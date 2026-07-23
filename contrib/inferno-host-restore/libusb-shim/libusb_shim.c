@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,13 @@
 /* ------------------------------------------------------------------ */
 /* Internal objects                                                   */
 /* ------------------------------------------------------------------ */
+
+static int shim_dbg = -1;
+#define SDBG(...)                                                    \
+    do {                                                             \
+        if (shim_dbg < 0) shim_dbg = getenv("INFERNO_SHIM_DEBUG") ? 1 : 0; \
+        if (shim_dbg) { fprintf(stderr, "[shim] " __VA_ARGS__); fflush(stderr); } \
+    } while (0)
 
 struct libusb_context {
     int broker_fd;
@@ -113,17 +121,36 @@ static void complete_async(struct libusb_context *ctx, uint32_t tag, int32_t sta
             x->actual_length = 0;
         } else {
             x->status = LIBUSB_TRANSFER_COMPLETED;
-            x->actual_length = (int)dlen;
-            if (dlen && data) {
-                unsigned char *dst = x->buffer;
-                if (x->type == LIBUSB_TRANSFER_TYPE_CONTROL)
+            /* Copy IN data into the transfer, never past its capacity and never
+             * to a NULL buffer (for control the data area starts 8 bytes in). */
+            unsigned char *dst = NULL;
+            uint32_t cap = 0;
+            if (x->buffer) {
+                if (x->type == LIBUSB_TRANSFER_TYPE_CONTROL) {
                     dst = libusb_control_transfer_get_data(x);
-                if (dst) memcpy(dst, data, dlen);
+                    cap = (x->length > (int)LIBUSB_CONTROL_SETUP_SIZE)
+                              ? (uint32_t)(x->length - (int)LIBUSB_CONTROL_SETUP_SIZE) : 0;
+                } else {
+                    dst = x->buffer;
+                    cap = (x->length > 0) ? (uint32_t)x->length : 0;
+                }
             }
+            uint32_t copy = dlen < cap ? dlen : cap;
+            if (copy && data && dst) memcpy(dst, data, copy);
+            x->actual_length = (int)copy;
         }
+        /*
+         * Snapshot the flag BEFORE the callback: a callback is allowed to call
+         * libusb_free_transfer(x) itself (usbmuxd's rx_callback does on error),
+         * so x may be freed once the callback returns — reading x->flags after
+         * it would be a use-after-free and freeing again a double-free. Only
+         * when FREE_TRANSFER is set does libusb (not the callback) own the free.
+         * FREE_BUFFER is applied only inside libusb_free_transfer(), never here
+         * (usbmuxd re-uses one transfer lang-ID -> serial and resubmits it).
+         */
+        int free_after = (x->flags & LIBUSB_TRANSFER_FREE_TRANSFER) != 0;
         if (x->callback) x->callback(x);
-        if (x->flags & LIBUSB_TRANSFER_FREE_BUFFER) { free(x->buffer); x->buffer = NULL; }
-        if (x->flags & LIBUSB_TRANSFER_FREE_TRANSFER) libusb_free_transfer(x);
+        if (free_after) libusb_free_transfer(x);
         return;
     }
 }
@@ -468,6 +495,7 @@ int libusb_get_max_packet_size(libusb_device *dev, unsigned char endpoint)
 
 int libusb_open(libusb_device *dev, libusb_device_handle **handle)
 {
+    SDBG("libusb_open dev=%p present=%d\n", (void *)dev, dev ? dev->ctx->device_present : -1);
     if (!dev || !dev->ctx->device_present) return LIBUSB_ERROR_NO_DEVICE;
     struct libusb_device_handle *h = calloc(1, sizeof(*h));
     h->dev = libusb_ref_device(dev);
@@ -496,7 +524,11 @@ static int simple_cmd(struct libusb_context *ctx, uint32_t kind, const void *pl,
 
 int libusb_get_configuration(libusb_device_handle *handle, int *config)
 {
-    (void)handle; if (config) *config = 1; return LIBUSB_SUCCESS;
+    /* Report UNCONFIGURED so clients (usbmuxd) always issue a real
+     * SET_CONFIGURATION, which the broker forwards to the device to activate
+     * its endpoints. Claiming it is already configured skips that step and
+     * leaves the mux endpoints inert (every bulk transfer NAKs). */
+    (void)handle; if (config) *config = 0; return LIBUSB_SUCCESS;
 }
 
 int libusb_set_configuration(libusb_device_handle *handle, int configuration)
@@ -646,12 +678,20 @@ struct libusb_transfer *libusb_alloc_transfer(int iso_packets)
     return x;
 }
 
-void libusb_free_transfer(struct libusb_transfer *transfer) { free(transfer); }
+void libusb_free_transfer(struct libusb_transfer *transfer)
+{
+    if (!transfer) return;
+    if ((transfer->flags & LIBUSB_TRANSFER_FREE_BUFFER) && transfer->buffer)
+        free(transfer->buffer);
+    free(transfer);
+}
 
 int libusb_submit_transfer(struct libusb_transfer *transfer)
 {
     struct libusb_device_handle *h = transfer->dev_handle;
     struct libusb_context *ctx = h->ctx;
+    SDBG("submit_transfer type=%d ep=0x%x len=%d fd=%d\n",
+         transfer->type, transfer->endpoint, transfer->length, ctx->broker_fd);
 
     int slot = -1;
     for (int i = 0; i < MAX_PENDING; i++) if (!ctx->pend[i].active) { slot = i; break; }

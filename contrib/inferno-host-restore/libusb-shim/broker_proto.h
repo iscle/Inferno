@@ -65,10 +65,19 @@ typedef struct broker_control_req {
     uint32_t timeout_ms;
 } broker_control_req;
 
+/* Transfer type values on the wire — these match libusb's transfer-type enum
+ * (LIBUSB_TRANSFER_TYPE_*), NOT inferno-usbd's internal TXN_* enum. */
+enum {
+    BROKER_XFER_CONTROL = 0,
+    BROKER_XFER_ISO = 1,
+    BROKER_XFER_BULK = 2,
+    BROKER_XFER_INTERRUPT = 3,
+};
+
 /* Payload for BROKER_BULK / BROKER_SUBMIT_ASYNC requests. */
 typedef struct broker_transfer_req {
     uint8_t  ep;         /* endpoint address incl. direction bit */
-    uint8_t  type;       /* 0 = control, 2 = bulk (matches libusb transfer type) */
+    uint8_t  type;       /* BROKER_XFER_* (== libusb transfer type) */
     uint16_t _pad;
     uint32_t length;     /* requested length */
     uint32_t timeout_ms;

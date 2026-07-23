@@ -52,6 +52,18 @@ make -C "$HERE/libusb-shim" test
 mkdir -p "$SRC"
 cd "$SRC"
 
+# Per-repo extra configure flags. usbmuxd's preflight worker needs the full
+# libimobiledevice (built later) and isn't used for our restore; Python/cython
+# bindings are unnecessary and often fail on macOS.
+extra_flags() {
+    case "$1" in
+        usbmuxd)          echo "--without-preflight" ;;
+        libplist)         echo "--without-cython" ;;
+        libimobiledevice) echo "--without-cython" ;;
+        *)                echo "" ;;
+    esac
+}
+
 for entry in "${REPOS[@]}"; do
     name="${entry%% *}"; url="${entry##* }"
     echo "==> $name"
@@ -65,9 +77,10 @@ for entry in "${REPOS[@]}"; do
             && echo "    applied idevicerestore.patch" || echo "    (patch already applied or N/A)"
     fi
 
-    [ -f configure ] || ./autogen.sh --prefix="$PREFIX" PKG_CONFIG_PATH="$PKG_CONFIG_PATH"
-    ./configure --prefix="$PREFIX" || { echo "configure failed for $name"; exit 1; }
-    make -j"$JOBS"
+    ./autogen.sh --prefix="$PREFIX" $(extra_flags "$name") \
+        || ./configure --prefix="$PREFIX" $(extra_flags "$name") \
+        || { echo "configure failed for $name"; exit 1; }
+    make -j"$JOBS" || { echo "make failed for $name"; exit 1; }
     make install
     popd >/dev/null
 done

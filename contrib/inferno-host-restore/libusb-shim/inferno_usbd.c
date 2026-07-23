@@ -396,6 +396,8 @@ static void txn_complete(txn_t *x, int32_t status)
     uint8_t *pl = NULL; uint32_t plen = 0;
     if (status >= 0 && x->in && x->actual) { pl = x->buf; plen = x->actual; }
     (void)stackbuf;
+    VLOG("[cmp] %s tag=%u status=%d inlen=%u", x->kind == TXN_BULK ? "bulk" : "control",
+         x->tag, status, x->in ? plen : 0);
     if (x->in)
         send_msg(x->client_fd, x->reply_kind, x->tag, status, pl, plen);
     else
@@ -464,6 +466,8 @@ static void *reader_thread(void *arg)
         if (read_all(l->fd, &resp, sizeof(resp)) <= 0) break;
         bool is_async = ((int32_t)resp.status == TCP_USB_RET_ASYNC);
 
+        VLOG("[rdr] resp id=%llu status=%d len=%u pid=0x%x async=%d",
+             (unsigned long long)resp.id, (int32_t)resp.status, resp.length, resp.pid, is_async);
         pthread_mutex_lock(&t->mutex);
         txn_t *x = find_txn_by_id(t, resp.id);
 
@@ -485,14 +489,32 @@ static void *reader_thread(void *arg)
         }
 
         if (x && !is_async) {
-            if ((int32_t)resp.status == TCP_USB_RET_NAK && x->nak_retries++ < MAX_NAK_RETRIES) {
-                /* Busy — re-issue the same token, as USB hardware does. The
-                 * device parks a genuinely idle bulk-IN as ASYNC (handled
-                 * above), so NAK here is transient. */
+            int32_t st = (int32_t)resp.status;
+            if (st == TCP_USB_RET_NAK && x->kind == TXN_BULK && x->in) {
+                /*
+                 * Persistent bulk-IN (usbmuxd's RX loop): real host controllers
+                 * keep an IN pending across NAKs until data arrives. Keep it
+                 * pending here too — re-poll at a paced rate, indefinitely. We
+                 * pace WITHOUT holding the table lock (only the IN token, no
+                 * buffer, is needed to re-issue), so submits/other completions
+                 * aren't blocked.
+                 */
+                uint8_t ep = x->ep;
+                uint32_t want = x->buf_len;
+                uint64_t nid = next_id(l);
+                x->id = nid;
+                x->nak_retries++;
+                pthread_mutex_unlock(&t->mutex);
+                usleep(2000);
+                link_write_req(l, TCP_USB_TOKEN_IN, ep, nid, NULL, (uint16_t)want);
+                continue;
+            }
+            if (st == TCP_USB_RET_NAK && x->nak_retries++ < MAX_NAK_RETRIES) {
+                /* Busy — re-issue the same token, as USB hardware does. */
                 txn_reissue(l, x);
             } else {
                 x->nak_retries = 0;
-                if (x->kind == TXN_BULK) txn_complete(x, (int32_t)resp.status);
+                if (x->kind == TXN_BULK) txn_complete(x, st);
                 else control_advance(rc, x);
             }
         }
@@ -540,6 +562,9 @@ static int submit_control(tcpusb_link *l, txn_table *t, int cfd, uint32_t tag,
     }
     x->id = next_id(l);
     uint8_t setup_buf[8]; memcpy(setup_buf, sp, 8);
+    VLOG("[sub] control bmReq=0x%x bReq=0x%x wVal=0x%x wIdx=0x%x wLen=%u id=%llu",
+         sp->bmRequestType, sp->bRequest, sp->wValue, sp->wIndex, sp->wLength,
+         (unsigned long long)x->id);
     pthread_mutex_unlock(&t->mutex);
     link_write_req(l, TCP_USB_TOKEN_SETUP, 0, x->id, setup_buf, 8);
     return 0;
@@ -563,6 +588,8 @@ static int submit_bulk(tcpusb_link *l, txn_table *t, int cfd, uint32_t tag,
         if (!in && out_data) memcpy(x->buf, out_data, length);
     }
     x->id = next_id(l);
+    VLOG("[sub] bulk ep=0x%x %s len=%u id=%llu", ep, in ? "IN" : "OUT", length,
+         (unsigned long long)x->id);
     pthread_mutex_unlock(&t->mutex);
     link_write_req(l, x->cur_pid, ep & 0x0f, x->id, out_data, (uint16_t)length);
     return 0;
@@ -574,8 +601,9 @@ static int handle_client_request(client_t *c, tcpusb_link *l, txn_table *t,
                                  device_cache *dc)
 {
     broker_msg_hdr h;
-    if (read_all(c->fd, &h, sizeof(h)) <= 0) return -1;
+    if (read_all(c->fd, &h, sizeof(h)) <= 0) { VLOG("[cli] read failed / client gone"); return -1; }
     bool have_dev = (l->fd >= 0) && dc->present;
+    VLOG("[cli] req kind=%u tag=%u len=%u have_dev=%d", h.kind, h.tag, h.length, have_dev);
 
     switch (h.kind) {
     case BROKER_HELLO: {
@@ -639,11 +667,16 @@ static int handle_client_request(client_t *c, tcpusb_link *l, txn_table *t,
     case BROKER_SUBMIT_ASYNC: {
         broker_transfer_req req;
         if (read_all(c->fd, &req, sizeof(req)) <= 0) return -1;
-        bool in = (req.ep & 0x80) != 0;
+        /* Direction: for control it's in the setup packet (bmRequestType bit 7);
+         * for bulk it's the endpoint address bit 7. Only OUT transfers carry
+         * data bytes after the request header. */
+        bool in = (req.type == BROKER_XFER_CONTROL)
+                      ? (req.setup[0] & 0x80) != 0
+                      : (req.ep & 0x80) != 0;
         uint8_t *out = NULL;
         if (!in && req.length) { out = malloc(req.length); if (read_all(c->fd, out, req.length) <= 0) { free(out); return -1; } }
         uint32_t reply_kind = (h.kind == BROKER_SUBMIT_ASYNC) ? BROKER_ASYNC_COMPLETE : BROKER_REPLY;
-        if (req.type == TXN_CONTROL) {
+        if (req.type == BROKER_XFER_CONTROL) {
             usb_setup_packet sp; memcpy(&sp, req.setup, sizeof(sp));
             if (!have_dev) { send_msg(c->fd, reply_kind, h.tag, TCP_USB_RET_NODEV, NULL, 0); free(out); return 0; }
             int rc = submit_control(l, t, c->fd, h.tag, reply_kind, &sp, out);
@@ -811,7 +844,7 @@ int main(int argc, char **argv)
                 int slot = -1;
                 for (int i = 0; i < MAX_CLIENTS; i++) if (clients[i].fd < 0) { slot = i; break; }
                 if (slot < 0) { logmsg("too many clients"); close(fd); }
-                else { clients[slot].fd = fd; clients[slot].hello_ok = false; }
+                else { clients[slot].fd = fd; clients[slot].hello_ok = false; VLOG("[cli] client %d connected (fd=%d)", slot, fd); }
             }
         }
 

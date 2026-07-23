@@ -26,7 +26,7 @@ USB_SOCK="/tmp/InfernoUSBRemote"
 BROKER_SOCK="/tmp/inferno-usbd.sock"
 MUX_SOCK="/tmp/inferno-usbmuxd.sock"
 
-export PATH="$PREFIX/bin:$PATH"
+export PATH="$PREFIX/bin:$PREFIX/sbin:$PATH"
 export INFERNO_USBD_SOCK="$BROKER_SOCK"
 # Point both usbmuxd (server) and libusbmuxd clients (idevicerestore) at our mux.
 export USBMUXD_SOCKET_ADDRESS="UNIX:$MUX_SOCK"
@@ -43,14 +43,19 @@ command -v inferno-usbd >/dev/null || { echo "inferno-usbd not found; run build-
 command -v usbmuxd >/dev/null || { echo "usbmuxd not found; run build-host-tools.sh first" >&2; exit 1; }
 [ -f "$IPSW" ] || { echo "IPSW not found: $IPSW (set INFERNO_IPSW)" >&2; exit 1; }
 
-echo "== 1. inferno-usbd =="
-inferno-usbd -s "$USB_SOCK" -b "$BROKER_SOCK" -v &
+USBD_LOG="${INFERNO_USBD_LOG:-/tmp/inferno-usbd.log}"
+echo "== 1. inferno-usbd (log: $USBD_LOG) =="
+inferno-usbd -s "$USB_SOCK" -b "$BROKER_SOCK" -v > "$USBD_LOG" 2>&1 &
 PIDS+=($!)
 sleep 1
 
 echo "== 2. usbmuxd (shim-backed, foreground) =="
-# -U "" keeps it from dropping privileges; -v verbose; -z prevents forking.
-usbmuxd -v -z &
+# -f foreground; -v verbose; -U <me> avoids dropping to a non-existent
+# 'usbmux' user on macOS; -S makes the daemon LISTEN on our private socket
+# (it does not read USBMUXD_SOCKET_ADDRESS — that's client-side); -P NONE
+# skips the /var/run/usbmuxd.pid lockfile that is fatal to create here.
+# (Do NOT use -z: it makes usbmuxd exit when no device is present.)
+usbmuxd -f -v -U "$(whoami)" -S "$MUX_SOCK" -P NONE &
 PIDS+=($!)
 sleep 1
 
@@ -59,18 +64,30 @@ INFERNO_DATA="$DATA_DIR" INFERNO_BUILD="${INFERNO_BUILD:-$HOME/Inferno/build}" \
     RESTORE=1 "$HERE/run-main-vm.sh" &
 PIDS+=($!)
 
-echo "== waiting for the device to appear on the host USB stack =="
+echo "== waiting for the emulated iPhone to enumerate (via inferno-usbd) =="
 for i in $(seq 1 60); do
-    if idevicerestore -h >/dev/null 2>&1 && irecovery -q >/dev/null 2>&1; then
-        echo "   device visible in recovery/DFU"
+    grep -qa 'device enumerated' "$USBD_LOG" 2>/dev/null && break
+    sleep 2
+done
+grep -qa 'device enumerated' "$USBD_LOG" 2>/dev/null \
+    && echo "   $(grep -a 'device enumerated' "$USBD_LOG" | tail -1)" \
+    || echo "   WARNING: device did not enumerate"
+
+echo "== waiting for usbmuxd to attach the device =="
+for i in $(seq 1 40); do
+    if idevice_id -l 2>/dev/null | grep -q .; then
+        echo "   usbmuxd reports device: $(idevice_id -l 2>/dev/null | tr '\n' ' ')"
         break
     fi
-    sleep 2
+    sleep 1
 done
 
 echo "== 4. idevicerestore (erase) =="
-echo "   NOTE: USB is experimental; if it stalls, see README 'Live bring-up'."
-idevicerestore --erase --restore-mode -i "$ECID" "$IPSW" -T "$DATA_DIR/root_ticket.der"
+echo "   NOTE: USB is experimental; if it stalls, see README 'Remaining work'."
+# Don't let a nonzero exit trip 'set -e' and tear down the VM — keep it up for
+# inspection/iteration.
+idevicerestore --erase --restore-mode -i "$ECID" "$IPSW" -T "$DATA_DIR/root_ticket.der" \
+    || echo "== idevicerestore exited $? =="
 
-echo "== restore command returned; leaving VM running (Ctrl-C to stop) =="
+echo "== leaving VM + usbmuxd running (Ctrl-C to stop) =="
 wait
