@@ -1,0 +1,10 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: libusb-1.0
+Description: Inferno libusb-1.0 shim (routes USB to inferno-usbd)
+Version: 1.0.27
+Libs: -L${libdir} -lusb-1.0
+Cflags: -I${includedir}/libusb-1.0
