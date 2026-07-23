@@ -75,35 +75,45 @@ contrib/inferno-host-restore/inferno-restore.sh
 | Component | State |
 |---|---|
 | `tcp_usb` host transport + control/bulk transaction state machine | implemented, unit-tested |
-| Enumeration (device + config descriptors, address assignment) | implemented, unit-tested |
-| Broker fan-out to multiple shim clients | implemented, unit-tested |
+| Async completion + NAK-retry + USB reset (matches the emulated dwc controller) | implemented, **live-validated** |
+| Enumeration (device + config descriptors, address assignment) | **live-validated** against the real iPhone 11 firmware |
+| Broker fan-out + reader-thread scheduler (concurrent IN/OUT) | implemented, unit-tested |
 | `libusb` shim: descriptors, sync control/bulk, async transfers, pollfd/event loop | implemented, unit-tested |
-| End-to-end shim ⇄ broker ⇄ tcp_usb ⇄ fake device | **passing** (`make -C libusb-shim test`) |
-| Full restore against a live booting VM | **needs live bring-up** — see below |
+| End-to-end shim ⇄ broker ⇄ tcp_usb ⇄ fake device (incl. parked-IN concurrency) | **passing** (`make -C libusb-shim test`) |
+| Full `usbmuxd`/`idevicerestore` restore against the live VM | **needs the userspace stack built + live iteration** — see below |
 
-`make -C libusb-shim test` runs `selftest.c`, which stands up the broker and a
-fake iPhone device (serving the usbmux interface descriptors) and drives the
-*real* libusb API through the shim: enumeration, descriptor parsing, a control
-transfer, and a bulk transfer all round-trip. This validates the whole
-mechanism except the live VM.
+Two levels of verification hold today:
 
-## Live bring-up (the remaining work)
+- **`make -C libusb-shim test`** stands up the broker and a fake iPhone (serving
+  the usbmux descriptors, exercising `ASYNC` completion and a parked bulk-IN
+  released by a bulk-OUT) and drives the *real* libusb API through the shim:
+  enumeration, descriptor parsing, control + bulk, and concurrent IN/OUT all
+  round-trip.
+- **Live**: booting the actual main VM (iPhone 11, iOS 14.0b5 restore ramdisk)
+  with `inferno-usbd`, the daemon reliably enumerates the emulated iPhone
+  (`vid=05ac pid=12a8`, the usbmux config) across repeated boots. Getting there
+  surfaced and fixed several real behaviours of the emulated dwc controller:
+  it completes control transfers asynchronously (`USB_RET_ASYNC` placeholder +
+  follow-up), NAKs heavily during its ~5s bring-up (so tokens must be retried
+  like real hardware), reports a nonzero length on non-IN responses with no
+  payload on the wire, and needs a port reset once it exists.
 
-These need a booting VM to observe and tune; they are marked `LIVE-TUNE` in
-`inferno_usbd.c`:
+## Remaining work
 
-1. **Persistent bulk-IN / NAK pacing.** `usbmuxd` keeps a bulk-IN outstanding
-   waiting for device data. Real libusb hardware retries NAKs transparently in
-   the host controller. `inferno-usbd` currently issues each transaction
-   synchronously; the NAK-retry/async-reissue path (so a pending IN doesn't
-   head-of-line-block other traffic) is the main scheduler work to finish. The
-   protocol already carries per-transaction `id`s to support this.
-2. **Mode-change re-enumeration.** As the guest moves DFU → recovery → restore →
-   normal it re-enumerates with new descriptors (and PID). Whether the guest
-   drops the socket or resets in place determines the trigger; `inferno-usbd`
-   re-enumerates on socket reconnect and on client `RESET`, but the exact signal
-   needs to be confirmed live.
-3. **`usbmuxd` socket path.** The orchestrator uses `USBMUXD_SOCKET_ADDRESS` so
+1. **Build the userspace stack.** `build-host-tools.sh` compiles
+   `usbmuxd`/`libirecovery`/`idevicerestore` against the shim; it needs autoconf
+   /automake/pkg-config present. This has not yet been run to completion here.
+2. **Drive a full restore.** With the stack built, `inferno-restore.sh` starts
+   everything and runs `idevicerestore --erase`. The device enumerates in
+   restore-mode mux (PID `0x12a8`, in usbmuxd's `0x1290–0x12af` range), so
+   `usbmuxd` should claim it; the serving-phase reader thread already handles
+   concurrent bulk IN/OUT and NAK-retry. Expect iteration on bulk-transfer
+   pacing under real `usbmuxd` load.
+3. **Mode-change re-enumeration.** As the guest moves between modes it
+   re-enumerates (possibly a new PID). `inferno-usbd` re-enumerates on socket
+   reconnect; whether an in-place reset also needs handling is a `LIVE-TUNE`
+   item to confirm once a restore is progressing.
+4. **`usbmuxd` socket path.** The orchestrator sets `USBMUXD_SOCKET_ADDRESS` so
    the shim-backed `usbmuxd` and `idevicerestore` share a private socket and
    never collide with macOS's own `usbmuxd`.
 

@@ -15,6 +15,7 @@
  * SPDX-License-Identifier: AGPL-3.0-or-later
  */
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,6 +62,11 @@ static void fake_device(void)
     if (fd < 0) { fprintf(stderr, "fake_device: cannot connect\n"); _exit(1); }
 
     usb_setup_packet last = { 0 };
+    bool async_control = (getenv("SELFTEST_ASYNC") != NULL);
+    /* One parked bulk-IN (id) awaiting a bulk-OUT before it completes. */
+    bool have_parked = false;
+    tcp_usb_request_header parked = { 0 };
+
     for (;;) {
         tcp_usb_header_t h;
         if (!read_all(fd, &h, sizeof(h))) break;
@@ -81,32 +87,48 @@ static void fake_device(void)
         if (req.pid == TCP_USB_TOKEN_SETUP) {
             memcpy(&last, inbuf, sizeof(last));
         } else if (req.pid == TCP_USB_TOKEN_IN && req.ep == 0) {
-            /* control IN data stage: serve descriptor per last setup */
-            if (last.bRequest == 6) { /* GET_DESCRIPTOR */
+            if (last.bRequest == 6) {
                 uint8_t type = last.wValue >> 8;
                 const uint8_t *src = NULL; uint16_t slen = 0;
                 if (type == 1) { src = DEV_DESC; slen = sizeof(DEV_DESC); }
                 else if (type == 2) { src = CFG_DESC; slen = sizeof(CFG_DESC); }
-                if (src) {
-                    outlen = req.length < slen ? req.length : slen;
-                    memcpy(out, src, outlen);
-                }
+                if (src) { outlen = req.length < slen ? req.length : slen; memcpy(out, src, outlen); }
+            }
+            if (async_control) {
+                /* Emulate the real controller: ASYNC placeholder, then terminal. */
+                tcp_usb_response_header a = resp; a.status = (uint32_t)TCP_USB_RET_ASYNC; a.length = 0;
+                if (write_all(fd, &rh, sizeof(rh)) || write_all(fd, &a, sizeof(a))) break;
             }
         } else if (req.pid == TCP_USB_TOKEN_IN && (req.ep & 0x0f) == 1) {
-            /* bulk IN on ep1: return a known token */
-            const char *msg = "PONG";
-            outlen = 4; memcpy(out, msg, 4);
+            /* Park this bulk-IN as ASYNC; it completes only after a bulk-OUT. */
+            tcp_usb_response_header a = resp; a.status = (uint32_t)TCP_USB_RET_ASYNC; a.length = 0;
+            if (write_all(fd, &rh, sizeof(rh)) || write_all(fd, &a, sizeof(a))) break;
+            have_parked = true; parked = req;
+            continue; /* don't send a terminal response yet */
         }
-        /* OUT/status stages just succeed. */
 
+        /* Terminal response for the current request. */
         resp.length = outlen;
         if (write_all(fd, &rh, sizeof(rh))) break;
         if (write_all(fd, &resp, sizeof(resp))) break;
         if (req.pid == TCP_USB_TOKEN_IN && outlen)
             if (write_all(fd, out, outlen)) break;
+
+        /* A bulk-OUT on ep2 releases the parked bulk-IN with data. */
+        if (req.pid == TCP_USB_TOKEN_OUT && (req.ep & 0x0f) == 2 && have_parked) {
+            tcp_usb_response_header pr = { 0 };
+            pr.addr = parked.addr; pr.pid = parked.pid; pr.ep = parked.ep; pr.id = parked.id;
+            pr.status = TCP_USB_RET_SUCCESS; pr.length = 4;
+            if (write_all(fd, &rh, sizeof(rh)) || write_all(fd, &pr, sizeof(pr)) ||
+                write_all(fd, "DATA", 4)) break;
+            have_parked = false;
+        }
     }
     _exit(0);
 }
+
+static int in_done = 0;
+static void on_transfer_done(struct libusb_transfer *t) { *(int *)t->user_data = 1; }
 
 int main(void)
 {
@@ -167,9 +189,30 @@ int main(void)
             int r = libusb_control_transfer(h, 0x80, 6, (1<<8), 0, buf, 18, 1000);
             CHECK(r == 18 && buf[8] == 0xac && buf[9] == 0x05, "control GET_DESCRIPTOR round-trips 18 bytes");
 
-            int transferred = 0;
-            r = libusb_bulk_transfer(h, 0x81, buf, sizeof(buf), &transferred, 1000);
-            CHECK(r == 0 && transferred == 4 && memcmp(buf, "PONG", 4) == 0, "bulk IN round-trips 'PONG'");
+            /* Concurrency: submit an async bulk-IN that the device PARKS, then
+             * run a sync bulk-OUT that must complete while the IN is pending;
+             * the OUT releases the IN. This is exactly usbmuxd's RX+TX overlap
+             * and would deadlock a synchronous, head-of-line-blocking broker. */
+            static unsigned char in_buf[64];
+            in_done = 0;
+            struct libusb_transfer *xin = libusb_alloc_transfer(0);
+            xin->dev_handle = h; xin->endpoint = 0x81; xin->type = LIBUSB_TRANSFER_TYPE_BULK;
+            xin->buffer = in_buf; xin->length = sizeof(in_buf); xin->timeout = 2000;
+            xin->user_data = &in_done;
+            xin->callback = on_transfer_done;
+            CHECK(libusb_submit_transfer(xin) == 0, "submit async bulk-IN (device parks it)");
+
+            unsigned char pkt[4] = { 'P','I','N','G' };
+            int tx = 0;
+            r = libusb_bulk_transfer(h, 0x02, pkt, sizeof(pkt), &tx, 1000);
+            CHECK(r == 0 && tx == 4, "sync bulk-OUT completes while IN is parked (no deadlock)");
+
+            struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 };
+            for (int k = 0; k < 20 && !in_done; k++) libusb_handle_events_timeout(ctx, &tv);
+            CHECK(in_done && xin->status == LIBUSB_TRANSFER_COMPLETED &&
+                  xin->actual_length == 4 && memcmp(in_buf, "DATA", 4) == 0,
+                  "parked async bulk-IN completes after OUT with 'DATA'");
+            libusb_free_transfer(xin);
 
             libusb_close(h);
         }

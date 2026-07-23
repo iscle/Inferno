@@ -96,8 +96,13 @@ CMD=( "$QEMU"
         -device nvme-ns,drive=effaceable,bus=nvme-bus.0,nsid=6,nstype=6,logical_block_size=4096,physical_block_size=4096
     -drive file=panic_log,format=raw,if=none,id=panic_log
         -device nvme-ns,drive=panic_log,bus=nvme-bus.0,nsid=7,nstype=8,logical_block_size=4096,physical_block_size=4096
-    -display cocoa,zoom-to-fit=on,zoom-interpolation=on,show-cursor=on
 )
+
+# Display: cocoa by default; set INFERNO_DISPLAY=none for headless runs.
+case "${INFERNO_DISPLAY:-cocoa}" in
+    none) CMD+=( -display none );;
+    *)    CMD+=( -display cocoa,zoom-to-fit=on,zoom-interpolation=on,show-cursor=on );;
+esac
 
 if [ "$RESTORE" = "1" ]; then
     [ -e "$RAMDISK" ] || { echo "error: RESTORE=1 but RAM disk missing: $RAMDISK" >&2; exit 1; }
