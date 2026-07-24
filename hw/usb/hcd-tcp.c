@@ -227,14 +227,23 @@ static uint64_t usb_tcp_host_repoll_ns(int nak_count)
 
 /*
  * Build and run one parked token described by pi (IN with no data, or OUT whose
- * data is pi->data). Returns true (and sends the response) if the device
- * produced a terminal, non-NAK status; returns false (nothing sent) if the
+ * data is pi->data). Returns true (and sends one response) once the device
+ * produces a terminal, non-NAK status; returns false (nothing sent) while the
  * device still NAKs (IN: no data queued; OUT: endpoint not ready). Each call is
  * a fresh transaction, so the guest's current DMA descriptors/mappings are used
  * — this is why re-polling here is safe where device-side USB_RET_ASYNC was not.
+ *
+ * OUT continuation: the emulated device controller accepts at most one RX
+ * buffer/TRB (0x8000 bytes) per transaction, so a large OUT (e.g. usbmuxd's
+ * 49152-byte writes) completes "short" — the guest took only part of it. A real
+ * host controller keeps streaming packets until the whole transfer lands; we do
+ * the same here by looping with pi->offset and only responding once every byte
+ * has been accepted. Doing this device-side (rather than re-issuing remainders
+ * from the host broker) keeps stream order intact, since requests are processed
+ * sequentially from the single link even when the host pipelines several OUTs.
  */
 static bool usb_tcp_host_run_pending(USBTCPHostState *s, USBPort *port,
-                                     const USBTCPPendingIn *pi)
+                                     USBTCPPendingIn *pi)
 {
     const tcp_usb_request_header *ph = &pi->hdr;
     USBEndpoint *ep = usb_ep_get(port->dev, ph->pid, ph->ep);
@@ -242,32 +251,55 @@ static bool usb_tcp_host_run_pending(USBTCPHostState *s, USBPort *port,
         return true; /* endpoint gone — stop retrying */
     }
 
-    USBTCPPacket *pkt = g_new0(USBTCPPacket, 1);
-    usb_packet_init(&pkt->p);
-    usb_packet_setup(&pkt->p, ph->pid, ep, ph->stream, ph->id, ph->short_not_ok,
-                     ph->int_req);
-    if (ph->length > 0) {
-        pkt->buffer = g_malloc0(ph->length);
-        if (ph->pid != USB_TOKEN_IN && pi->data) {
-            memcpy(pkt->buffer, pi->data, ph->length); /* re-send OUT data */
+    for (;;) {
+        uint32_t remaining = ph->length - pi->offset;
+        USBTCPPacket *pkt = g_new0(USBTCPPacket, 1);
+        usb_packet_init(&pkt->p);
+        usb_packet_setup(&pkt->p, ph->pid, ep, ph->stream, ph->id,
+                         ph->short_not_ok, ph->int_req);
+        if (remaining > 0) {
+            pkt->buffer = g_malloc0(remaining);
+            if (ph->pid != USB_TOKEN_IN && pi->data) {
+                /* (re-)send the not-yet-accepted tail of the OUT data */
+                memcpy(pkt->buffer, pi->data + pi->offset, remaining);
+            }
+            usb_packet_addbuf(&pkt->p, pkt->buffer, remaining);
         }
-        usb_packet_addbuf(&pkt->p, pkt->buffer, ph->length);
+        pkt->dev = ep->dev;
+        pkt->s = s;
+        pkt->addr = ph->addr;
+
+        usb_handle_packet(pkt->dev, &pkt->p);
+
+        if (pkt->p.status == USB_RET_NAK) {
+            usb_packet_cleanup(&pkt->p);
+            g_free(pkt->buffer);
+            g_free(pkt);
+            return false; /* stay parked; the re-poll will resume from offset */
+        }
+
+        /* Partial OUT (short write): account the accepted bytes and continue
+         * delivering the remainder. */
+        if (ph->pid != USB_TOKEN_IN && remaining > 0 &&
+            pkt->p.status == USB_RET_SUCCESS &&
+            pkt->p.actual_length < remaining) {
+            uint32_t done = pkt->p.actual_length;
+            usb_packet_cleanup(&pkt->p);
+            g_free(pkt->buffer);
+            g_free(pkt);
+            if (done == 0) {
+                return false; /* no progress; retry on the next re-poll */
+            }
+            pi->offset += done;
+            continue; /* try to hand over the next chunk right away */
+        }
+
+        /* Fully delivered (or IN, or a terminal error): send one response. For a
+         * multi-chunk OUT this reports the final chunk's length, which the host
+         * broker ignores for OUT — it completes on status. */
+        usb_tcp_host_respond_packet(s, pkt);
+        return true;
     }
-    pkt->dev = ep->dev;
-    pkt->s = s;
-    pkt->addr = ph->addr;
-
-    usb_handle_packet(pkt->dev, &pkt->p);
-
-    if (pkt->p.status == USB_RET_NAK) {
-        usb_packet_cleanup(&pkt->p);
-        g_free(pkt->buffer);
-        g_free(pkt);
-        return false;
-    }
-
-    usb_tcp_host_respond_packet(s, pkt);
-    return true;
 }
 
 static void usb_tcp_host_free_pending(USBTCPHostState *s)
@@ -351,7 +383,6 @@ static void coroutine_fn usb_tcp_host_msg_loop_co(void *opaque)
         case TCP_USB_REQUEST: {
             tcp_usb_request_header pkt_hdr;
             g_autofree void *buffer = NULL;
-            g_autofree USBTCPPacket *pkt = g_new0(USBTCPPacket, 1);
             USBEndpoint *ep = NULL;
 
             if (unlikely(tcp_usb_read(ioc, &pkt_hdr, sizeof(pkt_hdr)) !=
@@ -369,66 +400,70 @@ static void coroutine_fn usb_tcp_host_msg_loop_co(void *opaque)
                 return;
             }
 
-            usb_packet_init(&pkt->p);
-            usb_packet_setup(&pkt->p, pkt_hdr.pid, ep, pkt_hdr.stream,
-                             pkt_hdr.id, pkt_hdr.short_not_ok, pkt_hdr.int_req);
-
-            if (pkt_hdr.length > 0) {
+            if (pkt_hdr.length > 0 && pkt_hdr.pid != USB_TOKEN_IN) {
                 buffer = g_malloc0(pkt_hdr.length);
-
-                if (pkt_hdr.pid != USB_TOKEN_IN) {
-                    if (unlikely(tcp_usb_read(s->ioc, buffer, pkt_hdr.length) !=
-                                 pkt_hdr.length)) {
-                        usb_tcp_host_closed(s);
-                        usb_packet_cleanup(&pkt->p);
-                        return;
-                    }
+                if (unlikely(tcp_usb_read(s->ioc, buffer, pkt_hdr.length) !=
+                             pkt_hdr.length)) {
+                    usb_tcp_host_closed(s);
+                    return;
                 }
-
-                usb_packet_addbuf(&pkt->p, buffer, pkt_hdr.length);
-                pkt->buffer = buffer;
-                g_steal_pointer(&buffer);
             }
 
-            pkt->dev = ep->dev;
-            pkt->s = s;
-            pkt->addr = pkt_hdr.addr;
             assert_true(bql_locked());
 
-            usb_handle_packet(pkt->dev, &pkt->p);
-
-            if (pkt_hdr.ep != 0 && pkt->p.status == USB_RET_NAK) {
+            if (pkt_hdr.ep != 0) {
                 /*
-                 * A bulk/interrupt IN (no data queued yet) or OUT (endpoint not
-                 * ready). Park it and re-poll locally instead of relaying a NAK
-                 * the remote host would have to software-poll on. For IN this
-                 * keeps the RX loop pending; for OUT it holds the write until
-                 * the device can accept it (so the mux handshake OUT doesn't get
-                 * aborted, causing a device re-attach). Control (ep0) NAKs are
-                 * still relayed as before.
+                 * Bulk/interrupt: deliver the whole transfer via the shared
+                 * path, which chunks a large OUT across the guest's buffer size
+                 * and parks (IN: no data queued; OUT: endpoint not ready) with a
+                 * local re-poll rather than relaying a NAK the remote host would
+                 * have to software-poll on. Processing requests sequentially from
+                 * this single link keeps the OUT byte-stream ordered even when
+                 * the host pipelines several writes.
                  */
                 USBTCPPendingIn *pi = g_new0(USBTCPPendingIn, 1);
                 pi->hdr = pkt_hdr;
+                pi->offset = 0;
                 if (pkt_hdr.pid != USB_TOKEN_IN && pkt_hdr.length > 0) {
                     pi->data = g_malloc(pkt_hdr.length);
-                    memcpy(pi->data, pkt->buffer, pkt_hdr.length);
+                    memcpy(pi->data, buffer, pkt_hdr.length);
                 }
-                uint64_t due = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
-                               USB_TCP_HOST_REPOLL_FAST_NS;
-                pi->next_ns = due;
-                QTAILQ_INSERT_TAIL(&s->pending_ins, pi, next);
-                usb_packet_cleanup(&pkt->p);
-                g_free(pkt->buffer);
-                pkt->buffer = NULL;
-                /* pkt itself is freed by g_autofree */
-                if (!timer_pending(s->repoll_timer) ||
-                    timer_expire_time_ns(s->repoll_timer) > due) {
-                    timer_mod(s->repoll_timer, due);
+                if (usb_tcp_host_run_pending(s, port, pi)) {
+                    g_free(pi->data);
+                    g_free(pi);
+                } else {
+                    uint64_t due = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                                   USB_TCP_HOST_REPOLL_FAST_NS;
+                    pi->next_ns = due;
+                    QTAILQ_INSERT_TAIL(&s->pending_ins, pi, next);
+                    if (!timer_pending(s->repoll_timer) ||
+                        timer_expire_time_ns(s->repoll_timer) > due) {
+                        timer_mod(s->repoll_timer, due);
+                    }
                 }
-            } else {
-                usb_tcp_host_respond_packet(s, pkt);
-                g_steal_pointer(&pkt);
+                break;
             }
+
+            /* Control (ep0): handle inline; NAK is relayed to the host. */
+            g_autofree USBTCPPacket *pkt = g_new0(USBTCPPacket, 1);
+            usb_packet_init(&pkt->p);
+            usb_packet_setup(&pkt->p, pkt_hdr.pid, ep, pkt_hdr.stream,
+                             pkt_hdr.id, pkt_hdr.short_not_ok, pkt_hdr.int_req);
+            if (pkt_hdr.length > 0) {
+                void *b = g_malloc0(pkt_hdr.length);
+                if (buffer) {
+                    memcpy(b, buffer, pkt_hdr.length);
+                }
+                usb_packet_addbuf(&pkt->p, b, pkt_hdr.length);
+                pkt->buffer = b;
+            }
+            pkt->dev = ep->dev;
+            pkt->s = s;
+            pkt->addr = pkt_hdr.addr;
+
+            usb_handle_packet(pkt->dev, &pkt->p);
+            usb_tcp_host_respond_packet(s, pkt);
+            g_steal_pointer(&pkt);
             break;
         }
         case TCP_USB_RESPONSE:

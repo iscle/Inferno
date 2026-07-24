@@ -37,6 +37,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "broker_proto.h"
@@ -47,6 +48,14 @@
 #define CFG_DESC_MAX 4096
 
 static bool g_verbose = false;
+static bool g_timing = false;
+
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 static void logmsg(const char *fmt, ...)
 {
@@ -118,6 +127,7 @@ typedef struct {
     uint32_t buf_len;     /* requested length */
     uint32_t actual;      /* bytes received (IN) */
     int nak_retries;      /* serving-phase NAK re-issue counter */
+    uint64_t submit_ns;   /* timing: when the request was written to the link */
 } txn_t;
 
 typedef struct {
@@ -398,6 +408,13 @@ static void txn_complete(txn_t *x, int32_t status)
     (void)stackbuf;
     VLOG("[cmp] %s tag=%u status=%d inlen=%u", x->kind == TXN_BULK ? "bulk" : "control",
          x->tag, status, x->in ? plen : 0);
+    if (g_timing && x->kind == TXN_BULK && x->submit_ns) {
+        uint64_t us = (now_ns() - x->submit_ns) / 1000;
+        uint32_t bytes = x->in ? x->actual : x->buf_len;
+        logmsg("[tmg] bulk ep=0x%x %s bytes=%u rtt_us=%llu status=%d",
+               x->ep | (x->in ? 0x80 : 0), x->in ? "IN" : "OUT", bytes,
+               (unsigned long long)us, status);
+    }
     if (x->in)
         send_msg(x->client_fd, x->reply_kind, x->tag, status, pl, plen);
     else
@@ -578,6 +595,7 @@ static int submit_bulk(tcpusb_link *l, txn_table *t, int cfd, uint32_t tag,
         if (!in && out_data) memcpy(x->buf, out_data, length);
     }
     x->id = next_id(l);
+    x->submit_ns = now_ns();
     VLOG("[sub] bulk ep=0x%x %s len=%u id=%llu", ep, in ? "IN" : "OUT", length,
          (unsigned long long)x->id);
     pthread_mutex_unlock(&t->mutex);
@@ -764,6 +782,7 @@ int main(int argc, char **argv)
         }
     }
     signal(SIGPIPE, SIG_IGN);
+    g_timing = getenv("INFERNO_USBD_TIMING") != NULL;
 
     int usb_listen = bind_unix(usb_path);
     int broker_listen = bind_unix(broker_path);

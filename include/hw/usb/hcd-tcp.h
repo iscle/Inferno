@@ -53,6 +53,7 @@ typedef struct USBTCPPacket {
 typedef struct USBTCPPendingIn {
     tcp_usb_request_header hdr;
     uint8_t *data;     /* OUT data to (re-)send; NULL for IN */
+    uint32_t offset;   /* OUT: bytes already accepted by the guest (see below) */
     int nak_count;     /* consecutive NAKs, for adaptive poll backoff */
     uint64_t next_ns;  /* monotonic time this entry is next due for a re-poll */
     QTAILQ_ENTRY(USBTCPPendingIn) next;
