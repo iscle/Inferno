@@ -55,7 +55,11 @@ echo "== 2. usbmuxd (shim-backed, foreground) =="
 # (it does not read USBMUXD_SOCKET_ADDRESS — that's client-side); -P NONE
 # skips the /var/run/usbmuxd.pid lockfile that is fatal to create here.
 # (Do NOT use -z: it makes usbmuxd exit when no device is present.)
-usbmuxd -f -v -U "$(whoami)" -S "$MUX_SOCK" -P NONE &
+# -p disables the lockdownd preflight so a device is made visible/listable as
+# soon as it's ACTIVE, instead of gating visibility on a preflight lockdownd
+# query (which is flaky against the emulated device and made discovery
+# nondeterministic).
+usbmuxd -f -v -U "$(whoami)" -S "$MUX_SOCK" -P NONE -p &
 PIDS+=($!)
 sleep 1
 
