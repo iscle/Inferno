@@ -54,6 +54,10 @@ done
 
 # --- assemble the machine option -------------------------------------------
 MACHINE="t8030"
+# Optional boot mode: "exit_recovery" sets auto-boot=true in nvram and boots the
+# installed OS from the restored disk (use for a normal boot after a restore);
+# "enter_recovery" forces recovery. Leave unset for the machine default.
+[ -n "${INFERNO_BOOT_MODE:-}" ] && MACHINE+=",boot-mode=$INFERNO_BOOT_MODE"
 MACHINE+=",trustcache=$TRUSTCACHE"
 MACHINE+=",ticket=$TICKET"
 MACHINE+=",sep-fw=$SEP_FW"
