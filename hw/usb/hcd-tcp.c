@@ -200,25 +200,36 @@ static void usb_tcp_host_respond_packet(USBTCPHostState *s, USBTCPPacket *pkt)
 }
 
 /*
- * How often to re-run a parked IN token the device NAK'd. Each re-run re-fires
- * the endpoint's XFERNOTREADY event to the guest, so polling too fast starves
- * the guest driver and it never queues data (the mux handshake then hangs). A
- * few hundred hertz is plenty: an IN that actually has data does not NAK, so it
- * completes immediately regardless of this interval — this only paces the
- * genuinely-idle case.
+ * Adaptive re-poll pacing for a parked token. Each re-run re-fires the
+ * endpoint's XFERNOTREADY event, so polling a *genuinely idle* endpoint too
+ * fast starves the guest and it never queues data (the mux handshake hangs).
+ * But while data is actively flowing (the bulk-OUT NOR write and its ACK
+ * stream) we want low latency. So: poll fast, and only back off to the slow
+ * interval after several consecutive NAKs (a sign the endpoint is truly idle).
+ * A delivery resets the entry, so active endpoints stay fast.
  */
-#define USB_TCP_HOST_REPOLL_NS 2000000 /* 2ms */
+#define USB_TCP_HOST_REPOLL_FAST_NS 150000  /* 150us while active */
+#define USB_TCP_HOST_REPOLL_SLOW_NS 2000000 /* 2ms once idle */
+#define USB_TCP_HOST_REPOLL_BACKOFF 12      /* NAKs before slowing down */
+
+static uint64_t usb_tcp_host_repoll_ns(int nak_count)
+{
+    return nak_count < USB_TCP_HOST_REPOLL_BACKOFF ? USB_TCP_HOST_REPOLL_FAST_NS
+                                                   : USB_TCP_HOST_REPOLL_SLOW_NS;
+}
 
 /*
- * Build and run one IN token described by ph. Returns true (and sends the
- * response) if the device produced a terminal, non-NAK status; returns false
- * (nothing sent) if the device still has no data queued. Each call is a fresh
- * transaction, so the guest's current DMA descriptors/mappings are used — this
- * is why re-polling here is safe where device-side USB_RET_ASYNC was not.
+ * Build and run one parked token described by pi (IN with no data, or OUT whose
+ * data is pi->data). Returns true (and sends the response) if the device
+ * produced a terminal, non-NAK status; returns false (nothing sent) if the
+ * device still NAKs (IN: no data queued; OUT: endpoint not ready). Each call is
+ * a fresh transaction, so the guest's current DMA descriptors/mappings are used
+ * — this is why re-polling here is safe where device-side USB_RET_ASYNC was not.
  */
-static bool usb_tcp_host_run_in(USBTCPHostState *s, USBPort *port,
-                                const tcp_usb_request_header *ph)
+static bool usb_tcp_host_run_pending(USBTCPHostState *s, USBPort *port,
+                                     const USBTCPPendingIn *pi)
 {
+    const tcp_usb_request_header *ph = &pi->hdr;
     USBEndpoint *ep = usb_ep_get(port->dev, ph->pid, ph->ep);
     if (ep == NULL) {
         return true; /* endpoint gone — stop retrying */
@@ -230,6 +241,9 @@ static bool usb_tcp_host_run_in(USBTCPHostState *s, USBPort *port,
                      ph->int_req);
     if (ph->length > 0) {
         pkt->buffer = g_malloc0(ph->length);
+        if (ph->pid != USB_TOKEN_IN && pi->data) {
+            memcpy(pkt->buffer, pi->data, ph->length); /* re-send OUT data */
+        }
         usb_packet_addbuf(&pkt->p, pkt->buffer, ph->length);
     }
     pkt->dev = ep->dev;
@@ -254,6 +268,7 @@ static void usb_tcp_host_free_pending(USBTCPHostState *s)
     USBTCPPendingIn *pi, *tmp;
     QTAILQ_FOREACH_SAFE (pi, &s->pending_ins, next, tmp) {
         QTAILQ_REMOVE(&s->pending_ins, pi, next);
+        g_free(pi->data);
         g_free(pi);
     }
     if (s->repoll_timer) {
@@ -261,13 +276,15 @@ static void usb_tcp_host_free_pending(USBTCPHostState *s)
     }
 }
 
-/* Timer callback: re-run every parked IN; complete the ones that now have data,
- * keep re-polling the rest. */
+/* Timer callback: re-run parked tokens that are due; complete the ones that now
+ * have data, back off the ones still NAK'ing, and re-arm to the earliest due
+ * time. */
 static void usb_tcp_host_repoll(void *opaque)
 {
     USBTCPHostState *s = opaque;
     USBPort *port;
     USBTCPPendingIn *pi, *tmp;
+    uint64_t now;
 
     if (s->closed) {
         usb_tcp_host_free_pending(s);
@@ -279,16 +296,30 @@ static void usb_tcp_host_repoll(void *opaque)
         return;
     }
 
+    now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     QTAILQ_FOREACH_SAFE (pi, &s->pending_ins, next, tmp) {
-        if (usb_tcp_host_run_in(s, port, &pi->hdr)) {
+        if (pi->next_ns > now) {
+            continue; /* not due yet */
+        }
+        if (usb_tcp_host_run_pending(s, port, pi)) {
             QTAILQ_REMOVE(&s->pending_ins, pi, next);
+            g_free(pi->data);
             g_free(pi);
+        } else {
+            pi->nak_count++;
+            pi->next_ns = now + usb_tcp_host_repoll_ns(pi->nak_count);
         }
     }
 
-    if (!QTAILQ_EMPTY(&s->pending_ins)) {
-        timer_mod(s->repoll_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + USB_TCP_HOST_REPOLL_NS);
+    /* Re-arm to the soonest pending entry. */
+    uint64_t soonest = 0;
+    QTAILQ_FOREACH (pi, &s->pending_ins, next) {
+        if (soonest == 0 || pi->next_ns < soonest) {
+            soonest = pi->next_ns;
+        }
+    }
+    if (soonest != 0) {
+        timer_mod(s->repoll_timer, soonest);
     }
 }
 
@@ -359,25 +390,33 @@ static void coroutine_fn usb_tcp_host_msg_loop_co(void *opaque)
 
             usb_handle_packet(pkt->dev, &pkt->p);
 
-            if (pkt_hdr.pid == USB_TOKEN_IN && pkt_hdr.ep != 0 &&
-                pkt->p.status == USB_RET_NAK) {
+            if (pkt_hdr.ep != 0 && pkt->p.status == USB_RET_NAK) {
                 /*
-                 * A bulk/interrupt IN with no data queued yet. Park it and
-                 * re-poll locally instead of relaying a NAK the remote host
-                 * would have to software-poll on (which throttles the OUT
-                 * stream). Control (ep0) NAKs are still relayed as before.
+                 * A bulk/interrupt IN (no data queued yet) or OUT (endpoint not
+                 * ready). Park it and re-poll locally instead of relaying a NAK
+                 * the remote host would have to software-poll on. For IN this
+                 * keeps the RX loop pending; for OUT it holds the write until
+                 * the device can accept it (so the mux handshake OUT doesn't get
+                 * aborted, causing a device re-attach). Control (ep0) NAKs are
+                 * still relayed as before.
                  */
                 USBTCPPendingIn *pi = g_new0(USBTCPPendingIn, 1);
                 pi->hdr = pkt_hdr;
+                if (pkt_hdr.pid != USB_TOKEN_IN && pkt_hdr.length > 0) {
+                    pi->data = g_malloc(pkt_hdr.length);
+                    memcpy(pi->data, pkt->buffer, pkt_hdr.length);
+                }
+                uint64_t due = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                               USB_TCP_HOST_REPOLL_FAST_NS;
+                pi->next_ns = due;
                 QTAILQ_INSERT_TAIL(&s->pending_ins, pi, next);
                 usb_packet_cleanup(&pkt->p);
                 g_free(pkt->buffer);
                 pkt->buffer = NULL;
                 /* pkt itself is freed by g_autofree */
-                if (!timer_pending(s->repoll_timer)) {
-                    timer_mod(s->repoll_timer,
-                              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
-                                  USB_TCP_HOST_REPOLL_NS);
+                if (!timer_pending(s->repoll_timer) ||
+                    timer_expire_time_ns(s->repoll_timer) > due) {
+                    timer_mod(s->repoll_timer, due);
                 }
             } else {
                 usb_tcp_host_respond_packet(s, pkt);
