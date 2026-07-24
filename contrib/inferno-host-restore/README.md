@@ -97,25 +97,44 @@ round-trips the real libusb API through the shim without any VM.
 
 ### Where the current restore stops
 
-`idevicerestore` reaches `Sending NORData now...` then reports `Unable to send
-NORData`. This is the guest `restored` daemon rejecting the NOR/NAND firmware
-write (note `NAND firmware file not exist: /usr/standalone/firmware/t302/…pak`),
-**not** a transport problem — the mux shows 0 errors, and `restored` runs inside
-the guest, so it would reject the same write whether the host or the companion
-VM drove it. That final step is Inferno device-emulation / firmware territory,
-independent of the host-vs-companion question this branch addresses.
+`idevicerestore` reaches `Sending NORData now...` (the final NOR/NAND firmware
+write) and the transfer does not complete in time: the multi-MB write is carried
+correctly by the mux (`USB mux: N reads / 0 errors, M writes / 0 errors`) but too
+slowly, so the guest `restored` daemon times out and the device disconnects
+(`LIBUSB_ERROR_NO_DEVICE`) → `Unable to send NORData`.
+
+The root cause is throughput of the userspace host-controller: `inferno-usbd`'s
+single reader thread has to both keep usbmuxd's idle bulk-IN RX loops polled AND
+promptly complete the bulk-OUT stream. The emulated dwc controller NAKs an idle
+bulk-IN (it does not park it as ASYNC the way it parks control transfers), so the
+host has to software-poll. Small transfers (RootTicket, all the earlier restore
+steps) are unaffected; only the large sustained NOR write is.
+
+This is the open item for a *complete* restore. Two designs move it forward:
+
+1. **Async HCD scheduler.** Give `inferno-usbd` a proper pipelined scheduler
+   (separate the RX re-poll pacing from bulk-OUT completion so neither starves
+   the other). A first attempt — a non-blocking, clock-paced reader — improved
+   NOR throughput but disrupted the early `restored` HardwareModel query on the
+   emulated USB; getting both fast and reliable needs more iteration.
+2. **Device-side ASYNC parking of bulk-IN** in Inferno (`hw/usb/hcd-tcp.c` /
+   the dwc device model), so an idle RX-loop IN is held pending like a real bus
+   instead of NAK'd. That removes the software-poll entirely and is the clean
+   fix — but it's an emulator-side change, not a shim change.
+
+Everything up to that point — enumeration, attach, mode/serial/config, and the
+entire restore protocol through firmware personalization and RootTicket — works
+over the host-direct path with zero transport errors.
 
 ## Remaining work
 
-1. **NOR/NAND firmware write.** Chase `Unable to send NORData` on the guest /
-   Inferno side (NAND controller `t302` firmware, `restored` NOR acceptance).
-   This is orthogonal to the USB bridge.
-2. **Mode-change re-enumeration.** If a restore path ever moves the device
-   between USB modes mid-flight, `inferno-usbd` re-enumerates on socket
-   reconnect; an in-place-reset trigger is a `LIVE-TUNE` item if needed.
-3. **Debug logging.** `inferno-usbd -v` prints per-transaction `[txn]/[rdr]/
-   [sub]/[cmp]/[cli]` traces and the shim honours `INFERNO_SHIM_DEBUG`; both are
-   off by default and can be removed once the flow is fully settled.
+1. **NOR write throughput** (above) — the one blocker to a fully completed
+   restore.
+2. **Early-handshake reliability.** The first `restored` queries right after
+   attach are occasionally flaky on the emulated USB; the orchestrator adds a
+   settle delay (`INFERNO_SETTLE`) but this is USB-experimental territory.
+3. **Debug logging.** `inferno-usbd -v` prints `[txn]/[rdr]/[sub]/[cmp]/[cli]`
+   traces and the shim honours `INFERNO_SHIM_DEBUG`; both off by default.
 
 Per the upstream manual, USB in Inferno is itself still experimental
 ("USB is currently unstable"), so first-boot restores may need iteration

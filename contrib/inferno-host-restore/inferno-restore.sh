@@ -74,20 +74,25 @@ grep -qa 'device enumerated' "$USBD_LOG" 2>/dev/null \
     || echo "   WARNING: device did not enumerate"
 
 echo "== waiting for usbmuxd to attach the device =="
-for i in $(seq 1 40); do
+for i in $(seq 1 90); do
     if idevice_id -l 2>/dev/null | grep -q .; then
         echo "   usbmuxd reports device: $(idevice_id -l 2>/dev/null | tr '\n' ' ')"
         break
     fi
     sleep 1
 done
+# Let the device's restored daemon and the mux settle before querying it — the
+# very first restored queries right after attach are flaky on the emulated USB.
+sleep "${INFERNO_SETTLE:-8}"
 
 echo "== 4. idevicerestore (erase) =="
 echo "   NOTE: USB is experimental; if it stalls, see README 'Remaining work'."
-# Don't let a nonzero exit trip 'set -e' and tear down the VM — keep it up for
-# inspection/iteration.
-idevicerestore --erase --restore-mode -i "$ECID" "$IPSW" -T "$DATA_DIR/root_ticket.der" \
-    || echo "== idevicerestore exited $? =="
+# Single invocation: re-running idevicerestore against a device whose restored
+# has already been partway driven confuses it. The wait above ensures the device
+# is discoverable first. Never let a nonzero exit trip 'set -e'.
+idevicerestore --erase --restore-mode -i "$ECID" "$IPSW" -T "$DATA_DIR/root_ticket.der" 2>&1 \
+    | tee "/tmp/idevicerestore.out"
+echo "== idevicerestore exited ${PIPESTATUS[0]} =="
 
 echo "== leaving VM + usbmuxd running (Ctrl-C to stop) =="
 wait

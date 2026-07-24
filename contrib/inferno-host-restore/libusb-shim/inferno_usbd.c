@@ -37,7 +37,19 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
+
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+/* How long to leave an idle bulk-IN un-issued between NAK re-polls. Small
+ * enough that restored's ACKs are picked up promptly, large enough that idle
+ * RX polling doesn't flood the tcp_usb socket and starve bulk-OUT data. */
+#define RX_REPOLL_INTERVAL_NS (500 * 1000ull) /* 500us */
 
 #include "broker_proto.h"
 #include "tcp_usb_proto.h"
@@ -118,6 +130,7 @@ typedef struct {
     uint32_t buf_len;     /* requested length */
     uint32_t actual;      /* bytes received (IN) */
     int nak_retries;      /* serving-phase NAK re-issue counter */
+    uint64_t repoll_ns;   /* bulk-IN: monotonic time to re-issue after a NAK (0=not pending) */
 } txn_t;
 
 typedef struct {
@@ -459,63 +472,74 @@ static void *reader_thread(void *arg)
     txn_table *t = rc->table;
 
     while (atomic_load(&rc->running)) {
-        tcp_usb_header_t rhdr = { 0 };
-        int r = read_all(l->fd, &rhdr, sizeof(rhdr));
-        if (r <= 0 || rhdr.type != TCP_USB_RESPONSE) break;
-        tcp_usb_response_header resp = { 0 };
-        if (read_all(l->fd, &resp, sizeof(resp)) <= 0) break;
-        bool is_async = ((int32_t)resp.status == TCP_USB_RET_ASYNC);
+        /*
+         * Poll with a short timeout instead of a blocking read: this lets the
+         * single reader thread stay responsive to bulk-OUT completions (so a
+         * large NORData send isn't throttled) while still re-polling idle
+         * bulk-INs on time. We NEVER sleep in this loop — a blocking sleep here
+         * stalls TX and the guest restored times out.
+         */
+        struct pollfd pfd = { .fd = l->fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 1);
+        if (pr < 0) { if (errno == EINTR) continue; break; }
 
-        VLOG("[rdr] resp id=%llu status=%d len=%u pid=0x%x async=%d",
-             (unsigned long long)resp.id, (int32_t)resp.status, resp.length, resp.pid, is_async);
-        pthread_mutex_lock(&t->mutex);
-        txn_t *x = find_txn_by_id(t, resp.id);
+        if (pr > 0 && (pfd.revents & POLLIN)) {
+            tcp_usb_header_t rhdr = { 0 };
+            int r = read_all(l->fd, &rhdr, sizeof(rhdr));
+            if (r <= 0 || rhdr.type != TCP_USB_RESPONSE) break;
+            tcp_usb_response_header resp = { 0 };
+            if (read_all(l->fd, &resp, sizeof(resp)) <= 0) break;
+            bool is_async = ((int32_t)resp.status == TCP_USB_RET_ASYNC);
 
-        /* Payload follows only for IN responses (see tcpusb_txn_sync note). */
-        if (resp.length && !is_async && resp.pid == TCP_USB_TOKEN_IN) {
-            uint32_t remain = resp.length;
-            if (x && x->in && x->cur_pid == TCP_USB_TOKEN_IN) {
-                uint32_t space = (x->buf_len > x->actual) ? x->buf_len - x->actual : 0;
-                uint32_t want = remain < space ? remain : space;
-                if (want && read_all(l->fd, x->buf + x->actual, want) <= 0) { pthread_mutex_unlock(&t->mutex); break; }
-                x->actual += want;
-                remain -= want;
+            if ((int32_t)resp.status != TCP_USB_RET_NAK) /* skip NAK-poll spam */
+                VLOG("[rdr] resp id=%llu status=%d len=%u pid=0x%x async=%d",
+                     (unsigned long long)resp.id, (int32_t)resp.status, resp.length, resp.pid, is_async);
+            pthread_mutex_lock(&t->mutex);
+            txn_t *x = find_txn_by_id(t, resp.id);
+
+            /* Payload follows only for IN responses (see tcpusb_txn_sync note). */
+            if (resp.length && !is_async && resp.pid == TCP_USB_TOKEN_IN) {
+                uint32_t remain = resp.length;
+                if (x && x->in && x->cur_pid == TCP_USB_TOKEN_IN) {
+                    uint32_t space = (x->buf_len > x->actual) ? x->buf_len - x->actual : 0;
+                    uint32_t want = remain < space ? remain : space;
+                    if (want && read_all(l->fd, x->buf + x->actual, want) <= 0) { pthread_mutex_unlock(&t->mutex); break; }
+                    x->actual += want;
+                    remain -= want;
+                }
+                while (remain) {
+                    char junk[512]; uint32_t c = remain < sizeof(junk) ? remain : sizeof(junk);
+                    if (read_all(l->fd, junk, c) <= 0) { pthread_mutex_unlock(&t->mutex); goto done; }
+                    remain -= c;
+                }
             }
-            while (remain) {
-                char junk[512]; uint32_t c = remain < sizeof(junk) ? remain : sizeof(junk);
-                if (read_all(l->fd, junk, c) <= 0) { pthread_mutex_unlock(&t->mutex); goto done; }
-                remain -= c;
+
+            if (x && !is_async) {
+                int32_t st = (int32_t)resp.status;
+                if (st == TCP_USB_RET_NAK && x->kind == TXN_BULK && x->in) {
+                    /* Idle RX loop: defer the re-poll instead of re-issuing now,
+                     * so we don't flood the socket and starve bulk-OUT data. */
+                    x->repoll_ns = now_ns() + RX_REPOLL_INTERVAL_NS;
+                } else if (st == TCP_USB_RET_NAK && x->nak_retries++ < MAX_NAK_RETRIES) {
+                    txn_reissue(l, x);
+                } else {
+                    x->nak_retries = 0;
+                    if (x->kind == TXN_BULK) txn_complete(x, st);
+                    else control_advance(rc, x);
+                }
             }
+            pthread_mutex_unlock(&t->mutex);
         }
 
-        if (x && !is_async) {
-            int32_t st = (int32_t)resp.status;
-            if (st == TCP_USB_RET_NAK && x->kind == TXN_BULK && x->in) {
-                /*
-                 * Persistent bulk-IN (usbmuxd's RX loop): real host controllers
-                 * keep an IN pending across NAKs until data arrives. Keep it
-                 * pending here too — re-poll at a paced rate, indefinitely. We
-                 * pace WITHOUT holding the table lock (only the IN token, no
-                 * buffer, is needed to re-issue), so submits/other completions
-                 * aren't blocked.
-                 */
-                uint8_t ep = x->ep;
-                uint32_t want = x->buf_len;
-                uint64_t nid = next_id(l);
-                x->id = nid;
-                x->nak_retries++;
-                pthread_mutex_unlock(&t->mutex);
-                usleep(2000);
-                link_write_req(l, TCP_USB_TOKEN_IN, ep, nid, NULL, (uint16_t)want);
-                continue;
-            }
-            if (st == TCP_USB_RET_NAK && x->nak_retries++ < MAX_NAK_RETRIES) {
-                /* Busy — re-issue the same token, as USB hardware does. */
-                txn_reissue(l, x);
-            } else {
-                x->nak_retries = 0;
-                if (x->kind == TXN_BULK) txn_complete(x, st);
-                else control_advance(rc, x);
+        /* Re-issue any idle bulk-INs whose defer interval has elapsed. */
+        uint64_t now = now_ns();
+        pthread_mutex_lock(&t->mutex);
+        for (int i = 0; i < MAX_TXNS; i++) {
+            txn_t *x = &t->txns[i];
+            if (x->active && x->kind == TXN_BULK && x->in && x->repoll_ns && x->repoll_ns <= now) {
+                x->repoll_ns = 0;
+                x->id = next_id(l);
+                link_write_req(l, TCP_USB_TOKEN_IN, x->ep, x->id, NULL, (uint16_t)x->buf_len);
             }
         }
         pthread_mutex_unlock(&t->mutex);
