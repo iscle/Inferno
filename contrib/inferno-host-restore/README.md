@@ -95,44 +95,45 @@ whole restore with zero transport errors.
 (exercising `ASYNC` completion and a parked bulk-IN released by a bulk-OUT) and
 round-trips the real libusb API through the shim without any VM.
 
-### Where the current restore stops
+### Device-side bulk-IN parking (in progress)
 
-`idevicerestore` reaches `Sending NORData now...` (the final NOR/NAND firmware
-write) and the transfer does not complete in time: the multi-MB write is carried
-correctly by the mux (`USB mux: N reads / 0 errors, M writes / 0 errors`) but too
-slowly, so the guest `restored` daemon times out and the device disconnects
-(`LIBUSB_ERROR_NO_DEVICE`) → `Unable to send NORData`.
+The blocker to a *complete* restore is the throughput of the large NOR firmware
+write. Root cause: the emulated dwc3 controller **NAKs an idle bulk-IN** rather
+than holding it pending (the device model uses `USB_RET_NAK` on purpose — a
+comment in `hw/usb/hcd-dwc3.c` notes that `USB_RET_ASYNC` there "causes DART
+faults", i.e. stale IOMMU mappings on late completion). So the host has to
+software-poll every idle RX-loop IN, and that polling competes with the bulk-OUT
+data stream, starving the multi-MB NOR write until the guest `restored` times
+out.
 
-The root cause is throughput of the userspace host-controller: `inferno-usbd`'s
-single reader thread has to both keep usbmuxd's idle bulk-IN RX loops polled AND
-promptly complete the bulk-OUT stream. The emulated dwc controller NAKs an idle
-bulk-IN (it does not park it as ASYNC the way it parks control transfers), so the
-host has to software-poll. Small transfers (RootTicket, all the earlier restore
-steps) are unaffected; only the large sustained NOR write is.
+The clean fix, implemented here in **`hw/usb/hcd-tcp.c`** (the tcp_usb
+device-side relay): when the device NAKs a bulk/interrupt IN, don't relay the
+NAK over the socket — park the request and re-run it *locally* on a timer until
+the guest queues data, then send one response. Each re-run is a fresh
+transaction, so the guest's current DMA descriptors are used and the DART faults
+that broke device-side ASYNC don't occur. `inferno-usbd`'s reader then reverts
+to a simple demux (no socket NAK storm to pace).
 
-This is the open item for a *complete* restore. Two designs move it forward:
+Status: **data now delivers through the parked path** — the re-poll must be slow
+(`USB_TCP_HOST_REPOLL_NS`, 2ms) because each re-run re-fires the endpoint's
+`XFERNOTREADY` event and polling too fast starves the guest so it never queues
+data. What still needs work: after the version response is delivered, usbmuxd
+does not yet mark the device *active/listable*, and there is a one-time
+ID1→ID2 re-attach from an initial bulk-OUT NAK. Until that's resolved the
+device attaches but `idevicerestore` can't discover it.
 
-1. **Async HCD scheduler.** Give `inferno-usbd` a proper pipelined scheduler
-   (separate the RX re-poll pacing from bulk-OUT completion so neither starves
-   the other). A first attempt — a non-blocking, clock-paced reader — improved
-   NOR throughput but disrupted the early `restored` HardwareModel query on the
-   emulated USB; getting both fast and reliable needs more iteration.
-2. **Device-side ASYNC parking of bulk-IN** in Inferno (`hw/usb/hcd-tcp.c` /
-   the dwc device model), so an idle RX-loop IN is held pending like a real bus
-   instead of NAK'd. That removes the software-poll entirely and is the clean
-   fix — but it's an emulator-side change, not a shim change.
-
-Everything up to that point — enumeration, attach, mode/serial/config, and the
-entire restore protocol through firmware personalization and RootTicket — works
-over the host-direct path with zero transport errors.
+Everything up to the restore itself — enumeration, mode/serial/config, and (on
+the earlier broker-polling revision, tag `1e5e94b`) the full restore protocol
+through firmware personalization and RootTicket with zero transport errors —
+works over the host-direct path.
 
 ## Remaining work
 
-1. **NOR write throughput** (above) — the one blocker to a fully completed
-   restore.
-2. **Early-handshake reliability.** The first `restored` queries right after
-   attach are occasionally flaky on the emulated USB; the orchestrator adds a
-   settle delay (`INFERNO_SETTLE`) but this is USB-experimental territory.
+1. **usbmuxd device activation over the parked path** — get the mux version
+   handshake to complete so the device becomes listable; then re-validate the
+   NOR-write throughput the parking was meant to fix.
+2. **Avoid the initial re-attach** — the first bulk-OUT NAKs before the device's
+   mux OUT endpoint is ready; retry it longer (or park it device-side too).
 3. **Debug logging.** `inferno-usbd -v` prints `[txn]/[rdr]/[sub]/[cmp]/[cli]`
    traces and the shim honours `INFERNO_SHIM_DEBUG`; both off by default.
 

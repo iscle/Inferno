@@ -26,6 +26,8 @@
 #include "hw/usb/tcp-usb.h"
 #include "io/channel.h"
 #include "qemu/coroutine.h"
+#include "qemu/queue.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_USB_TCP_HOST "usb-tcp-host"
@@ -38,6 +40,20 @@ typedef struct USBTCPPacket {
     USBTCPHostState *s;
     uint8_t addr;
 } USBTCPPacket;
+
+/*
+ * A device-mode IN token (bulk/interrupt) that the device NAK'd because it has
+ * no data queued yet. Rather than relay the NAK to the remote host — which
+ * would make the host software-poll over the socket and throttle the bulk-OUT
+ * stream — we hold the request here and re-run it locally until the guest
+ * queues data, then send a single response. Re-running is a fresh transaction
+ * each time, so the guest's DMA/DART mappings stay valid (the reason the device
+ * model itself uses NAK instead of USB_RET_ASYNC here).
+ */
+typedef struct USBTCPPendingIn {
+    tcp_usb_request_header hdr;
+    QTAILQ_ENTRY(USBTCPPendingIn) next;
+} USBTCPPendingIn;
 
 struct USBTCPHostState {
     SysBusDevice parent_obj;
@@ -52,6 +68,9 @@ struct USBTCPHostState {
     USBTCPRemoteConnType conn_type;
     char *conn_addr;
     uint16_t conn_port;
+
+    QTAILQ_HEAD(, USBTCPPendingIn) pending_ins;
+    QEMUTimer *repoll_timer;
 };
 
 #endif /* HW_USB_HCD_TCP_H */

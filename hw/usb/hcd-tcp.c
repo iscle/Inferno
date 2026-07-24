@@ -46,6 +46,8 @@
     } while (0)
 #endif
 
+static void usb_tcp_host_free_pending(USBTCPHostState *s);
+
 static void usb_tcp_host_closed(USBTCPHostState *s)
 {
     DPRINTF("%s\n", __func__);
@@ -56,6 +58,7 @@ static void usb_tcp_host_closed(USBTCPHostState *s)
         s->ioc = NULL;
     }
     s->closed = true;
+    usb_tcp_host_free_pending(s);
     migrate_del_blocker(&s->migration_blocker);
 }
 
@@ -196,6 +199,99 @@ static void usb_tcp_host_respond_packet(USBTCPHostState *s, USBTCPPacket *pkt)
     qemu_coroutine_enter(co);
 }
 
+/*
+ * How often to re-run a parked IN token the device NAK'd. Each re-run re-fires
+ * the endpoint's XFERNOTREADY event to the guest, so polling too fast starves
+ * the guest driver and it never queues data (the mux handshake then hangs). A
+ * few hundred hertz is plenty: an IN that actually has data does not NAK, so it
+ * completes immediately regardless of this interval — this only paces the
+ * genuinely-idle case.
+ */
+#define USB_TCP_HOST_REPOLL_NS 2000000 /* 2ms */
+
+/*
+ * Build and run one IN token described by ph. Returns true (and sends the
+ * response) if the device produced a terminal, non-NAK status; returns false
+ * (nothing sent) if the device still has no data queued. Each call is a fresh
+ * transaction, so the guest's current DMA descriptors/mappings are used — this
+ * is why re-polling here is safe where device-side USB_RET_ASYNC was not.
+ */
+static bool usb_tcp_host_run_in(USBTCPHostState *s, USBPort *port,
+                                const tcp_usb_request_header *ph)
+{
+    USBEndpoint *ep = usb_ep_get(port->dev, ph->pid, ph->ep);
+    if (ep == NULL) {
+        return true; /* endpoint gone — stop retrying */
+    }
+
+    USBTCPPacket *pkt = g_new0(USBTCPPacket, 1);
+    usb_packet_init(&pkt->p);
+    usb_packet_setup(&pkt->p, ph->pid, ep, ph->stream, ph->id, ph->short_not_ok,
+                     ph->int_req);
+    if (ph->length > 0) {
+        pkt->buffer = g_malloc0(ph->length);
+        usb_packet_addbuf(&pkt->p, pkt->buffer, ph->length);
+    }
+    pkt->dev = ep->dev;
+    pkt->s = s;
+    pkt->addr = ph->addr;
+
+    usb_handle_packet(pkt->dev, &pkt->p);
+
+    if (pkt->p.status == USB_RET_NAK) {
+        usb_packet_cleanup(&pkt->p);
+        g_free(pkt->buffer);
+        g_free(pkt);
+        return false;
+    }
+
+    usb_tcp_host_respond_packet(s, pkt);
+    return true;
+}
+
+static void usb_tcp_host_free_pending(USBTCPHostState *s)
+{
+    USBTCPPendingIn *pi, *tmp;
+    QTAILQ_FOREACH_SAFE (pi, &s->pending_ins, next, tmp) {
+        QTAILQ_REMOVE(&s->pending_ins, pi, next);
+        g_free(pi);
+    }
+    if (s->repoll_timer) {
+        timer_del(s->repoll_timer);
+    }
+}
+
+/* Timer callback: re-run every parked IN; complete the ones that now have data,
+ * keep re-polling the rest. */
+static void usb_tcp_host_repoll(void *opaque)
+{
+    USBTCPHostState *s = opaque;
+    USBPort *port;
+    USBTCPPendingIn *pi, *tmp;
+
+    if (s->closed) {
+        usb_tcp_host_free_pending(s);
+        return;
+    }
+    port = usb_tcp_host_find_active_port(s);
+    if (port->dev == NULL || !port->dev->attached) {
+        usb_tcp_host_free_pending(s);
+        return;
+    }
+
+    QTAILQ_FOREACH_SAFE (pi, &s->pending_ins, next, tmp) {
+        if (usb_tcp_host_run_in(s, port, &pi->hdr)) {
+            QTAILQ_REMOVE(&s->pending_ins, pi, next);
+            g_free(pi);
+        }
+    }
+
+    if (!QTAILQ_EMPTY(&s->pending_ins)) {
+        timer_mod(s->repoll_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + USB_TCP_HOST_REPOLL_NS);
+    }
+}
+
 static void coroutine_fn usb_tcp_host_msg_loop_co(void *opaque)
 {
     USBTCPHostState *s;
@@ -262,8 +358,31 @@ static void coroutine_fn usb_tcp_host_msg_loop_co(void *opaque)
             assert_true(bql_locked());
 
             usb_handle_packet(pkt->dev, &pkt->p);
-            usb_tcp_host_respond_packet(s, pkt);
-            g_steal_pointer(&pkt);
+
+            if (pkt_hdr.pid == USB_TOKEN_IN && pkt_hdr.ep != 0 &&
+                pkt->p.status == USB_RET_NAK) {
+                /*
+                 * A bulk/interrupt IN with no data queued yet. Park it and
+                 * re-poll locally instead of relaying a NAK the remote host
+                 * would have to software-poll on (which throttles the OUT
+                 * stream). Control (ep0) NAKs are still relayed as before.
+                 */
+                USBTCPPendingIn *pi = g_new0(USBTCPPendingIn, 1);
+                pi->hdr = pkt_hdr;
+                QTAILQ_INSERT_TAIL(&s->pending_ins, pi, next);
+                usb_packet_cleanup(&pkt->p);
+                g_free(pkt->buffer);
+                pkt->buffer = NULL;
+                /* pkt itself is freed by g_autofree */
+                if (!timer_pending(s->repoll_timer)) {
+                    timer_mod(s->repoll_timer,
+                              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
+                                  USB_TCP_HOST_REPOLL_NS);
+                }
+            } else {
+                usb_tcp_host_respond_packet(s, pkt);
+                g_steal_pointer(&pkt);
+            }
             break;
         }
         case TCP_USB_RESPONSE:
@@ -305,6 +424,7 @@ static void coroutine_fn usb_tcp_host_msg_loop_co(void *opaque)
         case TCP_USB_RESET:
             DPRINTF("%s: TCP_USB_RESET\n", __func__);
             assert_true(bql_locked());
+            usb_tcp_host_free_pending(s); /* parked INs belong to the old state */
             usb_device_reset(port->dev);
             break;
             ;
@@ -563,6 +683,9 @@ static void usb_tcp_host_realize(DeviceState *dev, Error **errp)
 
     s->closed = true;
     qemu_co_mutex_init(&s->write_mutex);
+
+    QTAILQ_INIT(&s->pending_ins);
+    s->repoll_timer = timer_new_ns(QEMU_CLOCK_REALTIME, usb_tcp_host_repoll, s);
 }
 
 static void usb_tcp_host_unrealize(DeviceState *dev)
@@ -577,6 +700,11 @@ static void usb_tcp_host_unrealize(DeviceState *dev)
 
     s->closed = true;
     s->stopped = true;
+    usb_tcp_host_free_pending(s);
+    if (s->repoll_timer) {
+        timer_free(s->repoll_timer);
+        s->repoll_timer = NULL;
+    }
 }
 
 static void usb_tcp_host_init(Object *obj)
