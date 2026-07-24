@@ -208,14 +208,21 @@ static void usb_tcp_host_respond_packet(USBTCPHostState *s, USBTCPPacket *pkt)
  * interval after several consecutive NAKs (a sign the endpoint is truly idle).
  * A delivery resets the entry, so active endpoints stay fast.
  */
-#define USB_TCP_HOST_REPOLL_FAST_NS 150000  /* 150us while active */
-#define USB_TCP_HOST_REPOLL_SLOW_NS 2000000 /* 2ms once idle */
-#define USB_TCP_HOST_REPOLL_BACKOFF 12      /* NAKs before slowing down */
+/*
+ * Fixed re-poll interval. It must be large enough that re-running an idle
+ * endpoint's transfer (which re-fires XFERNOTREADY) doesn't starve the guest
+ * driver during the mux handshake — 150us was too fast and made the handshake
+ * flaky; 2ms is reliable but too slow for the multi-MB NOR write. 1ms is the
+ * balance. (An IN/OUT that actually has data/room does not NAK, so it completes
+ * immediately regardless of this interval — this only paces genuinely-idle
+ * endpoints.)
+ */
+#define USB_TCP_HOST_REPOLL_FAST_NS 2000000 /* 2ms */
 
 static uint64_t usb_tcp_host_repoll_ns(int nak_count)
 {
-    return nak_count < USB_TCP_HOST_REPOLL_BACKOFF ? USB_TCP_HOST_REPOLL_FAST_NS
-                                                   : USB_TCP_HOST_REPOLL_SLOW_NS;
+    (void)nak_count;
+    return USB_TCP_HOST_REPOLL_FAST_NS;
 }
 
 /*
