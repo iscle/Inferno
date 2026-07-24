@@ -315,15 +315,38 @@ static void usb_tcp_host_free_pending(USBTCPHostState *s)
     }
 }
 
-/* Timer callback: re-run parked tokens that are due; complete the ones that now
- * have data, back off the ones still NAK'ing, and re-arm to the earliest due
- * time. */
+/* True if an earlier pending token already exists for this (pid, ep): the
+ * endpoint is "busy", so a newly-arrived token must queue behind it rather than
+ * be delivered ahead of it (which would reorder the mux byte stream). */
+static bool usb_tcp_host_ep_busy(USBTCPHostState *s, int pid, uint8_t ep)
+{
+    USBTCPPendingIn *pi;
+    QTAILQ_FOREACH (pi, &s->pending_ins, next) {
+        if (pi->hdr.pid == pid && pi->hdr.ep == ep) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Timer callback: advance parked tokens that are due. Delivery is strictly
+ * in-order per endpoint: a token is never run while an earlier token for the
+ * same (pid, ep) is still pending. Running a later mux packet before an earlier
+ * one finishes would reorder the OUT byte stream (a partially-delivered packet's
+ * tail arriving after the next packet), which desyncs the device's mux — it
+ * parses a bogus packet header, reports "duplicate packet", and RSTs the restore
+ * connection. Completing each transfer fully before the next (as a real host
+ * controller does) keeps the stream intact.
+ */
 static void usb_tcp_host_repoll(void *opaque)
 {
     USBTCPHostState *s = opaque;
     USBPort *port;
     USBTCPPendingIn *pi, *tmp;
     uint64_t now;
+    struct { int pid; uint8_t ep; } blocked[16];
+    int n_blocked = 0;
 
     if (s->closed) {
         usb_tcp_host_free_pending(s);
@@ -337,22 +360,67 @@ static void usb_tcp_host_repoll(void *opaque)
 
     now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     QTAILQ_FOREACH_SAFE (pi, &s->pending_ins, next, tmp) {
-        if (pi->next_ns > now) {
-            continue; /* not due yet */
+        bool is_blocked = false;
+        for (int i = 0; i < n_blocked; i++) {
+            if (blocked[i].pid == pi->hdr.pid && blocked[i].ep == pi->hdr.ep) {
+                is_blocked = true;
+                break;
+            }
         }
+        if (is_blocked) {
+            continue; /* an earlier token for this endpoint hasn't finished */
+        }
+
+        if (pi->next_ns > now) {
+            /* head not due yet — block later tokens on the same endpoint */
+            if (n_blocked < (int)ARRAY_SIZE(blocked)) {
+                blocked[n_blocked].pid = pi->hdr.pid;
+                blocked[n_blocked].ep = pi->hdr.ep;
+                n_blocked++;
+            }
+            continue;
+        }
+
         if (usb_tcp_host_run_pending(s, port, pi)) {
             QTAILQ_REMOVE(&s->pending_ins, pi, next);
             g_free(pi->data);
             g_free(pi);
+            /* endpoint freed: a following same-ep token may run this pass */
         } else {
             pi->nak_count++;
             pi->next_ns = now + usb_tcp_host_repoll_ns(pi->nak_count);
+            if (n_blocked < (int)ARRAY_SIZE(blocked)) {
+                blocked[n_blocked].pid = pi->hdr.pid;
+                blocked[n_blocked].ep = pi->hdr.ep;
+                n_blocked++;
+            }
         }
     }
 
-    /* Re-arm to the soonest pending entry. */
+    /*
+     * Re-arm to the soonest *head* token (the first pending token of each
+     * endpoint). Tokens queued behind a head are driven when that head clears,
+     * so counting them here (their next_ns is in the past) would busy-loop.
+     */
     uint64_t soonest = 0;
+    struct { int pid; uint8_t ep; } seen[16];
+    int n_seen = 0;
     QTAILQ_FOREACH (pi, &s->pending_ins, next) {
+        bool is_head = true;
+        for (int i = 0; i < n_seen; i++) {
+            if (seen[i].pid == pi->hdr.pid && seen[i].ep == pi->hdr.ep) {
+                is_head = false;
+                break;
+            }
+        }
+        if (!is_head) {
+            continue;
+        }
+        if (n_seen < (int)ARRAY_SIZE(seen)) {
+            seen[n_seen].pid = pi->hdr.pid;
+            seen[n_seen].ep = pi->hdr.ep;
+            n_seen++;
+        }
         if (soonest == 0 || pi->next_ns < soonest) {
             soonest = pi->next_ns;
         }
@@ -428,17 +496,31 @@ static void coroutine_fn usb_tcp_host_msg_loop_co(void *opaque)
                     pi->data = g_malloc(pkt_hdr.length);
                     memcpy(pi->data, buffer, pkt_hdr.length);
                 }
-                if (usb_tcp_host_run_pending(s, port, pi)) {
+                /*
+                 * If the endpoint already has a token in flight, this one must
+                 * wait its turn — delivering it now would reorder the stream. Do
+                 * NOT deliver inline in that case; queue it and let the re-poll
+                 * run it once the head clears. Only when the endpoint is idle do
+                 * we try inline delivery for low latency.
+                 */
+                uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+                bool busy = usb_tcp_host_ep_busy(s, pkt_hdr.pid, pkt_hdr.ep);
+                bool delivered = false;
+                if (!busy) {
+                    delivered = usb_tcp_host_run_pending(s, port, pi);
+                }
+                if (delivered) {
                     g_free(pi->data);
                     g_free(pi);
                 } else {
-                    uint64_t due = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) +
-                                   USB_TCP_HOST_REPOLL_FAST_NS;
-                    pi->next_ns = due;
+                    /* A token queued behind a busy endpoint is due immediately
+                     * (it only waits on ordering); a freshly-parked head waits
+                     * one poll interval. */
+                    pi->next_ns = busy ? now : now + USB_TCP_HOST_REPOLL_FAST_NS;
                     QTAILQ_INSERT_TAIL(&s->pending_ins, pi, next);
                     if (!timer_pending(s->repoll_timer) ||
-                        timer_expire_time_ns(s->repoll_timer) > due) {
-                        timer_mod(s->repoll_timer, due);
+                        timer_expire_time_ns(s->repoll_timer) > pi->next_ns) {
+                        timer_mod(s->repoll_timer, pi->next_ns);
                     }
                 }
                 break;

@@ -59,7 +59,8 @@ echo "== 2. usbmuxd (shim-backed, foreground) =="
 # soon as it's ACTIVE, instead of gating visibility on a preflight lockdownd
 # query (which is flaky against the emulated device and made discovery
 # nondeterministic).
-usbmuxd -f -v -U "$(whoami)" -S "$MUX_SOCK" -P NONE -p &
+usbmuxd -f ${INFERNO_MUXD_VERBOSE:--v} -U "$(whoami)" -S "$MUX_SOCK" -P NONE -p \
+    ${INFERNO_MUXD_LOG:+> "$INFERNO_MUXD_LOG" 2>&1} &
 PIDS+=($!)
 sleep 1
 
@@ -94,7 +95,7 @@ echo "   NOTE: USB is experimental; if it stalls, see README 'Remaining work'."
 # Single invocation: re-running idevicerestore against a device whose restored
 # has already been partway driven confuses it. The wait above ensures the device
 # is discoverable first. Never let a nonzero exit trip 'set -e'.
-idevicerestore --erase --restore-mode -i "$ECID" "$IPSW" -T "$DATA_DIR/root_ticket.der" 2>&1 \
+idevicerestore ${INFERNO_IREC_VERBOSE:-} --erase --restore-mode -i "$ECID" "$IPSW" -T "$DATA_DIR/root_ticket.der" 2>&1 \
     | tee "/tmp/idevicerestore.out"
 echo "== idevicerestore exited ${PIPESTATUS[0]} =="
 
