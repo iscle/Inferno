@@ -13,6 +13,7 @@ system_ss.add(when: 'CONFIG_APPLE_SOC', if_true: files(
     'pmu-d2255.c',
     'aop.c',
     'baseband.c',
+    'apple-bcm-wlan.c',
     'buttons.c',
     'tempsensor.c',
     'mic_tempsensor.c',

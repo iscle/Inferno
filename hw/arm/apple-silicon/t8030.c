@@ -47,6 +47,7 @@
 #include "hw/intc/apple_aic.h"
 #include "hw/misc/apple-silicon/aes.h"
 #include "hw/misc/apple-silicon/aop.h"
+#include "hw/misc/apple-silicon/apple-bcm-wlan.h"
 #include "hw/misc/apple-silicon/baseband.h"
 #include "hw/misc/apple-silicon/buttons.h"
 #include "hw/misc/apple-silicon/chestnut.h"
@@ -1393,6 +1394,38 @@ static void t8030_create_baseband(AppleT8030MachineState *t8030)
         DEVICE(apcie_host), "interrupt_pci", bridge_index,
         qdev_get_gpio_in_named(DEVICE(baseband), "interrupt_pci", 0));
 #endif
+}
+
+static void t8030_create_wlan(AppleT8030MachineState *t8030)
+{
+    SysBusDevice *wlan;
+    AppleDTNode *child;
+    ApplePCIEHost *apcie_host;
+
+    // The Broadcom BCM4378 Wi-Fi endpoint. In the T8030 device tree the
+    // combo Wi-Fi/BT part hangs off the "amfm" apcie bridge; the baseband
+    // already claims bridge3 and ANS uses bridge0's secondary bus. bridge2 is
+    // the free bridge that actually exists in the device tree (bridge0/bridge1
+    // do not) and has its own DART (dart-apcie2) providing the DMA address
+    // space, so we attach Wi-Fi there. This mirrors how the baseband picks
+    // bridge3.
+    child = apple_dt_get_node(t8030->device_tree, "wlan");
+    // The node may have been stripped from the device tree (see boot.c
+    // REM_NAMES/REM_DEV_TYPES, guarded by ENABLE_WLAN). Creating the endpoint
+    // is still harmless: iOS simply won't probe it without the node.
+
+    ApplePCIEPort *port = APPLE_PCIE_PORT(
+        object_property_get_link(OBJECT(t8030), "pcie.bridge2", &error_fatal));
+    PCIDevice *pci_dev = PCI_DEVICE(port);
+    PCIBridge *pci_bridge = PCI_BRIDGE(pci_dev);
+    PCIBus *sec_bus = pci_bridge_get_sec_bus(pci_bridge);
+    apcie_host = port->host;
+    (void)apcie_host;
+
+    wlan = apple_bcm_wlan_create(child, sec_bus, port);
+    assert_nonnull(wlan);
+    object_property_add_child(OBJECT(t8030), "wlan", OBJECT(wlan));
+    sysbus_realize_and_unref(wlan, &error_fatal);
 }
 
 static void t8030_create_gpio(AppleT8030MachineState *t8030, const char *name)
@@ -2963,6 +2996,9 @@ static void t8030_init(MachineState *machine)
 #ifdef ENABLE_BASEBAND
     t8030_create_baseband_spmi(t8030, "spmi1", "baseband-spmi");
     t8030_create_baseband(t8030);
+#endif
+#ifdef ENABLE_WLAN
+    t8030_create_wlan(t8030);
 #endif
     t8030_create_sio(t8030);
     t8030_create_spi0(t8030);

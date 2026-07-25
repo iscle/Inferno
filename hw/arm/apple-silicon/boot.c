@@ -170,7 +170,9 @@ static const char *REM_NAMES[] = {
     "rose\0$",
     "smc-aop\0$",
     "gfx-asc\0$",
+#ifndef ENABLE_WLAN
     "amfm\0$",
+#endif
     "dart-ane\0$",
     "dart-avd\0$",
     "dart-ave\0$",
@@ -183,7 +185,9 @@ static const char *REM_NAMES[] = {
     "stockholm\0$",
     "stockholm-spmi\0$",
     "bluetooth-pcie\0$",
+#ifndef ENABLE_WLAN
     "wlan\0$",
+#endif
 #ifndef ENABLE_BASEBAND
     "baseband\0$",
     "baseband-spmi\0$",
@@ -197,7 +201,9 @@ static const char *REM_NAMES[] = {
 };
 
 static const char *REM_DEV_TYPES[] = {
+#ifndef ENABLE_WLAN
     "wlan\0$",
+#endif
     "pmp\0$",
 };
 
