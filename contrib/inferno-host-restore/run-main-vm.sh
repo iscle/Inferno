@@ -102,9 +102,20 @@ CMD=( "$QEMU"
         -device nvme-ns,drive=panic_log,bus=nvme-bus.0,nsid=7,nstype=8,logical_block_size=4096,physical_block_size=4096
 )
 
-# Display: cocoa by default; set INFERNO_DISPLAY=none for headless runs.
+# Display backend. cocoa by default (a native window). Set INFERNO_DISPLAY=none
+# for headless, or INFERNO_DISPLAY=vnc to serve VNC on 127.0.0.1:5900 (connect
+# with e.g. `open vnc://127.0.0.1:5900`) — useful when the VM is launched from a
+# context without window-server access (a background/ssh session).
 case "${INFERNO_DISPLAY:-cocoa}" in
     none) CMD+=( -display none );;
+    vnc)
+        # Set INFERNO_VNC_PASSWORD to require a password (recommended: macOS
+        # Screen Sharing prompts for one regardless). The password itself is
+        # applied after start via the monitor: `set_password vnc <pw>`.
+        vnc_opts="vnc=${INFERNO_VNC_ADDR:-127.0.0.1:0}"
+        [ -n "${INFERNO_VNC_PASSWORD:-}" ] && vnc_opts+=",password=on"
+        CMD+=( -display "$vnc_opts" )
+        ;;
     *)    CMD+=( -display cocoa,zoom-to-fit=on,zoom-interpolation=on,show-cursor=on );;
 esac
 
