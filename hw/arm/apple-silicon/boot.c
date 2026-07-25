@@ -85,6 +85,12 @@ static const char *KEEP_COMP[] = {
 #ifdef ENABLE_BASEBAND
     "baseband,i19\0$",
 #endif
+#ifdef ENABLE_WLAN
+    // Keep the apcie/pci-bridge2/wlan endpoint node: without it iOS enumerates
+    // the PCIe function but has no matching DT child, never names the nub
+    // "wlan", and AppleBCMWLAN's waitForMatchingService("wlan") blocks forever.
+    "wlan-pcie,bcm4378\0$",
+#endif
     // "biosensor,pearl\0$", // not implemented
     "buttons\0$",
     // "bluetooth,n88\0$",

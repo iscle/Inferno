@@ -1431,10 +1431,10 @@ static void t8030_create_wlan(AppleT8030MachineState *t8030)
     // do not) and has its own DART (dart-apcie2) providing the DMA address
     // space, so we attach Wi-Fi there. This mirrors how the baseband picks
     // bridge3.
-    child = apple_dt_get_node(t8030->device_tree, "wlan");
-    // The node may have been stripped from the device tree (see boot.c
-    // REM_NAMES/REM_DEV_TYPES, guarded by ENABLE_WLAN). Creating the endpoint
-    // is still harmless: iOS simply won't probe it without the node.
+    // apple_dt_get_node is path-based (direct children only), so the nested
+    // endpoint node must be fetched by its full path, not the bare name.
+    child = apple_dt_get_node(t8030->device_tree,
+                              "arm-io/apcie/pci-bridge2/wlan");
     // Drop 'amfm-managed-port-control' from wherever it lives in the device
     // tree so AppleBCMWLANBusInterfacePCIe brings the PCIe port up via the plain
     // AppleEmbeddedPCIEPortControlFunction path (apcie perst/clkreq/LTSSM,
