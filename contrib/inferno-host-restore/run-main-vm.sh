@@ -76,6 +76,9 @@ case "$USB_CONN_TYPE" in
 esac
 
 APPEND="tlto_us=-1 mtxspin=-1 agm-genuine=1 agm-authentic=1 agm-trusted=1 serial=3 wdt=-1 -vm_compressor_wk_sw"
+# Optional extra kernel boot-args (e.g. INFERNO_EXTRA_BOOTARGS="pcidebug=0xffffffff"
+# to trace IOPCIFamily enumeration). Appended verbatim.
+[ -n "${INFERNO_EXTRA_BOOTARGS:-}" ] && APPEND+=" $INFERNO_EXTRA_BOOTARGS"
 
 CMD=( "$QEMU"
     -M "$MACHINE"
