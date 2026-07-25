@@ -295,6 +295,8 @@ static void adp_v4_update_irqs(AppleDisplayPipeV4State *genpipe)
                                     qatomic_read(&genpipe->int_status)) != 0);
 }
 
+static void adp_v4_update_vblank(AppleDisplayPipeV4State *adp);
+
 static pixman_format_code_t adp_v4_gp_fmt_to_pixman(ADPV4GenPipe *genpipe)
 {
     if ((genpipe->state.pixel_format & GP_PIXEL_FORMAT_BGRA) ==
@@ -565,6 +567,7 @@ static void adp_v4_reg_write(void *opaque, hwaddr addr, uint64_t data,
         ADP_INFO("disp: int enable <- 0x%X", (uint32_t)data);
         qatomic_set(&adp->int_enable, (uint32_t)data);
         adp_v4_update_irqs(adp);
+        adp_v4_update_vblank(adp);
         break;
     }
     case (0x4602C >> 2): {
@@ -843,6 +846,7 @@ static void adp_v4_reset_hold(Object *obj, ResetType type)
     qatomic_set(&adp->int_enable, 0);
 
     adp_v4_update_irqs(adp);
+    adp_v4_update_vblank(adp); /* int_enable cleared -> stops the generator */
 
     adp_v4_update_disp_image_ptr(adp);
 
@@ -853,24 +857,53 @@ static void adp_v4_reset_hold(Object *obj, ResetType type)
     adp_v4_read_and_draw_boot_splash(adp);
 }
 
-// The panel runs at 60 Hz (see adp_v4_timing_info); emit a scanout/vblank
-// event every frame.
-#define ADP_V4_VBLANK_PERIOD_NS (NANOSECONDS_PER_SECOND / 60)
+/*
+ * The panel refreshes at 60 Hz; the display controller's timing generator
+ * raises OUTPUT_READY (the scanout / vertical-blank event) once per frame.
+ */
+#define ADP_V4_REFRESH_HZ 60
+#define ADP_V4_VBLANK_PERIOD_NS (NANOSECONDS_PER_SECOND / ADP_V4_REFRESH_HZ)
+
+/*
+ * Start or stop the vertical-blank timing generator so it runs exactly while
+ * the guest has the OUTPUT_READY interrupt unmasked. On real hardware the
+ * generator free-runs whenever the display is powered and the CPU just masks
+ * the interrupt; modelling it off CONTROL_INT_ENABLE is observably equivalent
+ * (OUTPUT_READY has no effect while masked) and avoids a timer that ticks
+ * before the display is ever brought up. Crucially the generator is driven by
+ * this timer, NOT by gfx_update(): gfx_update() only runs when a UI backend
+ * refreshes the console, so under -display none it never fires and the guest's
+ * IOMobileFramebuffer swap_wait would block forever.
+ */
+static void adp_v4_update_vblank(AppleDisplayPipeV4State *adp)
+{
+    if (!adp->vblank_timer) {
+        return; /* not realized yet (e.g. reset during init) */
+    }
+
+    bool enabled =
+        qatomic_read(&adp->int_enable) & R_CONTROL_INT_OUTPUT_READY_MASK;
+
+    if (enabled && !timer_pending(adp->vblank_timer)) {
+        timer_mod(adp->vblank_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ADP_V4_VBLANK_PERIOD_NS);
+    } else if (!enabled) {
+        timer_del(adp->vblank_timer);
+    }
+}
 
 static void adp_v4_vblank(void *opaque)
 {
     AppleDisplayPipeV4State *adp = opaque;
 
-    // A real display timing generator raises the OUTPUT_READY (scanout/vblank)
-    // interrupt once per frame as long as the pipe is powered, independent of
-    // whether any host is looking at the output. IOMobileFramebuffer's
-    // swap_wait blocks until this fires, so it must be driven here rather than
-    // from gfx_update (which only runs when a UI display backend refreshes the
-    // console, and never under -display none).
     qatomic_or(&adp->int_status, R_CONTROL_INT_OUTPUT_READY_MASK);
     adp_v4_update_irqs(adp);
-    timer_mod(adp->vblank_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ADP_V4_VBLANK_PERIOD_NS);
+
+    /* Keep scanning out while the guest still wants vblank reporting. */
+    if (qatomic_read(&adp->int_enable) & R_CONTROL_INT_OUTPUT_READY_MASK) {
+        timer_mod(adp->vblank_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ADP_V4_VBLANK_PERIOD_NS);
+    }
 }
 
 static void adp_v4_realize(DeviceState *dev, Error **errp)
@@ -878,10 +911,8 @@ static void adp_v4_realize(DeviceState *dev, Error **errp)
     AppleDisplayPipeV4State *adp = APPLE_DISPLAY_PIPE_V4(dev);
 
     adp->console = graphic_console_init(dev, 0, &adp_v4_ops, adp);
-    adp->vblank_timer =
-        timer_new_ns(QEMU_CLOCK_VIRTUAL, adp_v4_vblank, adp);
-    timer_mod(adp->vblank_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ADP_V4_VBLANK_PERIOD_NS);
+    /* Armed on demand when the guest enables OUTPUT_READY; see adp_v4_update_vblank(). */
+    adp->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, adp_v4_vblank, adp);
 }
 
 static const Property adp_v4_props[] = {
