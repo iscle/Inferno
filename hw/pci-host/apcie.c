@@ -994,6 +994,27 @@ static void apple_pcie_port_config_write(void *opaque, hwaddr addr,
         port->port_ltssm_enable = data;
         DPRINTF("%s: reg==0x80: Port %u: port_ltssm_enable: 0x%x\n", __func__,
                 port->bus_nr, port->port_ltssm_enable);
+        if (port->manual_enable) {
+            // A manual-enable port (e.g. T8030 bridge2 "wlan") is NOT brought
+            // up via setPortEnable / the 0x800 port-config register. iOS uses
+            // AppleMultiFunctionPlatformEmbedded::setPortEnable(), which drives
+            // power/refclk through a side provider and never writes apcie 0x800;
+            // the apcie link itself is enabled by this LTSSM-enable write. Since
+            // the T8030 linksts path (0x208) and the 0x804 port-status read both
+            // derive is_link_up/is_port_enabled purely from port_cfg_port_config
+            // (only ever set by a 0x800 write), a manual-enable port would never
+            // report link-up. Mirror the LTSSM-enable bit into
+            // port_cfg_port_config so those reads report the port as enabled and
+            // iOS maps the endpoint BARs. This is exactly what the S800x linksts
+            // (0x88) path above already does (is_link_up from port_ltssm_enable).
+            // Scoped to manual_enable so non-manual ports (baseband bridge3, ANS
+            // bridge0) keep enabling via their own 0x800 writes, unchanged.
+            if ((data & 1) != 0) {
+                port->port_cfg_port_config |= 1;
+            } else {
+                port->port_cfg_port_config &= ~1u;
+            }
+        }
         if ((data & 1) != 0) {
             DPRINTF("%s: reg==0x80: Port %u: enable_power_and_irq\n", __func__,
                     port->bus_nr);
