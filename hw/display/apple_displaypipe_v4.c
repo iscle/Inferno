@@ -177,6 +177,7 @@ struct AppleDisplayPipeV4State {
     QemuConsole *console;
     QEMUBH *update_disp_image_bh;
     QEMUTimer *boot_splash_timer;
+    QEMUTimer *vblank_timer;
 };
 
 static const VMStateDescription vmstate_adp_v4 = {
@@ -195,6 +196,7 @@ static const VMStateDescription vmstate_adp_v4 = {
             VMSTATE_STRUCT(blend_unit, AppleDisplayPipeV4State, 0,
                            vmstate_adp_v4_blend_unit, ADPV4BlendUnitState),
             VMSTATE_TIMER_PTR(boot_splash_timer, AppleDisplayPipeV4State),
+            VMSTATE_TIMER_PTR(vblank_timer, AppleDisplayPipeV4State),
             VMSTATE_END_OF_LIST(),
         },
 };
@@ -672,8 +674,10 @@ static void adp_v4_gfx_update(void *opaque)
     }
     g_free(snap);
 
-    qatomic_or(&adp->int_status, R_CONTROL_INT_OUTPUT_READY_MASK);
-    adp_v4_update_irqs(adp);
+    // Note: OUTPUT_READY (the per-frame scanout/vblank event) is raised by the
+    // free-running vblank timer (adp_v4_vblank), not here. gfx_update only runs
+    // when a host UI backend refreshes the console, so tying vblank to it hangs
+    // the guest under -display none; see adp_v4_vblank.
 }
 
 static const GraphicHwOps adp_v4_ops = {
@@ -849,11 +853,35 @@ static void adp_v4_reset_hold(Object *obj, ResetType type)
     adp_v4_read_and_draw_boot_splash(adp);
 }
 
+// The panel runs at 60 Hz (see adp_v4_timing_info); emit a scanout/vblank
+// event every frame.
+#define ADP_V4_VBLANK_PERIOD_NS (NANOSECONDS_PER_SECOND / 60)
+
+static void adp_v4_vblank(void *opaque)
+{
+    AppleDisplayPipeV4State *adp = opaque;
+
+    // A real display timing generator raises the OUTPUT_READY (scanout/vblank)
+    // interrupt once per frame as long as the pipe is powered, independent of
+    // whether any host is looking at the output. IOMobileFramebuffer's
+    // swap_wait blocks until this fires, so it must be driven here rather than
+    // from gfx_update (which only runs when a UI display backend refreshes the
+    // console, and never under -display none).
+    qatomic_or(&adp->int_status, R_CONTROL_INT_OUTPUT_READY_MASK);
+    adp_v4_update_irqs(adp);
+    timer_mod(adp->vblank_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ADP_V4_VBLANK_PERIOD_NS);
+}
+
 static void adp_v4_realize(DeviceState *dev, Error **errp)
 {
     AppleDisplayPipeV4State *adp = APPLE_DISPLAY_PIPE_V4(dev);
 
     adp->console = graphic_console_init(dev, 0, &adp_v4_ops, adp);
+    adp->vblank_timer =
+        timer_new_ns(QEMU_CLOCK_VIRTUAL, adp_v4_vblank, adp);
+    timer_mod(adp->vblank_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ADP_V4_VBLANK_PERIOD_NS);
 }
 
 static const Property adp_v4_props[] = {
