@@ -134,12 +134,20 @@ static void apple_pcie_set_own_irq(ApplePCIEPort *port, int level)
     ApplePCIEHost *host = port->host;
     int irq_num = port->bus_nr;
 
-    // handling this, it might trigger interrupts on unmask otherwise
-    port->port_last_interrupt &= ~port->port_interrupt_mask;
-
-    if (level && !port->port_last_interrupt)
-        return;
-    qemu_set_irq(host->irqs[irq_num], level);
+    /*
+     * port_interrupt_mask is an ENABLE mask (bit set == interrupt enabled):
+     * iOS's AppleT803xPCIePort::enableInterrupts writes a broad enable set
+     * (e.g. 0x0fffffff) into the 0x104 register. The shared per-port INTx line
+     * is therefore asserted level-style whenever any ENABLED interrupt is
+     * pending in port_last_interrupt, and stays asserted until iOS clears the
+     * pending bits via the 0x100 write-1-to-clear register. (The old code did
+     * `port_last_interrupt &= ~mask`, which cleared exactly the *enabled*
+     * pending bits and so could never deliver a link-up/link-down interrupt.)
+     * `level` is advisory; the line state is recomputed from status & enable.
+     */
+    (void)level;
+    bool pending = (port->port_last_interrupt & port->port_interrupt_mask) != 0;
+    qemu_set_irq(host->irqs[irq_num], pending ? 1 : 0);
 }
 
 static void apple_pcie_root_bus_class_init(ObjectClass *klass, const void *data)
@@ -1290,7 +1298,24 @@ static void apple_pcie_port_config_ltssm_debug_write(void *opaque, hwaddr addr,
             __func__, port->bus_nr, addr, data);
     switch (addr) {
     case 0x10:
-        // break;
+        /*
+         * LTSSM start. This is the final write iOS issues when bringing a port
+         * up (after 0x800 port-enable, refclk 0x810, and PERST-deassert 0x814):
+         * it kicks link training. Model the link reaching L0 by latching
+         * link-up and raising the port's link-up interrupt (status bit 0x1000
+         * in the 0x100 register), which drives AppleEmbeddedPCIEPort::
+         * handleLinkUp(true) -> kernelRequestProbe -> a live config scan of the
+         * secondary bus that finally publishes the endpoint's IOPCIDevice nub.
+         * Without this, a manual-enable port (bridge2 "wlan") is never probed
+         * because iOS does not poll such ports for link-up -- it waits for this
+         * interrupt. Gate on the port actually being enabled so we don't signal
+         * link-up on a disabled/torn-down port.
+         */
+        if ((port->port_cfg_port_config & 1) != 0) {
+            port->is_link_up = true;
+            port->port_last_interrupt |= 0x1000; // link-up interrupt
+            apple_pcie_set_own_irq(port, 1);
+        }
         goto jump_default;
     case 0x14:
         // break;
@@ -1905,7 +1930,17 @@ static void apple_pcie_port_reset_hold(Object *obj, ResetType type)
         apcie_port_gpio_set_clkreq(DEVICE(port), 0);
         // apcie_port_gpio_set_clkreq(DEVICE(port), 1);
         if (port->manual_enable) {
-            port_devices_set_power(port, false);
+            /*
+             * Keep a manual-enable port's endpoint POWERED at reset so its
+             * config space is enumerable at link-up. iOS's passive WLAN driver
+             * only issues the 0x80/0x800 port-enable *after* its endpoint's
+             * IOPCIDevice is published, which requires the endpoint to already
+             * be enumerable -- powering it off here would deadlock that. The
+             * enable still gates the BAR/MMIO windows (is_link_up), matching
+             * hardware where config access comes up with the link independent
+             * of the software port-enable.
+             */
+            port_devices_set_power(port, true);
         }
     }
     port->skip_reset_clear = false;
