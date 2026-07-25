@@ -1396,6 +1396,28 @@ static void t8030_create_baseband(AppleT8030MachineState *t8030)
 #endif
 }
 
+/* Recursively delete a property from every node in the device tree; returns
+ * the number of nodes it was removed from (and logs each node's name). */
+static int t8030_dt_strip_prop(AppleDTNode *node, const char *prop_name)
+{
+    int n = 0;
+    GList *iter;
+
+    if (node == NULL) {
+        return 0;
+    }
+    if (apple_dt_del_prop_named(node, prop_name)) {
+        AppleDTProp *nm = apple_dt_get_prop(node, "name");
+        fprintf(stderr, "[wlan]   '%s' removed from node '%s'\n", prop_name,
+                nm ? (const char *)nm->data : "?");
+        n++;
+    }
+    for (iter = node->children; iter; iter = iter->next) {
+        n += t8030_dt_strip_prop((AppleDTNode *)iter->data, prop_name);
+    }
+    return n;
+}
+
 static void t8030_create_wlan(AppleT8030MachineState *t8030)
 {
     SysBusDevice *wlan;
@@ -1413,6 +1435,13 @@ static void t8030_create_wlan(AppleT8030MachineState *t8030)
     // The node may have been stripped from the device tree (see boot.c
     // REM_NAMES/REM_DEV_TYPES, guarded by ENABLE_WLAN). Creating the endpoint
     // is still harmless: iOS simply won't probe it without the node.
+    // Drop 'amfm-managed-port-control' from wherever it lives in the device
+    // tree so AppleBCMWLANBusInterfacePCIe brings the PCIe port up via the plain
+    // AppleEmbeddedPCIEPortControlFunction path (apcie perst/clkreq/LTSSM,
+    // already modeled and working for the baseband) instead of the
+    // AppleMultiFunctionManager / SMC gP11 handshake we don't emulate.
+    fprintf(stderr, "[wlan] stripped amfm-managed-port-control from %d node(s)\n",
+            t8030_dt_strip_prop(t8030->device_tree, "amfm-managed-port-control"));
 
     ApplePCIEPort *port = APPLE_PCIE_PORT(
         object_property_get_link(OBJECT(t8030), "pcie.bridge2", &error_fatal));
