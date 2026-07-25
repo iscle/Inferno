@@ -59,8 +59,12 @@ echo "== 2. usbmuxd (shim-backed, foreground) =="
 # soon as it's ACTIVE, instead of gating visibility on a preflight lockdownd
 # query (which is flaky against the emulated device and made discovery
 # nondeterministic).
-usbmuxd -f ${INFERNO_MUXD_VERBOSE:--v} -U "$(whoami)" -S "$MUX_SOCK" -P NONE -p \
-    ${INFERNO_MUXD_LOG:+> "$INFERNO_MUXD_LOG" 2>&1} &
+if [ -n "${INFERNO_MUXD_LOG:-}" ]; then
+    usbmuxd -f ${INFERNO_MUXD_VERBOSE:--v} -U "$(whoami)" -S "$MUX_SOCK" -P NONE -p \
+        > "$INFERNO_MUXD_LOG" 2>&1 &
+else
+    usbmuxd -f ${INFERNO_MUXD_VERBOSE:--v} -U "$(whoami)" -S "$MUX_SOCK" -P NONE -p &
+fi
 PIDS+=($!)
 sleep 1
 

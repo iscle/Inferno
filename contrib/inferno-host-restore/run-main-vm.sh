@@ -82,7 +82,7 @@ CMD=( "$QEMU"
     -kernel "$KERNEL"
     -dtb "$DTB"
     -append "$APPEND"
-    -smp 7 -m 4G
+    -smp 7 -m "${INFERNO_RAM:-4G}"
     -serial mon:stdio
     -drive file=sep_nvram,if=pflash,format=raw
     -drive file=sep_ssc,if=pflash,format=raw
@@ -111,6 +111,13 @@ esac
 if [ "$RESTORE" = "1" ]; then
     [ -e "$RAMDISK" ] || { echo "error: RESTORE=1 but RAM disk missing: $RAMDISK" >&2; exit 1; }
     CMD+=( -initrd "$RAMDISK" )
+fi
+
+# Optional extra QEMU args (e.g. "-s -monitor unix:/tmp/qmon.sock,server,nowait"
+# for a gdbstub + QMP/HMP monitor to inspect a hung guest).
+if [ -n "${INFERNO_QEMU_EXTRA:-}" ]; then
+    # shellcheck disable=SC2206
+    CMD+=( ${INFERNO_QEMU_EXTRA} )
 fi
 
 echo "+ ${CMD[*]}" >&2

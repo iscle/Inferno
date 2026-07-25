@@ -587,6 +587,15 @@ static void usb_tcp_remote_realize(USBDevice *dev, Error **errp)
         return;
     }
 
+    /*
+     * qemu_socket() returns a non-blocking socket, which makes the accept()
+     * loop in usb_tcp_remote_thread busy-spin a whole host CPU while waiting
+     * for the main VM to connect. On the companion VM that stolen core starves
+     * the (TCG) main VM's boot enough to trip its SoC watchdog. Make the
+     * listening socket blocking so accept() sleeps until a connection arrives.
+     */
+    qemu_set_blocking(s->socket, true, NULL);
+
     error_setg(&s->migration_blocker,
                "%s does not support migration "
                "while connected",

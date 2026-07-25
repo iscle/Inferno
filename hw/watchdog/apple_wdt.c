@@ -114,6 +114,23 @@ static void wdt_update(void *opaque)
     uint64_t expiry = 0xffffffff;
     uint32_t chip_tmr = wdt_get_chip_timer(s);
     uint32_t sys_tmr = wdt_get_sys_timer(s);
+    static int wdt_disabled = -1;
+
+    /*
+     * When driving the restore from a (TCG) companion VM, the emulated iPhone
+     * spins waiting on the companion's slow USB responses, burning virtual time
+     * until the SoC watchdog IRQ/reset trips ("wdog panic"). Set INFERNO_WDT_
+     * DISABLE=1 to neuter the watchdog so the slow enumeration can finish. The
+     * guest still pets it via register writes; we just never fire.
+     */
+    if (wdt_disabled < 0) {
+        wdt_disabled = getenv("INFERNO_WDT_DISABLE") != NULL;
+    }
+    if (wdt_disabled) {
+        timer_mod_ns(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                   (uint64_t)0xffffffff * s->cnt_period_ns);
+        return;
+    }
 
     if (s->reg.chip_control & WDOG_CTL_EN_RESET) {
         if (chip_tmr >= s->reg.chip_reset_counter) {
