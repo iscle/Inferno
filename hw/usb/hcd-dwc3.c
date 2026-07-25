@@ -228,6 +228,14 @@ int dwc3_bd_map(DWC3State *s, DWC3BufferDesc *desc, USBPacket *p)
     }
     assert(!desc->ended);
     desc->dir = dir;
+    // A desc may be re-mapped after a mid-transfer unmap: the OUT-continuation
+    // path in dwc3_bd_copy releases the mapping between chunks so that no host
+    // DMA mapping is ever held across guest execution. Reset the iovec so a
+    // re-map rebuilds it from the sglist instead of appending stale (already
+    // unmapped) entries. Note we deliberately do NOT reset desc->actual_length
+    // here: a re-mapped desc must continue filling at its current offset, and a
+    // freshly allocated desc (g_new0 in dwc3_td_fetch) already starts at 0.
+    qemu_iovec_reset(&desc->iov);
     for (i = 0; i < desc->sgl.nsg; i++) {
         dma_addr_t base = desc->sgl.sg[i].base;
         dma_addr_t len = desc->sgl.sg[i].len;
@@ -255,7 +263,6 @@ int dwc3_bd_map(DWC3State *s, DWC3BufferDesc *desc, USBPacket *p)
         }
     }
     desc->mapped = true;
-    desc->actual_length = 0;
     return 0;
 
 err:
@@ -713,6 +720,16 @@ static int dwc3_bd_copy(DWC3State *s, DWC3BufferDesc *desc, USBPacket *p)
                 __func__, desc->length, desc->actual_length,
                 p->ep->max_packet_size);
         p->status = USB_RET_SUCCESS;
+        // Keep the TRB open for the remainder of this OUT transfer, but do NOT
+        // hold the guest DMA mapping across guest execution. Leaving the "if_0"
+        // OUT mass-transfer tail mapped leaks a dma_memory_map on the guest
+        // receive buffer; when the guest later reprograms those pages / DART
+        // IOVAs for NVMe/APFS DMA (e.g. asr's embed/invert), the stale USB
+        // mapping collides and that I/O never retires, hanging the restore.
+        // This is the same hazard the NAK-not-ASYNC paths in this file avoid.
+        // The next chunk (or the terminating ZLP/short packet) re-maps via
+        // dwc3_bd_map and continues at desc->actual_length.
+        dwc3_bd_unmap(s, desc);
         return xfer_size;
     }
 
