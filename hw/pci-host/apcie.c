@@ -99,10 +99,18 @@ static void apcie_port_gpio_perst(void *opaque, int n, int level)
     assert(n == 0);
     DPRINTF("%s: old: %d ; new %d\n", __func__, port->gpio_perst_val, val);
     if (port->gpio_perst_val != val) {
-        // val != EP PERST
-        // val: 0 during disable, 1 during enable
-        // this breaks manual-enable ports
-        ////port_devices_set_power(port, val);
+        // val != EP PERST; val: 0 during disable, 1 during enable.
+        // Power the endpoint ON when PERST is deasserted (val==1) so its config
+        // space becomes enumerable at link-up, independent of the later
+        // 0x80/0x800 port-enable that only gates the BAR/MMIO windows (as on
+        // real hardware). This breaks the deadlock for passive drivers like
+        // AppleBCMWLAN, which wait for their endpoint's IOPCIDevice to be
+        // published (notifyPCIeAttached) before they ever issue the port
+        // enable. Only the enable direction is applied: powering OFF on
+        // PERST-assert (val==0) is what previously broke manual-enable ports.
+        if (val) {
+            port_devices_set_power(port, true);
+        }
     }
     port->gpio_perst_val = val;
 }
