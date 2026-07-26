@@ -639,6 +639,12 @@ static const uint8_t apple_bcm_wlan_otp_cis[] = {
 
 /* How many host ioctl-response / event buffers we keep queued. */
 #define BCM_MAX_POSTED_BUFS 256
+/*
+ * ... and how many receive buffers. This has to be at least as deep as the
+ * host's RX post ring (384 entries), because a buffer we take off that ring
+ * and cannot remember is a buffer the host has lost forever.
+ */
+#define BCM_MAX_RX_BUFS 512
 
 /*
  * Ring geometry, mirroring brcmfmac's msgbuf defaults. The driver panics
@@ -750,7 +756,7 @@ struct AppleBCMWLANDeviceState {
     unsigned ioctl_resp_head, ioctl_resp_count;
     AppleBCMWLANPostedBuf event_bufs[BCM_MAX_POSTED_BUFS];
     unsigned event_head, event_count;
-    AppleBCMWLANPostedBuf rx_bufs[BCM_MAX_POSTED_BUFS];
+    AppleBCMWLANPostedBuf rx_bufs[BCM_MAX_RX_BUFS];
     unsigned rx_head, rx_count;
 
     /*
@@ -2719,6 +2725,21 @@ static void apple_bcm_wlan_drain_rxpost_ring(AppleBCMWLANDeviceState *s)
 
     for (guard = 0; ring->index != write_index && guard < ring->max_item;
          guard++) {
+        AppleBCMWLANPostedBuf *slot;
+
+        /*
+         * Stop, rather than dropping the buffer on the floor. Consuming a
+         * receive buffer we cannot remember loses it for good: the host takes
+         * the advanced read index as "the device has it now" and never gets
+         * that packet back, so its receive pool bleeds away until the
+         * interface falls over with "rxCompRingDrain: rx buffer request fail".
+         * Leaving the item in the ring is exactly what a real chip does when
+         * it has nowhere to put it.
+         */
+        if (s->rx_count >= BCM_MAX_RX_BUFS) {
+            break;
+        }
+
         if (!apple_bcm_wlan_dma_read(s,
                                      ring->base_addr +
                                          ring->index * ring->len_items,
@@ -2726,10 +2747,8 @@ static void apple_bcm_wlan_drain_rxpost_ring(AppleBCMWLANDeviceState *s)
             break;
         }
 
-        if (msg[BCM_MSGBUF_HDR_MSGTYPE_OFF] == BCM_MSGBUF_TYPE_RXBUF_POST &&
-            s->rx_count < BCM_MAX_POSTED_BUFS) {
-            AppleBCMWLANPostedBuf *slot =
-                &s->rx_bufs[(s->rx_head + s->rx_count) % BCM_MAX_POSTED_BUFS];
+        if (msg[BCM_MSGBUF_HDR_MSGTYPE_OFF] == BCM_MSGBUF_TYPE_RXBUF_POST) {
+            slot = &s->rx_bufs[(s->rx_head + s->rx_count) % BCM_MAX_RX_BUFS];
 
             slot->request_id = ldl_le_p(msg + BCM_MSGBUF_HDR_REQUEST_ID_OFF);
             slot->len = lduw_le_p(msg + BCM_RX_POST_DATA_LEN_OFF);
@@ -2737,6 +2756,9 @@ static void apple_bcm_wlan_drain_rxpost_ring(AppleBCMWLANDeviceState *s)
                 ldl_le_p(msg + BCM_RX_POST_DATA_ADDR_OFF) |
                 ((uint64_t)ldl_le_p(msg + BCM_RX_POST_DATA_ADDR_OFF + 4) << 32);
             s->rx_count++;
+        } else {
+            qemu_log_mask(LOG_UNIMP, "%s: UNIMP RX post message type 0x%x\n",
+                          __func__, msg[BCM_MSGBUF_HDR_MSGTYPE_OFF]);
         }
 
         ring->index = (ring->index + 1) % ring->max_item;
@@ -2879,7 +2901,7 @@ static ssize_t apple_bcm_wlan_receive(NetClientState *nc, const uint8_t *buf,
                       __func__, size, rx.len);
         return size;
     }
-    s->rx_head = (s->rx_head + 1) % BCM_MAX_POSTED_BUFS;
+    s->rx_head = (s->rx_head + 1) % BCM_MAX_RX_BUFS;
     s->rx_count--;
 
     if (!apple_bcm_wlan_dma_write(s, rx.addr, size, (uint8_t *)buf)) {
