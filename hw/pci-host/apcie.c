@@ -216,15 +216,44 @@ static void apple_pcie_port_msi_write(void *opaque, hwaddr addr, uint64_t data,
     status = true;
     // status might be msi_intr_index
     if (status) {
-        // iOS will only acknowledge the interrupt when it expects it, and will
-        // cause an interrupt storm otherwise
-        // need to find a place to quisce it properly
-        // apple_aic_unmask_interrupt(msi_interrupt);
+        /*
+         * An MSI is a message, but the AIC is a level-triggered controller:
+         * apple_aic_set_irq only sets or clears a bit in eir_state, a 64 us
+         * timer turns any set-and-unmasked bit into a CPU interrupt, and the
+         * ACK read merely MASKS the vector rather than clearing its state. So
+         * raising the line and leaving it raised means the guest gets the
+         * interrupt again the instant its handler unmasks the vector, forever.
+         * That does not look like a device failure -- the storm starves the
+         * CPU fielding it and the guest dies of an unrelated "Spinlock
+         * timeout" somewhere else entirely.
+         *
+         * Lowering it immediately does not work either: the AIC samples
+         * eir_state from its timer, so a pulse that starts and ends between
+         * two samples is simply lost.
+         *
+         * So hold the line up for a few AIC periods and then drop it. Any
+         * further MSI in the meantime just extends the window.
+         */
+        port->msi_asserted_banks |= BIT(msi_intr_index);
         qemu_set_irq(host->msi_irqs[bus_nr * 8 + msi_intr_index], 1);
-        // apple_aic_mask_interrupt(msi_interrupt);
-        //  pulsing doesn't work.
-        //  qemu_irq_pulse(host->msi_irqs[bus_nr * 8 + msi_intr_index]);
+        timer_mod_ns(port->msi_deassert_timer,
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                         APPLE_PCIE_MSI_ASSERT_NS);
     }
+}
+
+static void apple_pcie_port_msi_deassert(void *opaque)
+{
+    ApplePCIEPort *port = opaque;
+    ApplePCIEHost *host = port->host;
+    int i;
+
+    for (i = 0; i < APPLE_PCIE_NUM_MSI_BANKS; i++) {
+        if (port->msi_asserted_banks & BIT(i)) {
+            qemu_set_irq(host->msi_irqs[port->bus_nr * 8 + i], 0);
+        }
+    }
+    port->msi_asserted_banks = 0;
 }
 
 void apple_pcie_port_temp_lower_msi_irq(ApplePCIEPort *port, int msi_intr_index)
@@ -2040,6 +2069,10 @@ static void apple_pcie_port_realize(DeviceState *dev, Error **errp)
     PCIBus *bus = PCI_BUS(qdev_get_parent_bus(dev));
     PCIDevice *pci = PCI_DEVICE(dev);
     PCIESlot *slot = PCIE_SLOT(pci);
+
+    port->msi_asserted_banks = 0;
+    port->msi_deassert_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                            apple_pcie_port_msi_deassert, port);
 
     // PCIHostState *pci = PCI_HOST_BRIDGE(dev);
     // ApplePCIEHost *s = APPLE_PCIE_HOST(dev);

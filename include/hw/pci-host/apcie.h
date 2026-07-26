@@ -68,6 +68,12 @@ typedef struct ApplePCIEMSI {
     uint64_t base;
     MemoryRegion iomem;
 
+/*
+ * How long an MSI holds its AIC line up before it is dropped again. The AIC
+ * samples its input state every 64 us, so this has to span several samples.
+ */
+#define APPLE_PCIE_MSI_ASSERT_NS (500 * 1000)
+
 #define APPLE_PCIE_NUM_MSI_BANKS 1
     // #define APPLE_PCIE_NUM_MSI_BANKS 8
 
@@ -138,6 +144,14 @@ struct ApplePCIEPort {
     uint32_t port_rid_sid_map[0x40]; // 0x828 .. 0x924
 
     uint32_t port_ltssm_status; // 0x30
+
+    /*
+     * MSI deassert. The AIC is level driven, so an MSI write has to leave its
+     * line raised long enough to be noticed and then lower it again; see
+     * apple_pcie_port_msi_write().
+     */
+    uint32_t msi_asserted_banks;
+    QEMUTimer *msi_deassert_timer;
 
     qemu_irq apcie_port_gpio_clkreq_irq;
     bool gpio_perst_val;
