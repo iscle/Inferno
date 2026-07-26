@@ -542,10 +542,18 @@ static const ARMCPRegInfo apple_a13_cp_reginfo_tcg[] = {
     A13_CPREG_DEF(IMP_BARRIER_LBSY_BST_SYNC_W1_EL0, 3, 3, 15, 15, 1, PL1_RW, 0),
     // The core PMU has ten counters. PMC0/PMC1 are the fixed cycle and
     // instruction counters; PMC2 through PMC9 are the configurable ones, and
-    // note that PMC8/PMC9 sit at c9/c10, not c8/c10 — c8 is OPMAT1. The whole
-    // block has to exist, because XNU's counter save/restore writes every one
-    // of them on a context switch, and a missing one raises an undefined
-    // instruction exception instead.
+    // note that PMC8/PMC9 sit at c9/c10, not c8/c10. The gap is real: nothing
+    // in the iOS 14 kernelcache ever names s3_2_c15_c8_0, and mt_core_snap()
+    // walks exactly this sequence in its ten-way jump table over the counter
+    // index. (c8 in the *op1=1* space is OPMAT1, below, which is a different
+    // register altogether.)
+    //
+    // Only PMC0/PMC1 are read on a normal boot - mt_fiq() loops over the two
+    // fixed counters - and every other user here sits behind the kpc_configured
+    // flag, so this block is what keeps kperf and Instruments from panicking
+    // rather than something the guest needs to come up. A missing register is
+    // not a silent zero: handle_sys() undefs it, and XNU turns that into a
+    // kernel panic.
     A13_CPREG_DEF(PMC0, 3, 2, 15, 0, 0, PL1_RW, 0),
     A13_CPREG_DEF(PMC1, 3, 2, 15, 1, 0, PL1_RW, 0),
     A13_CPREG_DEF(PMC2, 3, 2, 15, 2, 0, PL1_RW, 0),
@@ -567,6 +575,14 @@ static const ARMCPRegInfo apple_a13_cp_reginfo_tcg[] = {
     A13_CPREG_DEF(OPMAT1, 3, 1, 15, 8, 0, PL1_RW, 0),
     A13_CPREG_DEF(OPMSK0, 3, 1, 15, 9, 0, PL1_RW, 0),
     A13_CPREG_DEF(OPMSK1, 3, 1, 15, 10, 0, PL1_RW, 0),
+    // kpc_get_rawpmu_config() reads these four in the same unbroken run of
+    // instructions that reads OPMAT0/1 and OPMSK0/1 above, so the block is
+    // only useful complete: stopping at OPMSK1 just moves the undef four
+    // instructions along.
+    A13_CPREG_DEF(PMTRHLD6, 3, 2, 15, 12, 0, PL1_RW, 0),
+    A13_CPREG_DEF(PMTRHLD4, 3, 2, 15, 13, 0, PL1_RW, 0),
+    A13_CPREG_DEF(PMTRHLD2, 3, 2, 15, 14, 0, PL1_RW, 0),
+    A13_CPREG_DEF(PMMMAP, 3, 2, 15, 15, 0, PL1_RW, 0),
     A13_CPREG_DEF(PMSR, 3, 1, 15, 13, 0, PL1_RW, 0),
     A13_CPREG_DEF(S3_4_c15_c0_5, 3, 4, 15, 0, 5, PL1_RW, 0),
     A13_CPREG_DEF(AMX_STATUS_EL1, 3, 4, 15, 1, 3, PL1_R, 0),
@@ -835,6 +851,10 @@ static const VMStateDescription vmstate_apple_a13 = {
             VMSTATE_A13_CPREG(OPMAT1),
             VMSTATE_A13_CPREG(OPMSK0),
             VMSTATE_A13_CPREG(OPMSK1),
+            VMSTATE_A13_CPREG(PMTRHLD6),
+            VMSTATE_A13_CPREG(PMTRHLD4),
+            VMSTATE_A13_CPREG(PMTRHLD2),
+            VMSTATE_A13_CPREG(PMMMAP),
             VMSTATE_A13_CPREG(PMSR),
             VMSTATE_A13_CPREG(S3_4_c15_c0_5),
             VMSTATE_A13_CPREG(AMX_STATUS_EL1),
