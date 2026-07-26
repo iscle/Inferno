@@ -47,6 +47,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ApplePCIEState, APPLE_PCIE)
 
 #define APCIE_MAX_PORTS 4
 
+/* Entries in the apcie node's "ranges" (CPU -> PCI memory space) property. */
+#define APCIE_MAX_MMIO_WINDOWS 4
+
 #define APCIE_PORT_GPIO_CLKREQ_OUT "apcie-port-gpio-clkreq-out"
 #define APCIE_PORT_GPIO_PERST "apcie-port-gpio-perst"
 
@@ -78,6 +81,9 @@ struct ApplePCIEHost {
     ApplePCIEState *pcie;
 
     MemoryRegion mmio, io;
+    /* Aliases of `mmio` placed in system memory, one per "ranges" entry. */
+    MemoryRegion mmio_windows[APCIE_MAX_MMIO_WINDOWS];
+    uint32_t num_mmio_windows;
     qemu_irq irqs[4];
     qemu_irq msi_irqs[8 * APCIE_MAX_PORTS];
     // uint32_t clkreq_gpio_id;

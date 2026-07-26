@@ -204,9 +204,7 @@ struct AppleBCMWLANDeviceState {
     PCIDevice parent_obj;
     AppleBCMWLANState *root;
 
-    MemoryRegion container;
     MemoryRegion bar0, bar2;
-    MemoryRegion bar0_alias, bar2_alias;
 
     ApplePCIEPort *port;
     MemoryRegion *dma_mr;
@@ -736,30 +734,14 @@ static void apple_bcm_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
                                   QEMU_PCI_EXP_LNK_5GT);
     }
 
+    /*
+     * No BAR-visibility workaround (unlike baseband.c, which pins aliases of
+     * its BARs at a hardcoded system-memory address): apcie now maps the PCI
+     * memory space into system memory according to the apcie node's "ranges",
+     * so the BARs are reachable wherever iOS' IOPCIConfigurator assigns them.
+     */
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar0);
     pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar2);
-
-    /*
-     * Mirror the baseband BAR-visibility workaround: iOS reshuffles the PCI
-     * subregions, so also expose aliases of the BARs through a private
-     * container mapped into system memory. Uses a distinct sub-address from
-     * the baseband's BASEBAND_BAR_SUB_ADDR (0x40000000) to avoid overlap.
-     */
-#define WLAN_BAR_SUB_ADDR 0x50000000ULL
-    memory_region_init(&s->container, OBJECT(s), "wlan-bar-container",
-                       APPLE_BCM_WLAN_DEVICE_BAR0_SIZE +
-                           APPLE_BCM_WLAN_DEVICE_BAR2_SIZE);
-    memory_region_init_alias(&s->bar0_alias, OBJECT(s), "wlan-bar0-alias",
-                             &s->bar0, 0x0, APPLE_BCM_WLAN_DEVICE_BAR0_SIZE);
-    memory_region_init_alias(&s->bar2_alias, OBJECT(s), "wlan-bar2-alias",
-                             &s->bar2, 0x0, APPLE_BCM_WLAN_DEVICE_BAR2_SIZE);
-    memory_region_add_subregion(&s->container, 0x0000, &s->bar2_alias);
-    memory_region_add_subregion(&s->container,
-                                APPLE_BCM_WLAN_DEVICE_BAR2_SIZE,
-                                &s->bar0_alias);
-    memory_region_add_subregion(get_system_memory(),
-                                APCIE_ROOT_COMMON_ADDRESS + WLAN_BAR_SUB_ADDR,
-                                &s->container);
 }
 
 static void apple_bcm_wlan_device_qdev_reset_hold(Object *obj, ResetType type)

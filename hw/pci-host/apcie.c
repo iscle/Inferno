@@ -1703,6 +1703,62 @@ static ApplePCIEPort *apple_pcie_create_port(AppleDTNode *node, uint32_t bus_nr,
     return port;
 }
 
+/*
+ * Make PCI memory space reachable from the CPU.
+ *
+ * The apcie node's "ranges" describes how CPU addresses decode into PCI memory
+ * space, as <phys.hi, pci_addr (2 cells), cpu_addr (2 cells), size (2 cells)>
+ * with every 64-bit value stored low cell first. On the T8030 that is
+ * <0x43000000 0x6_20000000 0x6_20000000 0x1_a0000000> (the 64-bit prefetchable
+ * aperture, mapped 1:1) and <0x02000000 0x40000000 0x6_40000000 0x40000000>
+ * (the 32-bit window iOS' IOPCIConfigurator actually allocates endpoint BARs
+ * from).
+ *
+ * Nothing else maps the root bus' MMIO container into system memory, so
+ * without these aliases a BAR assigned by the guest is not backed by anything
+ * and the first access to it takes an external data abort.
+ *
+ * The two windows overlap on the CPU side, so the narrow 32-bit one is given
+ * the higher priority. Everything stays below priority 0 so that a device
+ * model may still shadow a window with its own mapping.
+ */
+static void apple_pcie_map_mmio_windows(ApplePCIEHost *host, AppleDTNode *node)
+{
+    AppleDTProp *prop;
+    const uint32_t *cells;
+    uint32_t i, entries;
+
+    prop = apple_dt_get_prop(node, "ranges");
+    if (prop == NULL) {
+        return;
+    }
+
+    entries = prop->len / (7 * sizeof(uint32_t));
+    assert_cmpuint(entries, <=, APCIE_MAX_MMIO_WINDOWS);
+    cells = (const uint32_t *)prop->data;
+
+    for (i = 0; i < entries; i++) {
+        const uint32_t *entry = cells + i * 7;
+        uint32_t phys_hi = entry[0];
+        uint64_t pci_addr = entry[1] | ((uint64_t)entry[2] << 32);
+        uint64_t cpu_addr = entry[3] | ((uint64_t)entry[4] << 32);
+        uint64_t size = entry[5] | ((uint64_t)entry[6] << 32);
+        /* phys.hi bits 25:24: 0b10 == 32-bit memory, 0b11 == 64-bit memory. */
+        int priority = ((phys_hi >> 24) & 0x3) == 0x3 ? -2 : -1;
+        g_autofree char *name = g_strdup_printf("apcie-mmio-window%u", i);
+
+        if (size == 0) {
+            continue;
+        }
+
+        memory_region_init_alias(&host->mmio_windows[i], OBJECT(host), name,
+                                 &host->mmio, pci_addr, size);
+        memory_region_add_subregion_overlap(get_system_memory(), cpu_addr,
+                                            &host->mmio_windows[i], priority);
+        host->num_mmio_windows++;
+    }
+}
+
 SysBusDevice *apple_pcie_from_node(AppleDTNode *node, uint32_t chip_id)
 {
     DeviceState *dev;
@@ -1787,6 +1843,8 @@ SysBusDevice *apple_pcie_from_node(AppleDTNode *node, uint32_t chip_id)
         s->ports[i] =
             apple_pcie_create_port(node, i, host->irqs[i], pci->bus, host);
     }
+    apple_pcie_map_mmio_windows(host, node);
+
     assert_cmpuint(reg[common_index * 2 + 1], <=, APCIE_COMMON_REGS_LENGTH);
 
     memory_region_init_io(&host->root_cfg, OBJECT(host),
