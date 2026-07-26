@@ -242,6 +242,9 @@ static const VMStateDescription vmstate_apple_mt_spi = {
 /// The link-layer interface the touch reports belong to. The personality's
 /// sole "Interface Config" entry has bInterfaceNumber = 0.
 #define LL_INTERFACE_HID (0)
+/// Frames addressed to the controller itself rather than to one of its HID
+/// interfaces, as "HIDSPI Config"'s "Device Interface Id" = 208.
+#define LL_INTERFACE_DEVICE (0xD0)
 
 /*
  * Link-layer frame types. "Input" and "Output" are named for the direction the
@@ -819,23 +822,25 @@ static void apple_mt_spi_push_no_data(AppleMTSPIBuffer *buf)
 /// hold before anything indexes with it.
 static uint16_t apple_mt_spi_ll_payload(const AppleMTSPIBuffer *buf,
                                         const uint8_t **payload,
-                                        uint8_t *interface)
+                                        AppleMTSPILLHeader *hdr)
 {
-    AppleMTSPILLHeader hdr;
-
-    if (buf->len < LL_PADDING_LEN + sizeof(hdr)) {
+    if (buf->len < LL_PADDING_LEN + sizeof(*hdr)) {
         *payload = NULL;
-        *interface = LL_INTERFACE_HID;
+        memset(hdr, 0, sizeof(*hdr));
+        hdr->interface = LL_INTERFACE_HID;
         return 0;
     }
 
-    memcpy(&hdr, buf->data + LL_PADDING_LEN, sizeof(hdr));
-    *payload = buf->data + LL_PADDING_LEN + sizeof(hdr);
-    *interface = hdr.interface;
+    memcpy(hdr, buf->data + LL_PADDING_LEN, sizeof(*hdr));
+    hdr->payload_off = le16_to_cpu(hdr->payload_off);
+    hdr->payload_remaining = le16_to_cpu(hdr->payload_remaining);
+    hdr->payload_length = le16_to_cpu(hdr->payload_length);
+
+    *payload = buf->data + LL_PADDING_LEN + sizeof(*hdr);
     // The declared length is guest-controlled. Clamp it to what a frame can
     // carry, which stops short of the trailing CRC.
-    return MIN(le16_to_cpu(hdr.payload_length),
-               MIN(LL_PAYLOAD_MAX, buf->len - LL_PADDING_LEN - sizeof(hdr)));
+    return MIN(hdr->payload_length,
+               MIN(LL_PAYLOAD_MAX, buf->len - LL_PADDING_LEN - sizeof(*hdr)));
 }
 
 /// Reads the HID header out of a link-layer payload. Returns false, without
@@ -1155,11 +1160,11 @@ static void apple_mt_spi_handle_set_feature(AppleMTSPIState *s,
 static void apple_mt_spi_handle_control(AppleMTSPIState *s)
 {
     AppleMTSPIHIDHeader req;
+    AppleMTSPILLHeader hdr;
     const uint8_t *payload;
     uint16_t payload_len;
-    uint8_t interface;
 
-    payload_len = apple_mt_spi_ll_payload(&s->rx, &payload, &interface);
+    payload_len = apple_mt_spi_ll_payload(&s->rx, &payload, &hdr);
 
     if (!apple_mt_spi_hid_hdr(payload, payload_len, &req)) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -1171,10 +1176,10 @@ static void apple_mt_spi_handle_control(AppleMTSPIState *s)
 
     switch (req.type) {
     case HID_CONTROL_PACKET_GET_FEATURE_REPORT:
-        apple_mt_spi_handle_get_feature(s, &req, interface);
+        apple_mt_spi_handle_get_feature(s, &req, hdr.interface);
         break;
     case HID_CONTROL_PACKET_SET_FEATURE_REPORT:
-        apple_mt_spi_handle_set_feature(s, &req, interface);
+        apple_mt_spi_handle_set_feature(s, &req, hdr.interface);
         break;
     default:
         qemu_log_mask(LOG_UNIMP,
@@ -1186,29 +1191,54 @@ static void apple_mt_spi_handle_control(AppleMTSPIState *s)
 }
 
 /*
- * Handles a data frame the host sent us, i.e. a HID output report.
+ * Handles a data frame the host sent us.
  *
- * iOS does not wrap these in a control packet. AppleHIDTransportProtocolHIDSPI
+ * Two different things arrive this way. Frames on the device interface are
+ * addressed to the controller itself and carry no HID header; see below. On a
+ * HID interface these are HID output reports: AppleHIDTransportProtocolHIDSPI
  * ::controlReportGated() picks the HID packet type from the report type and
  * direction, and for a *set* of an Output report it selects 0x20 - the data
- * transfer type - rather than 0x51, sending it as one of these frames. Feature
- * reports keep going through the control path, so this is not where the
- * statistics reports get cleared.
+ * transfer type - rather than 0x51, sending it as a data frame instead of a
+ * control packet. Feature reports keep going through the control path, so this
+ * is not where the statistics reports get cleared.
  */
 static void apple_mt_spi_handle_output(AppleMTSPIState *s)
 {
     AppleMTSPIHIDHeader req;
+    AppleMTSPILLHeader hdr;
     const uint8_t *payload;
     uint16_t payload_len;
-    uint8_t interface;
 
-    payload_len = apple_mt_spi_ll_payload(&s->rx, &payload, &interface);
+    payload_len = apple_mt_spi_ll_payload(&s->rx, &payload, &hdr);
+
+    if (hdr.interface == LL_INTERFACE_DEVICE) {
+        /*
+         * Addressed to the controller itself, not to its HID interface, so
+         * there is no HID header here and none is expected. iOS sends exactly
+         * two of these per boot, both four bytes:
+         *
+         *     A0 10 02 00     and     A0 10 12 00
+         *
+         * It asks for no reply and does not wait for one: enumeration, the
+         * feature reports and touch all complete without the controller ever
+         * answering. The encoding is not understood beyond that, so say so
+         * with the bytes attached rather than guessing at a response.
+         */
+        qemu_log_mask(LOG_UNIMP,
+                      "%s: unimplemented %u byte device-interface request "
+                      "%02X %02X %02X %02X\n",
+                      __func__, payload_len, payload_len > 0 ? payload[0] : 0,
+                      payload_len > 1 ? payload[1] : 0,
+                      payload_len > 2 ? payload[2] : 0,
+                      payload_len > 3 ? payload[3] : 0);
+        return;
+    }
 
     if (!apple_mt_spi_hid_hdr(payload, payload_len, &req)) {
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "%s: output packet with a %u byte payload is too short "
-                      "for a HID header\n",
-                      __func__, payload_len);
+                      "%s: output frame on interface 0x%02X with a %u byte "
+                      "payload is too short for a HID header\n",
+                      __func__, hdr.interface, payload_len);
         s->stats.input_drops++;
         return;
     }
