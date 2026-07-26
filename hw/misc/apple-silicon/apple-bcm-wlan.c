@@ -780,6 +780,13 @@ struct AppleBCMWLANDeviceState {
     bool escan_reported;
     bool link_up;
 
+    /*
+     * The virtual (AWDL) interface the host asks us to create, and the timer
+     * that reports it back as created.
+     */
+    QEMUTimer *virt_if_timer;
+    uint8_t virt_if_bsscfgidx;
+
     /* Host networking, i.e. the other end of the fake air interface. */
     NICState *nic;
     NICConf conf;
@@ -1564,7 +1571,21 @@ static void apple_bcm_wlan_d2h_ctrl_post(AppleBCMWLANDeviceState *s,
 /* WLC event numbers, from the driver's event name table @0xfffffff0079ae230. */
 #define WLC_E_SET_SSID 0
 #define WLC_E_LINK 16
+#define WLC_E_IF 54
 #define WLC_E_ESCAN_RESULT 69
+
+/*
+ * WLC_E_IF payload (wl_event_data_if_t), the answer to a virtual-interface
+ * creation request. Only two of its bytes are ever read on this chip: the
+ * bsscfgidx, which has to match the one that was asked for, and the ifidx the
+ * new interface got.
+ */
+#define BCM_EVENT_IF_IFIDX_OFF 0
+#define BCM_EVENT_IF_OPCODE_OFF 1
+#define BCM_EVENT_IF_BSSCFGIDX_OFF 3
+#define BCM_EVENT_IF_ROLE_OFF 4
+#define BCM_EVENT_IF_DATA_LEN 8
+#define BCM_EVENT_IF_OP_ADD 1
 
 /*
  * wl_event_msg_t status codes.
@@ -1676,6 +1697,8 @@ static const uint8_t apple_bcm_wlan_ap_bssid[ETH_ALEN] = {
 /* How long a scan and an association "take". */
 #define APPLE_BCM_WLAN_SCAN_DELAY_MS 120
 #define APPLE_BCM_WLAN_JOIN_DELAY_MS 60
+/* How long creating a virtual interface "takes"; see the awdl_if handler. */
+#define APPLE_BCM_WLAN_VIRT_IF_DELAY_MS 20
 
 /*
  * Deliver one WLC event to the host.
@@ -1692,10 +1715,11 @@ static const uint8_t apple_bcm_wlan_ap_bssid[ETH_ALEN] = {
  * own. The length we report covers the packet plus that 4-byte prefix and the
  * driver's own slack, which it takes as 12.
  */
-static void apple_bcm_wlan_post_event(AppleBCMWLANDeviceState *s,
-                                      uint32_t event_type, uint16_t flags,
-                                      uint32_t status, uint32_t reason,
-                                      const void *data, uint32_t datalen)
+static void apple_bcm_wlan_post_event_on(AppleBCMWLANDeviceState *s,
+                                         uint8_t ifidx, uint8_t bsscfgidx,
+                                         uint32_t event_type, uint16_t flags,
+                                         uint32_t status, uint32_t reason,
+                                         const void *data, uint32_t datalen)
 {
     AppleBCMWLANPostedBuf ev;
     uint8_t msg[BCM_D2H_CTRL_ITEM_SIZE];
@@ -1745,8 +1769,8 @@ static void apple_bcm_wlan_post_event(AppleBCMWLANDeviceState *s,
     stl_be_p(emsg + BCM_EVENT_MSG_REASON_OFF, reason);
     stl_be_p(emsg + BCM_EVENT_MSG_DATALEN_OFF, datalen);
     memcpy(emsg + BCM_EVENT_MSG_ADDR_OFF, apple_bcm_wlan_ap_bssid, ETH_ALEN);
-    emsg[BCM_EVENT_MSG_IFIDX_OFF] = 0;
-    emsg[BCM_EVENT_MSG_BSSCFGIDX_OFF] = 0;
+    emsg[BCM_EVENT_MSG_IFIDX_OFF] = ifidx;
+    emsg[BCM_EVENT_MSG_BSSCFGIDX_OFF] = bsscfgidx;
 
     if (datalen != 0) {
         memcpy(pkt + BCM_EVENT_DATA_OFF, data, datalen);
@@ -1768,6 +1792,16 @@ static void apple_bcm_wlan_post_event(AppleBCMWLANDeviceState *s,
                   "pktid 0x%x buf 0x%" PRIx64 " len %u pool %u\n",
                   __func__, event_type, flags, status, reason, datalen,
                   ev.request_id, ev.addr, pktlen, s->event_count);
+}
+
+/* The same, for the primary interface -- which is what almost everything is. */
+static void apple_bcm_wlan_post_event(AppleBCMWLANDeviceState *s,
+                                      uint32_t event_type, uint16_t flags,
+                                      uint32_t status, uint32_t reason,
+                                      const void *data, uint32_t datalen)
+{
+    apple_bcm_wlan_post_event_on(s, 0, 0, event_type, flags, status, reason,
+                                 data, datalen);
 }
 
 /*
@@ -1902,6 +1936,65 @@ static void apple_bcm_wlan_join_timer(void *opaque)
     if (s->nic != NULL) {
         qemu_flush_queued_packets(qemu_get_queue(s->nic));
     }
+}
+
+/*
+ * Report the virtual interface the host asked for as created.
+ *
+ * AppleBCMWLANProximityInterface::createChipInterface (@0xfffffff00957e730)
+ * sets the "awdl_if" iovar and then sleeps for 3 s waiting for a WLC_E_IF
+ * event to say the interface exists; without one, bring-up logs "AWDL i/f
+ * creation timedout" and every later AWDL iovar is issued on interface 255.
+ *
+ * The event has to find its way to the virtual interface rather than to the
+ * main event handler. For a firmware whose interface version is below 5 --
+ * which is what we report -- AppleBCMWLANCore::handleEventPacket routes an
+ * event to a virtual interface purely by wl_event_msg_t.bsscfgidx
+ * (@0xfffffff00946a328), so the event must carry back the bsscfgidx that the
+ * request asked for; handleEvent (@0xfffffff009575180) checks it again against
+ * the value it sent and then takes the interface's chip ifidx out of the
+ * payload. We give the interface the same index as its bsscfgidx.
+ *
+ * It is posted from a timer rather than inline because the request is a
+ * *synchronous* iovar: the thread that will wait for this event is still
+ * blocked on the ioctl completion, so an event queued behind that completion
+ * in the same ring would be handled before there is anybody to wake.
+ */
+static void apple_bcm_wlan_virt_if_timer(void *opaque)
+{
+    AppleBCMWLANDeviceState *s = opaque;
+    uint8_t data[BCM_EVENT_IF_DATA_LEN] = { 0 };
+
+    data[BCM_EVENT_IF_IFIDX_OFF] = s->virt_if_bsscfgidx;
+    data[BCM_EVENT_IF_OPCODE_OFF] = BCM_EVENT_IF_OP_ADD;
+    data[BCM_EVENT_IF_BSSCFGIDX_OFF] = s->virt_if_bsscfgidx;
+    data[BCM_EVENT_IF_ROLE_OFF] = 0;
+
+    apple_bcm_wlan_post_event_on(s, s->virt_if_bsscfgidx,
+                                 s->virt_if_bsscfgidx, WLC_E_IF, 0,
+                                 WLC_E_STATUS_SUCCESS, 0, data, sizeof(data));
+}
+
+/*
+ * SET_VAR "awdl_if": create the AWDL interface.
+ *
+ * The 20-byte payload starts with the bsscfgidx the host wants the interface
+ * to have, followed by an enable flag and the MAC address it should use.
+ */
+static int apple_bcm_wlan_cmd_awdl_if(AppleBCMWLANDeviceState *s,
+                                      const void *arg, const uint8_t *in,
+                                      uint16_t inlen, uint8_t *out,
+                                      uint16_t outmax, uint16_t *outlen)
+{
+    size_t name_len = strlen("awdl_if") + 1;
+
+    if (inlen < name_len + 4) {
+        return BCME_ERROR;
+    }
+    s->virt_if_bsscfgidx = ldl_le_p(in + name_len) & 0xFF;
+    timer_mod(s->virt_if_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                                    APPLE_BCM_WLAN_VIRT_IF_DELAY_MS);
+    return BCME_OK;
 }
 
 /* SET_VAR "escan": remember the scan's sync id and schedule the results. */
@@ -2376,6 +2469,8 @@ static const struct {
      * what actually commits the join.
      */
     { WLC_SET_VAR, "escan", apple_bcm_wlan_cmd_escan },
+    /* AWDL's virtual interface, which bring-up waits three seconds for. */
+    { WLC_SET_VAR, "awdl_if", apple_bcm_wlan_cmd_awdl_if },
     { WLC_SCAN, NULL, apple_bcm_wlan_cmd_ok },
     { WLC_SET_INFRA, NULL, apple_bcm_wlan_cmd_ok },
     { WLC_SET_AUTH, NULL, apple_bcm_wlan_cmd_ok },
@@ -3287,6 +3382,8 @@ static void apple_bcm_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
                                   apple_bcm_wlan_escan_timer, s);
     s->join_timer =
         timer_new_ms(QEMU_CLOCK_VIRTUAL, apple_bcm_wlan_join_timer, s);
+    s->virt_if_timer =
+        timer_new_ms(QEMU_CLOCK_VIRTUAL, apple_bcm_wlan_virt_if_timer, s);
 
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
     s->nic = qemu_new_nic(&apple_bcm_wlan_net_info, &s->conf,
@@ -3346,9 +3443,11 @@ static void apple_bcm_wlan_device_qdev_reset_hold(Object *obj, ResetType type)
     s->link_up = false;
     s->escan_sync_id = 0;
     s->escan_reported = false;
+    s->virt_if_bsscfgidx = 0;
     timer_del(s->irq_retry_timer);
     timer_del(s->escan_timer);
     timer_del(s->join_timer);
+    timer_del(s->virt_if_timer);
 
     /* Unprogrammed fuses read as 0; the CIS sits at kBCOM4378ChipUserOTP. */
     QEMU_BUILD_BUG_ON(BCM_OTP_CIS_OFFSET + sizeof(apple_bcm_wlan_otp_cis) >
@@ -3365,6 +3464,7 @@ static void apple_bcm_wlan_device_pci_uninit(PCIDevice *dev)
     timer_free(s->irq_retry_timer);
     timer_free(s->escan_timer);
     timer_free(s->join_timer);
+    timer_free(s->virt_if_timer);
     qemu_del_nic(s->nic);
     pcie_aer_exit(dev);
     pcie_cap_exit(dev);
