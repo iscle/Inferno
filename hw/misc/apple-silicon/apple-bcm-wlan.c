@@ -664,6 +664,12 @@ static const uint8_t apple_bcm_wlan_otp_cis[] = {
 #define BCM_FLOW_RING_ID_BASE 2
 
 /*
+ * How often to re-assert the interrupt while the host still has unread D2H
+ * items. Comfortably below the driver's 1.5 s command watchdog.
+ */
+#define BCM_IRQ_RETRY_MS 10
+
+/*
  * One msgbuf ring, as described by its ring_mem_t descriptor plus the index
  * slot the host allocated for it.
  *
@@ -764,6 +770,7 @@ struct AppleBCMWLANDeviceState {
      * scan and cleared once the results have been delivered; `link_up` tracks
      * whether we have told the host it is associated.
      */
+    QEMUTimer *irq_retry_timer;
     QEMUTimer *escan_timer;
     QEMUTimer *join_timer;
     uint16_t escan_sync_id;
@@ -1421,6 +1428,57 @@ static void apple_bcm_wlan_signal_d2h(AppleBCMWLANDeviceState *s)
         return;
     }
     msi_notify(pci_dev, 0);
+
+    /*
+     * ... and make sure it was not missed.
+     *
+     * An MSI raised while the host has the vector masked -- which it is for
+     * the whole of its own interrupt handler -- can be lost: the AIC's pending
+     * state is a level that gets dropped again shortly after it is raised, and
+     * if that happens before the host unmasks, the message is gone. The host
+     * has no doorbell to tell us it has drained a D2H ring, so instead keep
+     * nudging it while any D2H ring still has items it has not read.
+     *
+     * Without this a single lost message stalls a synchronous ioctl until the
+     * driver's 1.5 s watchdog fires ("checkQueues: Outbound Queue Stall"),
+     * which resets the chip and tears the association down.
+     */
+    timer_mod(s->irq_retry_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + BCM_IRQ_RETRY_MS);
+}
+
+/* Has the host consumed everything we put on this ring? */
+static bool apple_bcm_wlan_d2h_ring_pending(AppleBCMWLANDeviceState *s,
+                                            AppleBCMWLANRing *ring)
+{
+    uint32_t read_index;
+
+    if (!ring->valid) {
+        return false;
+    }
+    if (!apple_bcm_wlan_read_index(s, s->d2h_r_idx_addr, ring->id,
+                                   &read_index)) {
+        return false;
+    }
+    return read_index != ring->index;
+}
+
+static void apple_bcm_wlan_irq_retry_timer(void *opaque)
+{
+    AppleBCMWLANDeviceState *s = opaque;
+    PCIDevice *pci_dev = PCI_DEVICE(s);
+
+    if (!apple_bcm_wlan_d2h_ring_pending(s, &s->d2h_ctrl) &&
+        !apple_bcm_wlan_d2h_ring_pending(s, &s->d2h_tx) &&
+        !apple_bcm_wlan_d2h_ring_pending(s, &s->d2h_rx)) {
+        return;
+    }
+
+    if (msi_enabled(pci_dev)) {
+        msi_notify(pci_dev, 0);
+    }
+    timer_mod(s->irq_retry_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + BCM_IRQ_RETRY_MS);
 }
 
 /*
@@ -3125,6 +3183,8 @@ static void apple_bcm_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
      * ioctl that asked for them has been completed, so they are posted from a
      * timer rather than from inside the doorbell write.
      */
+    s->irq_retry_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                      apple_bcm_wlan_irq_retry_timer, s);
     s->escan_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                   apple_bcm_wlan_escan_timer, s);
     s->join_timer =
@@ -3188,6 +3248,7 @@ static void apple_bcm_wlan_device_qdev_reset_hold(Object *obj, ResetType type)
     s->link_up = false;
     s->escan_sync_id = 0;
     s->escan_reported = false;
+    timer_del(s->irq_retry_timer);
     timer_del(s->escan_timer);
     timer_del(s->join_timer);
 
@@ -3203,6 +3264,7 @@ static void apple_bcm_wlan_device_pci_uninit(PCIDevice *dev)
 {
     AppleBCMWLANDeviceState *s = APPLE_BCM_WLAN_DEVICE(dev);
 
+    timer_free(s->irq_retry_timer);
     timer_free(s->escan_timer);
     timer_free(s->join_timer);
     qemu_del_nic(s->nic);
