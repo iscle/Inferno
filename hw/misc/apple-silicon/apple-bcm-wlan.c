@@ -1681,6 +1681,34 @@ static int apple_bcm_wlan_ioctl(AppleBCMWLANDeviceState *s, uint8_t ifidx,
         status = BCME_OK;
     }
 
+    /*
+     * Pad an iovar reply by the length of the iovar name.
+     *
+     * AppleBCMWLANCommand::complete (@0xfffffff00958f9bc) does, for GET_VAR
+     * with a non-empty name and a result buffer of at most 0x7fc bytes:
+     *
+     *     actual = min(resp_len, packet_len - 16);
+     *     if (actual > strlen(name) + 1)
+     *             actual -= strlen(name) + 1;
+     *     memcpy(rx.buf, payload, min(actual, rx.cap));
+     *
+     * i.e. it expects real firmware to report a length that still counts the
+     * echoed request. It does NOT skip those bytes when copying, so the value
+     * must start at offset 0 and the reported length must be that many bytes
+     * LONGER. Without this every iovar reply arrives short by exactly the
+     * length of its name -- which is why the firmware banner used to be logged
+     * as "FWID 01-deadb".
+     */
+    if (status == BCME_OK && cmd == WLC_GET_VAR && iovar != NULL &&
+        *outlen != 0) {
+        uint16_t pad = strlen(iovar) + 1;
+
+        if (*outlen + pad <= outmax && outmax - pad <= 0x7FC) {
+            memset(out + *outlen, 0, pad);
+            *outlen += pad;
+        }
+    }
+
     qemu_log_mask(LOG_UNIMP,
                   "%s: ifidx %u cmd %u (%s) iovar '%s' inlen %u outmax %u -> "
                   "%d (%u bytes)\n",
