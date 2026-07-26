@@ -1435,11 +1435,6 @@ static void t8030_create_wlan(AppleT8030MachineState *t8030)
     // endpoint node must be fetched by its full path, not the bare name.
     child = apple_dt_get_node(t8030->device_tree,
                               "arm-io/apcie/pci-bridge2/wlan");
-    // Drop 'amfm-managed-port-control' from wherever it lives in the device
-    // tree so AppleBCMWLANBusInterfacePCIe brings the PCIe port up via the plain
-    // AppleEmbeddedPCIEPortControlFunction path (apcie perst/clkreq/LTSSM,
-    // already modeled and working for the baseband) instead of the
-    // AppleMultiFunctionManager / SMC gP11 handshake we don't emulate.
     /*
      * Keep "amfm-managed-port-control". It selects the AMFM variants of the
      * driver's platform function and port interface, which get their
@@ -1447,41 +1442,14 @@ static void t8030_create_wlan(AppleT8030MachineState *t8030)
      * The non-AMFM variants look those up on the wlan node instead, which does
      * not carry them, so stripping this makes deferredStart bail before it ever
      * arms its PCIe attach notifier.
-     */
-
-    /*
-     * Give pci-bridge2 a "clkreq-wait-time" (milliseconds) so iOS delays its
-     * boot-time bring-up of the WLAN port.
      *
-     * AppleEmbeddedPCIEPort::enableGated stores this property at +0x1bc and,
-     * when it is non-zero, busy-waits up to that long for the endpoint to
-     * assert CLKREQ# (polling the "function-clkreq" AppleARMFunction) before
-     * declaring the port up. The stock T8030 device tree omits the property
-     * entirely, so iOS brings pci-bridge2 up immediately -- which means the
-     * endpoint's IOPCIDevice nub is created and published by the boot-time
-     * IOPCIConfigurator pass *before* AppleBCMWLANBusInterfacePCIe::
-     * deferredStart has installed its "wlan" publish notification. IOKit then
-     * invokes notifyPCIeAttached synchronously from addMatchingNotification,
-     * i.e. before the driver has stored the returned IONotifier* into
-     * this->[0x410]; the handler compares the two, silently no-ops, the attach
-     * is never signalled, and deferredStart fails 10 s later in
-     * waitForBusAttachWithTimeoutGated ("BCMWLAN Device Not Enumerated-line
-     * 1599", readable as com.apple.wlan.init_failure_string on /arm-io/wlan).
-     *
-     * Delaying the port bring-up reorders the two, and matches hardware: the
-     * BCM4378 is only powered up once its driver runs, so its link really does
-     * train late and CLKREQ# really is absent at boot.
+     * Keeping it also puts the chip's power-up and the PCIe port enable behind
+     * AppleMultiFunctionManager, which is where they belong: the manager
+     * power-cycles the part through the SMC-PMU "gP11" key (implemented by the
+     * endpoint, see apple_bcm_wlan_create) and only then enables the port. That
+     * is what makes the endpoint appear at the right moment -- see the
+     * manual-enable handling in hw/pci-host/apcie.c.
      */
-    {
-        const char *env = getenv("INFERNO_WLAN_CLKREQ_WAIT_MS");
-        uint32_t wait_ms = env != NULL ? (uint32_t)strtoul(env, NULL, 0) : 5000;
-        AppleDTNode *bridge2 =
-            apple_dt_get_node(t8030->device_tree, "arm-io/apcie/pci-bridge2");
-        assert_nonnull(bridge2);
-        if (wait_ms != 0) {
-            apple_dt_set_prop_u32(bridge2, "clkreq-wait-time", wait_ms);
-        }
-    }
 
     ApplePCIEPort *port = APPLE_PCIE_PORT(
         object_property_get_link(OBJECT(t8030), "pcie.bridge2", &error_fatal));

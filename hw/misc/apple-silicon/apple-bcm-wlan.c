@@ -31,6 +31,7 @@
 #include "hw/arm/apple-silicon/dt.h"
 #include "hw/irq.h"
 #include "hw/misc/apple-silicon/apple-bcm-wlan.h"
+#include "hw/misc/apple-silicon/smc.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/pci_device.h"
 #include "hw/qdev-properties.h"
@@ -704,6 +705,8 @@ typedef struct AppleBCMWLANPostedBuf {
 
 struct AppleBCMWLANDeviceState {
     PCIDevice parent_obj;
+    /* WL_REG_ON, as driven by the guest through the SMC-PMU gP11 key. */
+    uint32_t reg_on;
     AppleBCMWLANState *root;
 
     MemoryRegion bar0, bar2;
@@ -3053,6 +3056,80 @@ static const MemoryRegionOps bar0_ops = {
  */
 #define APPLE_BCM_WLAN_NETDEV_ID "wlan0"
 
+/*
+ * The SMC-PMU "gP11" key: WL_REG_ON and friends for the Wi-Fi / Bluetooth
+ * combo part.
+ *
+ * The n104 device tree hangs the Wi-Fi chip's power control off the
+ * AppleMultiFunctionManager ("amfm") node, whose "function-reg_on" is
+ * <smc-pmu, 'pKW4', 'gP11', 0> -- i.e. driving WL_REG_ON means writing this SMC
+ * key. AppleMultiFunctionManager::chipReset() power-cycles the part through it
+ * and only then enables the PCIe port; if the key is missing every command
+ * fails, the manager never reports the chip as up, and the WLAN driver's port
+ * enable never happens. The key therefore belongs to this device.
+ *
+ * The command encoding is the generic AppleSMCPMU one (the same one the
+ * baseband's gP07/gP09 keys use): the top byte selects the function and the
+ * low bits carry its argument.
+ */
+static SMCResult apple_bcm_wlan_smc_gP11_read(SMCKey *key, SMCKeyData *data,
+                                              const void *in, uint8_t in_length)
+{
+    uint32_t value;
+
+    if (in == NULL) {
+        return SMC_RESULT_BAD_ARGUMENT_ERROR;
+    }
+    value = ldl_le_p(in);
+
+    switch (value >> 24) {
+    case 0x00: // WL_REG_ON: report the level the guest last drove
+    case 0x01: // function-pmu_gpio
+    case 0x02: // function-pmu_exton
+        stl_le_p(data->data, APPLE_BCM_WLAN_DEVICE(key->opaque)->reg_on);
+        return SMC_RESULT_SUCCESS;
+    case 0x06: // AppleSMCPMU::getVectorType; !=0/1 means "Edge"
+        stl_le_p(data->data, 0x2);
+        return SMC_RESULT_SUCCESS;
+    default:
+        qemu_log_mask(LOG_UNIMP, "apple-bcm-wlan: SMC gP11 read 0x%08x\n",
+                      value);
+        return SMC_RESULT_BAD_FUNC_PARAMETER;
+    }
+}
+
+static SMCResult apple_bcm_wlan_smc_gP11_write(SMCKey *key, SMCKeyData *data,
+                                               const void *in,
+                                               uint8_t in_length)
+{
+    AppleBCMWLANDeviceState *dev = APPLE_BCM_WLAN_DEVICE(key->opaque);
+    uint32_t value;
+
+    if (in == NULL || in_length != key->info.size) {
+        return SMC_RESULT_BAD_ARGUMENT_ERROR;
+    }
+    value = ldl_le_p(in);
+
+    switch (value >> 24) {
+    case 0x00: // WL_REG_ON: bit0 powers the chip
+    case 0x01: // function-pmu_gpio
+    case 0x02: // function-pmu_exton
+        dev->reg_on = value & 1;
+        qemu_log_mask(LOG_UNIMP, "apple-bcm-wlan: WL_REG_ON -> %u\n",
+                      dev->reg_on);
+        return SMC_RESULT_SUCCESS;
+    case 0x03: // function-pmu_reset
+    case 0x04: // disableVectorHard / enableVector
+    case 0x05:
+    case 0x07: // function-pmu_exton_config
+        return SMC_RESULT_SUCCESS;
+    default:
+        qemu_log_mask(LOG_UNIMP, "apple-bcm-wlan: SMC gP11 write 0x%08x\n",
+                      value);
+        return SMC_RESULT_BAD_FUNC_PARAMETER;
+    }
+}
+
 SysBusDevice *apple_bcm_wlan_create(AppleDTNode *node, AppleDTNode *mac_node,
                                     PCIBus *pci_bus, ApplePCIEPort *port)
 {
@@ -3093,6 +3170,15 @@ SysBusDevice *apple_bcm_wlan_create(AppleDTNode *node, AppleDTNode *mac_node,
     }
 
     object_property_add_child(OBJECT(s), "device", OBJECT(s->device));
+
+    {
+        AppleSMCState *smc = APPLE_SMC_IOP(object_property_get_link(
+            OBJECT(qdev_get_machine()), "smc", &error_fatal));
+        apple_smc_add_key_func(smc, 'gP11', 4, SMC_KEY_TYPE_UINT32,
+                               SMC_ATTR_LE | SMC_ATTR_UNK_0x20, s->device,
+                               apple_bcm_wlan_smc_gP11_read,
+                               apple_bcm_wlan_smc_gP11_write);
+    }
 
     return sbd;
 }
