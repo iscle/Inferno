@@ -1395,6 +1395,20 @@ static int apple_bcm_wlan_cmd_string(AppleBCMWLANDeviceState *s,
 
 static const uint32_t apple_bcm_wlan_zero = 0;
 /*
+ * Scan "home away time", in milliseconds: how long the radio may spend off the
+ * home channel during a scan while associated.
+ *
+ * AppleBCMWLANScanManager::initDefaultScanParametersFromChip
+ * (@0xfffffff009506024) asks for it with a CommandRxExpected of {min 4, max 4},
+ * i.e. it insists on exactly a u32, stores it verbatim at scanMgr+0x8bc and
+ * logs it ("Setting Scan Home away time to %u"). It is the LAST thing
+ * AppleBCMWLANCore::setupDriver does, and the only unanswered command left in
+ * that path -- failing it gives "setupDriver@5161: Error: Failure to get
+ * default Home Away Time" and then "loadAndSetup@4963: setupDriver fail".
+ * Nothing validates the value, so use Broadcom's usual 100 ms default.
+ */
+static const uint32_t apple_bcm_wlan_scan_home_away_time = 100;
+/*
  * WLC ioctl interface version. AppleBCMWLANCore::updateFWAPIVerFromHW
  * (@0xfffffff0094750e0) pre-seeds its 4-byte result buffer with 1 and does not
  * validate what comes back, so 1 is the value the driver would have assumed
@@ -1540,6 +1554,8 @@ static const struct {
      * Report it already off.
      */
     { WLC_GET_VAR, "mpc", apple_bcm_wlan_cmd_u32, &apple_bcm_wlan_zero },
+    { WLC_GET_VAR, "scan_home_away_time", apple_bcm_wlan_cmd_u32,
+      &apple_bcm_wlan_scan_home_away_time },
     { WLC_GET_COUNTRY_LIST, NULL, apple_bcm_wlan_cmd_country_list },
     { WLC_GET_COUNTRY, NULL, apple_bcm_wlan_cmd_country, "US" },
     { WLC_SET_COUNTRY, NULL, apple_bcm_wlan_cmd_ok },
