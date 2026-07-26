@@ -301,6 +301,107 @@ static const uint8_t apple_bcm_wlan_otp_cis[] = {
 #define BCM_AI_RESETCTRL 0x800
 #define BCM_AI_RESETSTATUS 0x804
 
+/*
+ * The ARM core's own wrapper (kBCOM4378ChipWrappers id 2, "ARMMaster"). This
+ * is the one loadChipImage() drives to take the CPU in and out of reset around
+ * the firmware download.
+ */
+#define BCM_BACKPLANE_ARM_WRAPPER_BASE 0x18130000ULL
+#define BCM_BACKPLANE_ARM_WRAPPER_INDEX \
+    ((BCM_BACKPLANE_ARM_WRAPPER_BASE - BCM_BACKPLANE_WRAPPER_BASE) / 0x1000)
+
+/*
+ * Chip memories (kBCOM4378ChipMemories @0xfffffff00730d1c8). BAR2 maps them
+ * identity-style, so a "dongle address" is simply a BAR2 offset.
+ *
+ * ChipMemoryID 4 is the firmware RAM: { 0x352000, 0x1CE000 }. loadChipImage()
+ * blits the firmware at its base, a block of random bytes and the NVRAM near
+ * its top, then writes a token into its LAST word and releases the ARM core.
+ * It then polls that same word until it reads back as neither 0xFFFFFFFF nor
+ * the token -- i.e. until the firmware has replaced it with a pointer to its
+ * pciedev_shared_t. There is no magic value to match; the only thing checked
+ * is that the pointer lands inside the firmware RAM, is 4-byte aligned, and
+ * leaves room for the 0x78-byte structure.
+ */
+#define BCM_MEM_FW_RAM_BASE 0x352000
+#define BCM_MEM_FW_RAM_SIZE 0x1CE000
+#define BCM_MEM_FW_RAM_END (BCM_MEM_FW_RAM_BASE + BCM_MEM_FW_RAM_SIZE)
+#define BCM_SHARED_INFO_PTR_ADDR (BCM_MEM_FW_RAM_END - 4)
+
+/*
+ * Where we put the structures the (absent) firmware would have published. This
+ * firmware image occupies roughly the first 1.3 MiB of chip RAM and the NVRAM
+ * sits at the very top, so the middle of the region is free; nothing ever
+ * reads the downloaded image back, so even an overlap would be harmless.
+ */
+#define BCM_SHARED_INFO_ADDR (BCM_MEM_FW_RAM_BASE + 0x1C0000)
+#define BCM_RING_INFO_ADDR (BCM_SHARED_INFO_ADDR + 0x80)
+#define BCM_RINGMEM_ADDR (BCM_SHARED_INFO_ADDR + 0x100)
+#define BCM_H2D_MB_DATA_ADDR (BCM_SHARED_INFO_ADDR + 0x300)
+#define BCM_D2H_MB_DATA_ADDR (BCM_SHARED_INFO_ADDR + 0x310)
+
+/*
+ * pciedev_shared_t. Only four fields are ever READ by the driver; everything
+ * else in the structure is filled in by the host once it accepts us, so we
+ * leave the rest zero.
+ *
+ *   0x00 flags
+ *   0x04 trap_addr        (only dereferenced from handleFWTrap())
+ *   0x30 rings_info_ptr
+ *   0x50 flags2
+ *
+ * flags:
+ *   [7:0]  msgbuf protocol version, must be 5..7 (@0xfffffff0095c93d0)
+ *   b16    host writes the ring indices by DMA. MANDATORY: without it the
+ *          driver bails with "Driver only supports FW with bi-directional
+ *          ring index DMA" (@0xfffffff0095ca4b0).
+ *   b29    "no out-of-band device wake"
+ *   b30    "in-band device wake supported"
+ *          b29 set together with b30 clear is fatal; and with b30 clear the
+ *          driver falls back to an out-of-band device-wake GPIO which an
+ *          emulated endpoint does not have, so b30 has to be set.
+ *
+ * flags2 is NOT validated -- it is a bag of feature bits. Leave it zero: the
+ * one trap is that bit 4 without bit 2 panics ("btLogNoMaxQIncrease is set but
+ * BT logging isn't supported", @0xfffffff0095cbfc0).
+ */
+#define BCM_SHARED_SIZE 0x78
+#define BCM_SHARED_FLAGS_OFF 0x00
+#define BCM_SHARED_RINGS_INFO_PTR_OFF 0x30
+#define BCM_SHARED_FLAGS2_OFF 0x50
+
+#define BCM_SHARED_VERSION 6
+#define BCM_SHARED_FLAG_DMA_INDEX (1U << 16)
+#define BCM_SHARED_FLAG_INBAND_DEVICE_WAKE (1U << 30)
+#define BCM_SHARED_FLAGS                              \
+    (BCM_SHARED_VERSION | BCM_SHARED_FLAG_DMA_INDEX | \
+     BCM_SHARED_FLAG_INBAND_DEVICE_WAKE)
+#define BCM_SHARED_FLAGS2 0x00000000
+
+/*
+ * ring_info_t. Again only a few fields come from us: the ring-memory pointer
+ * and the two u16 counts at 0x34/0x36. 0x14..0x30 are the four 64-bit host
+ * DMA addresses of the index arrays, which the HOST writes, and 0x38/0x3A
+ * (max_completion_rings / max_rxbufpost) are never read at all.
+ */
+#define BCM_RING_INFO_SIZE 0x3C
+#define BCM_RING_INFO_RINGMEM_PTR_OFF 0x00
+#define BCM_RING_INFO_MAX_TX_FLOWRINGS_OFF 0x34
+#define BCM_RING_INFO_MAX_SUBMISSION_QUEUES_OFF 0x36
+
+/* Five 16-byte ring descriptors; the host fills them in. */
+#define BCM_RINGMEM_SIZE 0x50
+
+/*
+ * Ring geometry, mirroring brcmfmac's msgbuf defaults. The driver panics
+ * ("maxNbrOfDynamicSubmissionRings <= maxNbrOfTxFlowRings",
+ * @0xfffffff0095cbfa0) unless max_submission_queues is STRICTLY GREATER than
+ * max_tx_flowrings: the submission-queue array has to hold the two common H2D
+ * rings on top of the per-flow TX rings.
+ */
+#define BCM_MAX_TX_FLOWRINGS 40
+#define BCM_MAX_SUBMISSION_QUEUES (BCM_MAX_TX_FLOWRINGS + 2)
+
 /* One BAR0 window == one 4 KiB backplane aperture. */
 #define APPLE_BCM_WLAN_WINDOW_SIZE 0x1000
 #define APPLE_BCM_WLAN_NUM_WINDOWS \
@@ -503,6 +604,8 @@ static uint64_t apple_bcm_wlan_window_base(AppleBCMWLANDeviceState *s,
  * forcePowerLite() caller turns that into a kernel panic. Unimplemented
  * registers therefore read as 0.
  */
+static void apple_bcm_wlan_publish_shared_info(AppleBCMWLANDeviceState *s);
+
 static uint32_t apple_bcm_wlan_backplane_read(AppleBCMWLANDeviceState *s,
                                               uint64_t addr)
 {
@@ -700,6 +803,18 @@ static void apple_bcm_wlan_backplane_write(AppleBCMWLANDeviceState *s,
         case BCM_AI_IOCTRL:
             /* loadChipImage() writes 0x23 and requires 0x23 back. */
             s->wrapper_ioctrl[index] = data;
+            /*
+             * Taking the ARM core out of reset is the last step of the
+             * firmware download: loadChipImage() ends with
+             * IOCTRL = 3, RESETCTRL = 0, IOCTRL = 1. Only the final write
+             * counts -- the earlier IOCTRL = 0x21 has bit 5 set (still
+             * clocking up), and IOCTRL = 3 arrives while reset is still
+             * asserted.
+             */
+            if (index == BCM_BACKPLANE_ARM_WRAPPER_INDEX &&
+                (data & 0x21) == 1 && (s->wrapper_resetctrl[index] & 1) == 0) {
+                apple_bcm_wlan_publish_shared_info(s);
+            }
             return;
         case BCM_AI_RESETCTRL:
             s->wrapper_resetctrl[index] = data;
@@ -712,6 +827,58 @@ static void apple_bcm_wlan_backplane_write(AppleBCMWLANDeviceState *s,
     qemu_log_mask(LOG_UNIMP,
                   "%s: UNIMP backplane WRITE @ 0x%" PRIx64 " value 0x%x\n",
                   __func__, addr, data);
+}
+
+/*
+ * Stand in for the firmware's "I am up" announcement.
+ *
+ * loadChipImage() releases the ARM core and then polls the last word of chip
+ * RAM for ~4.8 s, waiting for it to become something other than 0xFFFFFFFF or
+ * the token it wrote there itself (@0xfffffff0095c8eec). A real chip gets
+ * there by running the firmware we just swallowed; we synthesize the outcome
+ * instead -- we never execute a single instruction of Apple's image.
+ *
+ * The driver then bounds-checks the pointer (inside ChipMemoryID 4, 4-byte
+ * aligned, at least 0x78 bytes of room), reads the shared structure and
+ * follows rings_info_ptr, so all three structures have to sit in chip RAM.
+ * BAR2 is a plain RAM region mapped identity-style onto dongle addresses, so
+ * we can simply build them in place.
+ */
+static void apple_bcm_wlan_publish_shared_info(AppleBCMWLANDeviceState *s)
+{
+    uint8_t *ram = memory_region_get_ram_ptr(&s->bar2);
+
+    QEMU_BUILD_BUG_ON(BCM_SHARED_INFO_ADDR % 4 != 0);
+    QEMU_BUILD_BUG_ON(BCM_SHARED_INFO_ADDR < BCM_MEM_FW_RAM_BASE);
+    QEMU_BUILD_BUG_ON(BCM_SHARED_INFO_ADDR + BCM_SHARED_SIZE >
+                      BCM_MEM_FW_RAM_END);
+    QEMU_BUILD_BUG_ON(BCM_RINGMEM_ADDR + BCM_RINGMEM_SIZE > BCM_MEM_FW_RAM_END);
+    QEMU_BUILD_BUG_ON(BCM_MEM_FW_RAM_END > APPLE_BCM_WLAN_DEVICE_BAR2_SIZE);
+
+    memset(ram + BCM_SHARED_INFO_ADDR, 0, BCM_SHARED_SIZE);
+    stl_le_p(ram + BCM_SHARED_INFO_ADDR + BCM_SHARED_FLAGS_OFF,
+             BCM_SHARED_FLAGS);
+    stl_le_p(ram + BCM_SHARED_INFO_ADDR + BCM_SHARED_FLAGS2_OFF,
+             BCM_SHARED_FLAGS2);
+    stl_le_p(ram + BCM_SHARED_INFO_ADDR + BCM_SHARED_RINGS_INFO_PTR_OFF,
+             BCM_RING_INFO_ADDR);
+
+    memset(ram + BCM_RING_INFO_ADDR, 0, BCM_RING_INFO_SIZE);
+    stl_le_p(ram + BCM_RING_INFO_ADDR + BCM_RING_INFO_RINGMEM_PTR_OFF,
+             BCM_RINGMEM_ADDR);
+    stw_le_p(ram + BCM_RING_INFO_ADDR + BCM_RING_INFO_MAX_TX_FLOWRINGS_OFF,
+             BCM_MAX_TX_FLOWRINGS);
+    stw_le_p(ram + BCM_RING_INFO_ADDR + BCM_RING_INFO_MAX_SUBMISSION_QUEUES_OFF,
+             BCM_MAX_SUBMISSION_QUEUES);
+
+    memset(ram + BCM_RINGMEM_ADDR, 0, BCM_RINGMEM_SIZE);
+
+    /* Last: hand the driver the pointer it is spinning on. */
+    stl_le_p(ram + BCM_SHARED_INFO_PTR_ADDR, BCM_SHARED_INFO_ADDR);
+
+    qemu_log_mask(LOG_UNIMP,
+                  "%s: firmware released, published pciedev_shared_t @ 0x%x\n",
+                  __func__, BCM_SHARED_INFO_ADDR);
 }
 
 static uint64_t apple_bcm_wlan_device_bar0_read(void *opaque, hwaddr addr,
