@@ -758,6 +758,7 @@ struct AppleBCMWLANDeviceState {
     QEMUTimer *escan_timer;
     QEMUTimer *join_timer;
     uint16_t escan_sync_id;
+    bool escan_reported;
     bool link_up;
 
     /* Host networking, i.e. the other end of the fake air interface. */
@@ -1693,8 +1694,10 @@ static void apple_bcm_wlan_post_event(AppleBCMWLANDeviceState *s,
     apple_bcm_wlan_d2h_ctrl_post(s, msg);
 
     qemu_log_mask(LOG_UNIMP,
-                  "%s: event %u flags 0x%x status %u reason %u datalen %u\n",
-                  __func__, event_type, flags, status, reason, datalen);
+                  "%s: event %u flags 0x%x status %u reason %u datalen %u "
+                  "pktid 0x%x buf 0x%" PRIx64 " len %u pool %u\n",
+                  __func__, event_type, flags, status, reason, datalen,
+                  ev.request_id, ev.addr, pktlen, s->event_count);
 }
 
 /*
@@ -1771,28 +1774,41 @@ static void apple_bcm_wlan_escan_timer(void *opaque)
     uint32_t bss_len;
 
     memset(result, 0, sizeof(result));
-    bss_len =
-        apple_bcm_wlan_build_bss_info(result + BCM_ESCAN_RESULT_BSS_INFO_OFF);
-    /* buflen counts the BSS array only, not this header. */
-    stl_le_p(result + BCM_ESCAN_RESULT_BUFLEN_OFF, bss_len);
     stl_le_p(result + BCM_ESCAN_RESULT_VERSION_OFF, BCM_BSS_INFO_VERSION);
     stw_le_p(result + BCM_ESCAN_RESULT_SYNC_ID_OFF, s->escan_sync_id);
-    stw_le_p(result + BCM_ESCAN_RESULT_BSS_COUNT_OFF, 1);
-    /*
-     * The results event must carry more than 0x90 bytes or the driver decides
-     * it is shorter than a wl_escan_result and throws it away. 12 + 0x84 plus
-     * the information elements clears that by construction.
-     */
-    apple_bcm_wlan_post_event(s, WLC_E_ESCAN_RESULT, 0, WLC_E_STATUS_PARTIAL, 0,
-                              result, BCM_ESCAN_RESULT_BSS_INFO_OFF + bss_len);
+
+    if (!s->escan_reported) {
+        bss_len = apple_bcm_wlan_build_bss_info(result +
+                                                BCM_ESCAN_RESULT_BSS_INFO_OFF);
+        /*
+         * Real firmware reports the whole structure's size here; the driver
+         * uses it as the length of the BSS array that follows, so counting
+         * this header in it merely leaves slack.
+         */
+        stl_le_p(result + BCM_ESCAN_RESULT_BUFLEN_OFF,
+                 BCM_ESCAN_RESULT_BSS_INFO_OFF + bss_len);
+        stw_le_p(result + BCM_ESCAN_RESULT_BSS_COUNT_OFF, 1);
+        /*
+         * The results event must carry more than 0x90 bytes or the driver
+         * decides it is shorter than a wl_escan_result and throws it away.
+         * 12 + 0x84 plus the information elements clears that by construction.
+         */
+        apple_bcm_wlan_post_event(s, WLC_E_ESCAN_RESULT, 0,
+                                  WLC_E_STATUS_PARTIAL, 0, result,
+                                  BCM_ESCAN_RESULT_BSS_INFO_OFF + bss_len);
+
+        /* The terminator follows as its own event, as it would on real hardware. */
+        s->escan_reported = true;
+        timer_mod(s->escan_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                                      APPLE_BCM_WLAN_SCAN_DELAY_MS);
+        return;
+    }
 
     /*
-     * And the terminator. It carries no BSS, but the sync id is read before
-     * the status is looked at, so the header still has to be there.
+     * The terminator carries no BSS, but the sync id is read before the status
+     * is looked at, so the header still has to be there.
      */
-    memset(result, 0, BCM_ESCAN_RESULT_BSS_INFO_OFF);
-    stl_le_p(result + BCM_ESCAN_RESULT_VERSION_OFF, BCM_BSS_INFO_VERSION);
-    stw_le_p(result + BCM_ESCAN_RESULT_SYNC_ID_OFF, s->escan_sync_id);
+    s->escan_reported = false;
     apple_bcm_wlan_post_event(s, WLC_E_ESCAN_RESULT, 0, WLC_E_STATUS_SUCCESS, 0,
                               result, BCM_ESCAN_RESULT_BSS_INFO_OFF);
 }
@@ -1830,6 +1846,7 @@ static int apple_bcm_wlan_cmd_escan(AppleBCMWLANDeviceState *s,
         s->escan_sync_id = lduw_le_p(params + BCM_ESCAN_PARAMS_SYNC_ID_OFF);
     }
 
+    s->escan_reported = false;
     timer_mod(s->escan_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
                                   APPLE_BCM_WLAN_SCAN_DELAY_MS);
     return BCME_OK;
@@ -2943,8 +2960,8 @@ static const MemoryRegionOps bar0_ops = {
  */
 #define APPLE_BCM_WLAN_NETDEV_ID "wlan0"
 
-SysBusDevice *apple_bcm_wlan_create(AppleDTNode *node, PCIBus *pci_bus,
-                                    ApplePCIEPort *port)
+SysBusDevice *apple_bcm_wlan_create(AppleDTNode *node, AppleDTNode *mac_node,
+                                    PCIBus *pci_bus, ApplePCIEPort *port)
 {
     DeviceState *dev;
     AppleBCMWLANState *s;
@@ -2971,7 +2988,7 @@ SysBusDevice *apple_bcm_wlan_create(AppleDTNode *node, PCIBus *pci_bus,
      * is never asked for it), so anything else would make the host network see
      * a different address than the guest believes it has.
      */
-    prop = apple_dt_get_prop(node, "local-mac-address");
+    prop = apple_dt_get_prop(mac_node, "local-mac-address");
     if (prop != NULL && prop->len >= sizeof(s->device->conf.macaddr.a)) {
         memcpy(s->device->conf.macaddr.a, prop->data,
                sizeof(s->device->conf.macaddr.a));
@@ -3135,6 +3152,7 @@ static void apple_bcm_wlan_device_qdev_reset_hold(Object *obj, ResetType type)
     s->rx_head = s->rx_count = 0;
     s->link_up = false;
     s->escan_sync_id = 0;
+    s->escan_reported = false;
     timer_del(s->escan_timer);
     timer_del(s->join_timer);
 

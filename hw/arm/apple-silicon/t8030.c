@@ -1491,7 +1491,12 @@ static void t8030_create_wlan(AppleT8030MachineState *t8030)
     apcie_host = port->host;
     (void)apcie_host;
 
-    wlan = apple_bcm_wlan_create(child, sec_bus, port);
+    // The MAC address lives on the platform node, not on the endpoint node:
+    // iOS reads "local-mac-address" from /arm-io/wlan (see t8030_create_misc),
+    // and the emulated NIC has to use the same one the guest gives en0.
+    wlan = apple_bcm_wlan_create(
+        child, apple_dt_get_node(t8030->device_tree, "arm-io/wlan"), sec_bus,
+        port);
     assert_nonnull(wlan);
     object_property_add_child(OBJECT(t8030), "wlan", OBJECT(wlan));
     sysbus_realize_and_unref(wlan, &error_fatal);
@@ -3077,9 +3082,6 @@ static void t8030_init(MachineState *machine)
     t8030_create_baseband_spmi(t8030, "spmi1", "baseband-spmi");
     t8030_create_baseband(t8030);
 #endif
-#ifdef ENABLE_WLAN
-    t8030_create_wlan(t8030);
-#endif
     t8030_create_sio(t8030);
     t8030_create_spi0(t8030);
     t8030_create_spi(t8030, 1);
@@ -3111,6 +3113,13 @@ static void t8030_init(MachineState *machine)
     t8030_create_scaler(t8030);
     t8030_create_accbuck(t8030);
     t8030_create_misc(t8030);
+
+    // After t8030_create_misc: that is where /arm-io/wlan's
+    // "local-mac-address" is replaced with a real address, and the emulated
+    // NIC copies it from there.
+#ifdef ENABLE_WLAN
+    t8030_create_wlan(t8030);
+#endif
 
     t8030_create_tempsensor(t8030, "tempsensor0", false);
     t8030_create_tempsensor(t8030, "tempsensor1", false);

@@ -25,7 +25,12 @@
 #include "hw/pci/pci.h"
 #include "hw/sysbus.h"
 
-SysBusDevice *apple_bcm_wlan_create(AppleDTNode *node, PCIBus *pci_bus,
-                                    ApplePCIEPort *port);
+/*
+ * `node` is the PCIe endpoint node (arm-io/apcie/pci-bridge2/wlan); `mac_node`
+ * is the platform node (arm-io/wlan), which is where iOS takes the interface's
+ * MAC address from and therefore where the emulated NIC has to take its own.
+ */
+SysBusDevice *apple_bcm_wlan_create(AppleDTNode *node, AppleDTNode *mac_node,
+                                    PCIBus *pci_bus, ApplePCIEPort *port);
 
 #endif /* HW_MISC_APPLE_SILICON_APPLE_BCM_WLAN_H */
