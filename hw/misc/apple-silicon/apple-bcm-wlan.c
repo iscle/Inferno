@@ -524,6 +524,15 @@ static const uint8_t apple_bcm_wlan_otp_cis[] = {
  * optional features, so a blanket -23 is the correct default rather than a
  * generic failure.
  */
+#define WLC_UP 2
+#define WLC_DOWN 3
+#define WLC_GET_VERSION 1
+#define WLC_SET_RADIO 38
+#define WLC_SET_REGULATORY 47
+#define WLC_GET_COUNTRY 83
+#define WLC_SET_COUNTRY 84
+#define WLC_GET_VALID_CHANNELS 217
+#define WLC_GET_COUNTRY_LIST 261
 #define WLC_GET_VAR 262
 #define WLC_SET_VAR 263
 
@@ -1311,16 +1320,16 @@ static int apple_bcm_wlan_cmd_ok(AppleBCMWLANDeviceState *s, const void *arg,
     return BCME_OK;
 }
 
-/* Succeed with a zeroed 32-bit reply: "no error", "feature off", "zero". */
-static int apple_bcm_wlan_cmd_zero_u32(AppleBCMWLANDeviceState *s,
-                                       const void *arg, const uint8_t *in,
-                                       uint16_t inlen, uint8_t *out,
-                                       uint16_t outmax, uint16_t *outlen)
+/* Succeed with a constant 32-bit reply taken from the command table. */
+static int apple_bcm_wlan_cmd_u32(AppleBCMWLANDeviceState *s, const void *arg,
+                                  const uint8_t *in, uint16_t inlen,
+                                  uint8_t *out, uint16_t outmax,
+                                  uint16_t *outlen)
 {
     if (outmax < sizeof(uint32_t)) {
         return BCME_BUFTOOSHORT;
     }
-    stl_le_p(out, 0);
+    stl_le_p(out, *(const uint32_t *)arg);
     *outlen = sizeof(uint32_t);
     return BCME_OK;
 }
@@ -1366,6 +1375,128 @@ static int apple_bcm_wlan_cmd_string(AppleBCMWLANDeviceState *s,
     "TxCap API: 1.0\nData: 1.0.0\nCreation: 2020-01-01 00:00:00\n"
 
 /*
+ * Chip capability list.
+ *
+ * AppleBCMWLANCore::processChipCaps (@0xfffffff009472460) reads this into a
+ * 1 KiB buffer and then just runs ::findWord over it for each of the 55 names
+ * in its allCaps table (@0xfffffff0079acee0), setting or clearing a feature
+ * bit per hit -- nothing here is mandatory, and a name we leave out simply
+ * leaves its feature off. Only the *command* has to succeed; failing it aborts
+ * bring-up with "iovar get cap command failed".
+ *
+ * So this is deliberately a conservative, plausible BCM4378 list: the basics
+ * plus dual band and management-frame protection, and none of the exotic
+ * features (RSDB, time sync, scan core, 802.11ax) whose bits would send the
+ * driver down paths this model does not implement.
+ */
+#define APPLE_BCM_WLAN_CAPABILITIES                                     \
+    "ap sta wme 802.11d 802.11h 802.11n dualband ampdu ampdu_tx "       \
+    "ampdu_rx amsdurx amsdutx wep tkip aes wpa wpa2 psk mfp"
+
+static const uint32_t apple_bcm_wlan_zero = 0;
+/*
+ * WLC ioctl interface version. AppleBCMWLANCore::updateFWAPIVerFromHW
+ * (@0xfffffff0094750e0) pre-seeds its 4-byte result buffer with 1 and does not
+ * validate what comes back, so 1 is the value the driver would have assumed
+ * anyway -- but the *command* must succeed or setupFirmware gives up.
+ */
+static const uint32_t apple_bcm_wlan_ioctl_version = 1;
+
+/*
+ * The regulatory domains we claim to know about.
+ *
+ * "X0" is Broadcom's worldwide/generic domain; the rest are ordinary ISO
+ * country codes. Each entry occupies a fixed 4-byte slot.
+ */
+#define APPLE_BCM_WLAN_CCODE_SIZE 4
+static const char *const apple_bcm_wlan_country_codes[] = {
+    "X0", "US", "CA", "GB", "DE", "FR", "JP", "AU", "CN", "KR",
+};
+
+/*
+ * WLC_GET_COUNTRY_LIST, wl_country_list_t. AppleBCMWLANCore::
+ * handleGetCountryListAsyncCallBack (@0xfffffff0094def1c) reads the count at
+ * +0x0C (clamped to 256) and then copies that many 4-byte codes from +0x10.
+ */
+static int apple_bcm_wlan_cmd_country_list(AppleBCMWLANDeviceState *s,
+                                           const void *arg, const uint8_t *in,
+                                           uint16_t inlen, uint8_t *out,
+                                           uint16_t outmax, uint16_t *outlen)
+{
+    size_t count = ARRAY_SIZE(apple_bcm_wlan_country_codes);
+    size_t len = 0x10 + count * APPLE_BCM_WLAN_CCODE_SIZE;
+    size_t i;
+
+    if (len > outmax) {
+        return BCME_BUFTOOSHORT;
+    }
+
+    memset(out, 0, len);
+    stl_le_p(out, len); // buflen
+    stl_le_p(out + 0x0C, count);
+    for (i = 0; i < count; i++) {
+        strncpy((char *)out + 0x10 + i * APPLE_BCM_WLAN_CCODE_SIZE,
+                apple_bcm_wlan_country_codes[i], APPLE_BCM_WLAN_CCODE_SIZE);
+    }
+    *outlen = len;
+    return BCME_OK;
+}
+
+/*
+ * WLC_GET_COUNTRY. The full reply is a wl_country_t -- abbreviation, regulatory
+ * revision, underlying country code -- but the driver also asks for it with a
+ * 4-byte buffer when all it wants is the abbreviation, so answer whichever
+ * fits rather than failing the short form.
+ */
+static int apple_bcm_wlan_cmd_country(AppleBCMWLANDeviceState *s,
+                                      const void *arg, const uint8_t *in,
+                                      uint16_t inlen, uint8_t *out,
+                                      uint16_t outmax, uint16_t *outlen)
+{
+    size_t len = outmax >= 12 ? 12 : APPLE_BCM_WLAN_CCODE_SIZE;
+
+    if (outmax < len) {
+        return BCME_BUFTOOSHORT;
+    }
+    memset(out, 0, len);
+    strncpy((char *)out, arg, APPLE_BCM_WLAN_CCODE_SIZE);
+    if (len == 12) {
+        strncpy((char *)out + 8, arg, APPLE_BCM_WLAN_CCODE_SIZE);
+    }
+    *outlen = len;
+    return BCME_OK;
+}
+
+/*
+ * The channels we claim to support: the 2.4 GHz band plus the usual
+ * non-DFS 5 GHz channels. Reported as a wl_uint32_list_t -- a count followed
+ * by that many 32-bit channel numbers.
+ */
+static const uint32_t apple_bcm_wlan_channels[] = {
+    1,  2,  3,  4,  5,   6,   7,   8,   9,   10,  11,
+    36, 40, 44, 48, 149, 153, 157, 161, 165,
+};
+
+static int apple_bcm_wlan_cmd_channels(AppleBCMWLANDeviceState *s,
+                                       const void *arg, const uint8_t *in,
+                                       uint16_t inlen, uint8_t *out,
+                                       uint16_t outmax, uint16_t *outlen)
+{
+    size_t count = ARRAY_SIZE(apple_bcm_wlan_channels);
+    size_t i;
+
+    if (outmax < sizeof(uint32_t) * (count + 1)) {
+        return BCME_BUFTOOSHORT;
+    }
+    stl_le_p(out, count);
+    for (i = 0; i < count; i++) {
+        stl_le_p(out + sizeof(uint32_t) * (i + 1), apple_bcm_wlan_channels[i]);
+    }
+    *outlen = sizeof(uint32_t) * (count + 1);
+    return BCME_OK;
+}
+
+/*
  * Everything the emulated firmware answers.
  *
  * Anything absent from this table gets BCME_UNSUPPORTED, which the driver maps
@@ -1390,13 +1521,33 @@ static const struct {
      * failed". We swallow the blobs and describe a plausible database.
      */
     { WLC_SET_VAR, "clmload", apple_bcm_wlan_cmd_ok },
-    { WLC_GET_VAR, "clmload_status", apple_bcm_wlan_cmd_zero_u32 },
+    { WLC_GET_VAR, "clmload_status", apple_bcm_wlan_cmd_u32,
+      &apple_bcm_wlan_zero },
     { WLC_GET_VAR, "clmver", apple_bcm_wlan_cmd_string,
       APPLE_BCM_WLAN_CLM_VERSION },
     { WLC_SET_VAR, "txcapload", apple_bcm_wlan_cmd_ok },
-    { WLC_GET_VAR, "txcapload_status", apple_bcm_wlan_cmd_zero_u32 },
+    { WLC_GET_VAR, "txcapload_status", apple_bcm_wlan_cmd_u32,
+      &apple_bcm_wlan_zero },
     { WLC_GET_VAR, "txcapver", apple_bcm_wlan_cmd_string,
       APPLE_BCM_WLAN_TXCAP_VERSION },
+    { WLC_GET_VERSION, NULL, apple_bcm_wlan_cmd_u32,
+      &apple_bcm_wlan_ioctl_version },
+    { WLC_GET_VAR, "cap", apple_bcm_wlan_cmd_string,
+      APPLE_BCM_WLAN_CAPABILITIES },
+    /*
+     * Minimum power consumption. The driver reads it, turns it off and
+     * requires the read to have worked ("Iovar failure getting MPC value").
+     * Report it already off.
+     */
+    { WLC_GET_VAR, "mpc", apple_bcm_wlan_cmd_u32, &apple_bcm_wlan_zero },
+    { WLC_GET_COUNTRY_LIST, NULL, apple_bcm_wlan_cmd_country_list },
+    { WLC_GET_COUNTRY, NULL, apple_bcm_wlan_cmd_country, "US" },
+    { WLC_SET_COUNTRY, NULL, apple_bcm_wlan_cmd_ok },
+    { WLC_UP, NULL, apple_bcm_wlan_cmd_ok },
+    { WLC_DOWN, NULL, apple_bcm_wlan_cmd_ok },
+    { WLC_SET_REGULATORY, NULL, apple_bcm_wlan_cmd_ok },
+    { WLC_SET_RADIO, NULL, apple_bcm_wlan_cmd_ok },
+    { WLC_GET_VALID_CHANNELS, NULL, apple_bcm_wlan_cmd_channels },
 };
 
 static int apple_bcm_wlan_ioctl(AppleBCMWLANDeviceState *s, uint8_t ifidx,
@@ -1438,6 +1589,17 @@ static int apple_bcm_wlan_ioctl(AppleBCMWLANDeviceState *s, uint8_t ifidx,
         status = apple_bcm_wlan_commands[i].fn(s, apple_bcm_wlan_commands[i].arg,
                                                in, inlen, out, outmax, outlen);
         break;
+    }
+
+    /*
+     * A configuration write we do not model is still a write that "took": the
+     * emulated firmware has no state to disagree with. Accepting them by
+     * default is both what real firmware does and what keeps bring-up moving,
+     * whereas a *read* of something we cannot invent must stay unsupported so
+     * the driver falls back to its own default instead of believing a zero.
+     */
+    if (status == BCME_UNSUPPORTED && cmd == WLC_SET_VAR && iovar != NULL) {
+        status = BCME_OK;
     }
 
     qemu_log_mask(LOG_UNIMP,
