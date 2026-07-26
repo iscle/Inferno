@@ -2204,8 +2204,19 @@ static void t8030_create_misc(AppleT8030MachineState *t8030)
     apple_dt_set_prop(chosen, "mac-address-wifi0", 6,
                       (const uint8_t[]){ 0xDE, 0xAD, 0xBE, 0xEF, 0x22, 0x12 });
 
-    // child = apple_dt_get_node(armio, "wlan");
-    // assert_nonnull(child);
+    child = apple_dt_get_node(armio, "wlan");
+    assert_nonnull(child);
+
+    /*
+     * Stock value is the iBoot placeholder
+     * "macaddr/wifiaddr,syscfg/WMac/6,zeroes/6", which resolves to six zero
+     * bytes here. AppleBCMWLANProvisioningManager::process() rejects an
+     * all-zero (or multicast) address and AppleBCMWLANCore::start() then bails
+     * with "Failed to process provisioning data", so hand it the same address
+     * chosen/mac-address-wifi0 advertises.
+     */
+    apple_dt_set_prop(child, "local-mac-address", 6,
+                      (const uint8_t[]){ 0xDE, 0xAD, 0xBE, 0xEF, 0x22, 0x12 });
 }
 
 static void t8030_create_display(AppleT8030MachineState *t8030)
