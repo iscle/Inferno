@@ -1976,10 +1976,12 @@ static void apple_bcm_wlan_virt_if_timer(void *opaque)
 }
 
 /*
- * SET_VAR "awdl_if": create the AWDL interface.
+ * SET_VAR "awdl_if": create or destroy the AWDL interface.
  *
  * The 20-byte payload starts with the bsscfgidx the host wants the interface
  * to have, followed by an enable flag and the MAC address it should use.
+ * ::deleteChipInterface (@0xfffffff00957f2d8) sends the same iovar with the
+ * flag clear and does not wait for anything, so only a creation is answered.
  */
 static int apple_bcm_wlan_cmd_awdl_if(AppleBCMWLANDeviceState *s,
                                       const void *arg, const uint8_t *in,
@@ -1988,8 +1990,11 @@ static int apple_bcm_wlan_cmd_awdl_if(AppleBCMWLANDeviceState *s,
 {
     size_t name_len = strlen("awdl_if") + 1;
 
-    if (inlen < name_len + 4) {
+    if (inlen < name_len + 8) {
         return BCME_ERROR;
+    }
+    if (ldl_le_p(in + name_len + 4) == 0) {
+        return BCME_OK;
     }
     s->virt_if_bsscfgidx = ldl_le_p(in + name_len) & 0xFF;
     timer_mod(s->virt_if_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
