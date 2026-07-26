@@ -70,14 +70,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMWLANState, APPLE_BCM_WLAN)
  * BAR layout. brcmfmac's pcie.c and the reverse-engineered AppleBCMWLAN driver
  * both expect a small register window and a large TCM/shared-RAM window.
  *
- * TODO(phase-verify): confirm exact BAR sizes for BCM4378 against a live ioreg
- * dump. Real BCM PCIe cores expose a 32 KiB BAR0; here we only model the low
- * 4 KiB of registers that matter for chip recognition. The TCM window on
- * BCM4378 is large (firmware + RAM); 4 MiB is a safe over-approximation that
- * lets the driver blit firmware/NVRAM without faulting.
+ * BAR0 is 32 KiB: the driver's backplane table (kBCOM4378ChipBackplaneWindows)
+ * describes eight 4 KiB windows at BAR0 offsets 0x0000-0x7000, each steered by
+ * a PCI config register (0x80, 0x70, 0x74, 0x78) or pinned to a fixed core.
+ *
+ * BAR2 maps the chip's memories identity-style. The highest region the driver
+ * uses is 0x400000 + 0x120000, and it polls for the shared-info pointer at
+ * dongle offset ramsize-4 = 0x51FFFC, so the window must cover at least
+ * 0x520000; 8 MiB gives headroom.
  */
-#define APPLE_BCM_WLAN_DEVICE_BAR0_SIZE (0x1000)
-#define APPLE_BCM_WLAN_DEVICE_BAR2_SIZE (4 * MiB)
+#define APPLE_BCM_WLAN_DEVICE_BAR0_SIZE (0x8000)
+#define APPLE_BCM_WLAN_DEVICE_BAR2_SIZE (8 * MiB)
 
 /*
  * SiliconBackplane / ChipCommon.
@@ -395,7 +398,16 @@ static void apple_bcm_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
                            APPLE_BCM_WLAN_DEVICE_BAR2_SIZE, &error_fatal);
 
     assert_true(pci_is_express(dev));
-    pcie_endpoint_cap_init(dev, 0x70);
+    /*
+     * Put the PCI Express capability at 0xD0, where real BCM43xx parts have it.
+     * It must not overlap the Broadcom-proprietary config registers: the
+     * backplane window registers live at 0x70/0x74/0x78/0x80, SPROM control at
+     * 0x88, BAR1 control at 0x8C and the backplane address/data pair at
+     * 0xA0/0xA4. A capability placed at 0x70 covers 0x70-0xAB and buries all of
+     * them. The driver finds the capability by walking the list, so its offset
+     * only has to avoid collisions.
+     */
+    pcie_endpoint_cap_init(dev, 0xD0);
     pcie_cap_deverr_init(dev);
 
     /* Single MSI vector, mirroring the baseband endpoint. */
