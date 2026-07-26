@@ -122,6 +122,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMWLANState, APPLE_BCM_WLAN)
 #define BCM_BACKPLANE_CHIPCOMMON_BASE 0x18000000ULL // ChipCoreID 0
 #define BCM_BACKPLANE_PCIE2_BASE 0x18001000ULL // ChipCoreID 3
 #define BCM_BACKPLANE_GCI_BASE 0x18010000ULL // ChipCoreID 6
+#define BCM_BACKPLANE_OTP_BASE 0x18011000ULL // ChipCoreID 8
 #define BCM_BACKPLANE_CORE_SIZE 0x1000ULL
 /* Every AI wrapper shares one register layout, so one handler serves them all. */
 #define BCM_BACKPLANE_WRAPPER_BASE 0x18100000ULL
@@ -190,6 +191,78 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMWLANState, APPLE_BCM_WLAN)
 #define BCM_GCI_STATUS_VALUE (0x00000000U & ~BCM_GCI_STATUS_FAIL)
 #define BCM_GCI_CHIPCTRL 0xE64
 
+/*
+ * OTP core (ChipCoreID 8, backplane 0x18011000).
+ *
+ * The chip's one-time-programmable fuse array is exposed as a plain register
+ * window and read by AppleBCMWLANChipBackplane::copyRegisters16() as a run of
+ * 16-bit loads. Two regions are copied out (both live in the SAME 0x400-byte
+ * image, they only differ in where they start):
+ *
+ *   kBCOM4378ChipUserOTP = { 0x120, 0x2e0 } -> OSData [busIface+0x470],
+ *       published as the "OTP" property AND fed to
+ *       AppleBCMWLANBusInterfacePCIe::parseOTP() as a Broadcom CIS tuple
+ *       stream. THIS is the one that has to contain something sensible.
+ *   kBCOM4378ChipOTP     = { 0x000, 0x400 } -> OSData [busIface+0x480],
+ *       published as the "ChipOTP" property only, never parsed.
+ *
+ * AppleBCMWLANBusInterface::parseOTPData (@0xfffffff0094488e8) walks the
+ * stream as {u8 tag, u8 len, u8 data[len]}: tag 0x00 is one byte of padding,
+ * tag 0xFF ends the stream, anything else is handed to the parseOTPTuple
+ * callback. Truncated tuples are a hard error.
+ */
+#define BCM_OTP_IMAGE_SIZE 0x400
+#define BCM_OTP_CIS_OFFSET 0x120 // == kBCOM4378ChipUserOTP.offset
+
+/* Broadcom/PCMCIA CIS tuple tags. */
+#define CIS_TPL_VERS_1 0x15
+#define CIS_TPL_MANFID 0x20
+#define CIS_TPL_FUNCID 0x21
+#define CIS_TPL_END 0xFF
+
+/*
+ * Synthetic CIS content. Nothing here is copied from Apple; it is the minimum
+ * a BCM4378 OTP has to say for the driver's identification path to work.
+ *
+ * The tuple that matters is CISTPL_VERS_1 (0x15). Its handler chain is
+ * AppleBCMWLANBusInterface::parseOTPTuple (@0xfffffff009448b5c, requires
+ * len > 6, else "dropping invalid Version tuple") ->
+ * AppleBCMWLANBusInterfacePCIe::parseVersion1Tuple (@0xfffffff0095c4660),
+ * which skips the two version bytes and then splits the payload into up to
+ * four NUL-terminated strings, storing them at busIface +0xd8 (ProductInfo0),
+ * +0xe0 (ProductInfo1), +0xc8 (Manufacturer) and +0xd0 (Product) -- note the
+ * PCIe override's slot order differs from the base class'. It stops at a 0xFF
+ * byte or when it has consumed len-3 bytes.
+ *
+ * publishHWIdentifiers (inlined into attachPCIeBusGated) then requires ALL
+ * FOUR of those pointers to be non-NULL, otherwise it bails with
+ * kIOReturnBadArgument at source lines 4112..4115 -- which is exactly the
+ * "publishHWIdentifiers@4112: Bad argument" we used to get with an all-zero
+ * OTP. It merges the four strings into one dictionary with
+ * AppleBCMWLANUtil::appendParsedKeyValuePairsToDictionary
+ * (@0xfffffff00953f264), which parses SPACE-separated "key=value" pairs and
+ * FAILS on anything malformed, and publishes it as "HWIdentifiers". The keys
+ * it looks up afterwards are the single letters used by Apple's Wi-Fi
+ * firmware naming scheme: "C" (chip, filled in by the driver itself from the
+ * PCI device id), "P" (product/platform), "M" (module) and "m" (module
+ * revision).
+ */
+static const uint8_t apple_bcm_wlan_otp_cis[] = {
+    /* CISTPL_MANFID: manufacturer 0x02D0 (Broadcom), card id 0x4378. */
+    CIS_TPL_MANFID, 0x04, 0xD0, 0x02, 0x78, 0x43,
+    /* CISTPL_FUNCID: function 0x0C == network adapter, no sysinit. */
+    CIS_TPL_FUNCID, 0x02, 0x0C, 0x00,
+    /* CISTPL_VERS_1: major 8, minor 0, four strings, 0xFF terminator. */
+    CIS_TPL_VERS_1, 0x1B, 0x08, 0x00,
+    'P', '=', 'C', '0', '5', '1', '\0', // platform
+    'M', '=', 'B', 'C', 'P', 'N', '\0', // module
+    'V', '=', 'm', '\0', // vendor
+    'm', '=', '1', '.', '0', '\0', // module revision
+    CIS_TPL_END,
+    /* End of the tuple stream. */
+    CIS_TPL_END,
+};
+
 /* AI (wrapper) registers, identical for every wrapper. */
 #define BCM_AI_IOCTRL 0x408
 #define BCM_AI_RESETCTRL 0x800
@@ -236,6 +309,9 @@ struct AppleBCMWLANDeviceState {
     /* Per-wrapper AI registers, indexed by (backplane_addr >> 12) & 0x3F. */
     uint32_t wrapper_ioctrl[BCM_BACKPLANE_NUM_WRAPPERS];
     uint32_t wrapper_resetctrl[BCM_BACKPLANE_NUM_WRAPPERS];
+
+    /* OTP fuse array as seen through ChipCoreID 8, see apple_bcm_wlan_otp_cis. */
+    uint8_t otp[BCM_OTP_IMAGE_SIZE];
 };
 
 struct AppleBCMWLANState {
@@ -460,6 +536,18 @@ static uint32_t apple_bcm_wlan_backplane_read(AppleBCMWLANDeviceState *s,
         default:
             break;
         }
+    } else if (addr - BCM_BACKPLANE_OTP_BASE < BCM_BACKPLANE_CORE_SIZE) {
+        /*
+         * OTP fuse array. copyRegisters16() reads it as consecutive 16-bit
+         * loads; the BAR0 region only implements 32-bit accesses, so QEMU
+         * hands us the containing aligned word and extracts the half itself.
+         * Anything past the 0x400-byte image reads as 0.
+         */
+        off = addr - BCM_BACKPLANE_OTP_BASE;
+        if (off + 4 <= BCM_OTP_IMAGE_SIZE) {
+            return ldl_le_p(s->otp + off);
+        }
+        return 0;
     } else if (addr >= BCM_BACKPLANE_WRAPPER_BASE &&
                addr < BCM_BACKPLANE_WRAPPER_END) {
         unsigned index = (addr - BCM_BACKPLANE_WRAPPER_BASE) / 0x1000;
@@ -777,6 +865,13 @@ static void apple_bcm_wlan_device_qdev_reset_hold(Object *obj, ResetType type)
 
     memset(s->wrapper_ioctrl, 0, sizeof(s->wrapper_ioctrl));
     memset(s->wrapper_resetctrl, 0, sizeof(s->wrapper_resetctrl));
+
+    /* Unprogrammed fuses read as 0; the CIS sits at kBCOM4378ChipUserOTP. */
+    QEMU_BUILD_BUG_ON(BCM_OTP_CIS_OFFSET + sizeof(apple_bcm_wlan_otp_cis) >
+                      BCM_OTP_IMAGE_SIZE);
+    memset(s->otp, 0, sizeof(s->otp));
+    memcpy(s->otp + BCM_OTP_CIS_OFFSET, apple_bcm_wlan_otp_cis,
+           sizeof(apple_bcm_wlan_otp_cis));
 }
 
 static void apple_bcm_wlan_device_pci_uninit(PCIDevice *dev)
