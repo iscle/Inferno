@@ -2135,10 +2135,22 @@ static int apple_bcm_wlan_cmd_string(AppleBCMWLANDeviceState *s,
  * plus dual band and management-frame protection, and none of the exotic
  * features (RSDB, time sync, scan core, 802.11ax) whose bits would send the
  * driver down paths this model does not implement.
+ *
+ * "evt_ext" is the one entry that is not optional in practice. Without it
+ * AppleBCMWLANCore::writeEventBitField (@0xfffffff0094c91e4) has to express
+ * the set of events it wants with the legacy 16-byte "event_msgs" bitfield,
+ * which cannot hold a bit above 127; it asks for several that are, notices the
+ * top nine bytes of its own bitfield are non-zero and reports fault
+ * 0xE3FF8525. That fault is what makes the driver announce itself to userspace
+ * as APPLE80211_M_DRIVER_AVAILABLE available[0] at the end of an otherwise
+ * successful bring-up, and it drags corecaptured in to collect a report.
+ * Claiming the capability moves it to the 68-byte "event_msgs_ext" form (a
+ * 64-byte mask), which expresses everything and which we accept like any other
+ * configuration write.
  */
 #define APPLE_BCM_WLAN_CAPABILITIES                                     \
     "ap sta wme 802.11d 802.11h 802.11n dualband ampdu ampdu_tx "       \
-    "ampdu_rx amsdurx amsdutx wep tkip aes wpa wpa2 psk mfp"
+    "ampdu_rx amsdurx amsdutx wep tkip aes wpa wpa2 psk mfp evt_ext"
 
 static const uint32_t apple_bcm_wlan_zero = 0;
 /*
