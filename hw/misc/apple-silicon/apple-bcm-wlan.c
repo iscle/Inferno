@@ -241,23 +241,56 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMWLANState, APPLE_BCM_WLAN)
  * OTP. It merges the four strings into one dictionary with
  * AppleBCMWLANUtil::appendParsedKeyValuePairsToDictionary
  * (@0xfffffff00953f264), which parses SPACE-separated "key=value" pairs and
- * FAILS on anything malformed, and publishes it as "HWIdentifiers". The keys
- * it looks up afterwards are the single letters used by Apple's Wi-Fi
- * firmware naming scheme: "C" (chip, filled in by the driver itself from the
- * PCI device id), "P" (product/platform), "M" (module) and "m" (module
- * revision).
+ * FAILS on anything malformed, and publishes it as "HWIdentifiers".
+ *
+ * Two of the strings are ALSO published verbatim, by getModuleInfo
+ * (@0xfffffff0095c4a60): "ChipInfo" = the Manufacturer string (+0xc8) and
+ * "ModuleInfo" = the Product string (+0xd0). AppleBCMWLANCore::generateFileName
+ * (@0xfffffff009466cd0) turns those two into the firmware path:
+ *
+ *     <upper-case keys joined by '_'> "__" <lower-case keys joined by '_'>
+ *
+ * for each of them (AppleBCMWLANCore::copyKeys @0xfffffff00946779c selects by
+ * key case), joined with '/', with '=' rendered as '-'; if ChipInfo has no
+ * "C=" key the driver prepends "C=<chip number>".
+ *
+ * ModuleInfo must NOT carry a "P=" key: generateFileName takes the "P=" key as
+ * a signal that the platform is already named and then skips the branch that
+ * appends the device tree's "module-instance" to the SHORT name buffers -- the
+ * ones the firmware/CLM/TxCap files use. With "P=" present you get
+ * "C-4378__s-B1/.trx" and a bare ".clmb"/".txcb"; without it the driver builds
+ * the platform name itself. So
+ *
+ *     ChipInfo   = "s=B1"
+ *     ModuleInfo = "M=GODF V=m m=4.3"
+ *
+ * asks for exactly what the guest's own /usr/share/firmware/wifi contains for
+ * this board:
+ *
+ *     C-4378__s-B1/moana.trx  .clmb  .txcb
+ *     C-4378__s-B1/P-moana_M-GODF_V-m__m-4.3.txt   (NVRAM)
+ *
+ * ("moana" is the DT module-instance of the n104ap WLAN node.) We deliberately
+ * name real files: the guest downloads ITS OWN firmware into our BAR2 and we
+ * merely swallow the writes; we neither ship nor execute it.
  */
 static const uint8_t apple_bcm_wlan_otp_cis[] = {
     /* CISTPL_MANFID: manufacturer 0x02D0 (Broadcom), card id 0x4378. */
     CIS_TPL_MANFID, 0x04, 0xD0, 0x02, 0x78, 0x43,
     /* CISTPL_FUNCID: function 0x0C == network adapter, no sysinit. */
     CIS_TPL_FUNCID, 0x02, 0x0C, 0x00,
-    /* CISTPL_VERS_1: major 8, minor 0, four strings, 0xFF terminator. */
-    CIS_TPL_VERS_1, 0x1B, 0x08, 0x00,
-    'P', '=', 'C', '0', '5', '1', '\0', // platform
-    'M', '=', 'B', 'C', 'P', 'N', '\0', // module
-    'V', '=', 'm', '\0', // vendor
-    'm', '=', '1', '.', '0', '\0', // module revision
+    /*
+     * CISTPL_VERS_1: major 8, minor 0, then the four strings in the slot
+     * order the PCIe override uses: ProductInfo0, ProductInfo1, Manufacturer
+     * (== ChipInfo), Product (== ModuleInfo). Terminated by 0xFF.
+     */
+    CIS_TPL_VERS_1, 0x23, 0x08, 0x00,
+    'V', '=', 'm', '\0', // ProductInfo0: module vendor (Murata)
+    'm', '=', '4', '.', '3', '\0', // ProductInfo1: module revision
+    's', '=', 'B', '1', '\0', // Manufacturer -> "ChipInfo": chip stepping
+    // Product -> "ModuleInfo": module, vendor, module revision
+    'M', '=', 'G', 'O', 'D', 'F', ' ', 'V', '=', 'm', ' ', 'm', '=', '4', '.',
+    '3', '\0',
     CIS_TPL_END,
     /* End of the tuple stream. */
     CIS_TPL_END,
