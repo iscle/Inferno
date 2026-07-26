@@ -22,9 +22,12 @@ PREFIX="${INFERNO_HOST_TOOLS:-$DATA_DIR/host-tools}"
 IPSW="${INFERNO_IPSW:-$HOME/Downloads/iPhone11,8,iPhone12,1_14.0_18A5351d_Restore.ipsw}"
 ECID="${INFERNO_ECID:-0x1122334455667788}"
 
-USB_SOCK="/tmp/InfernoUSBRemote"
-BROKER_SOCK="/tmp/inferno-usbd.sock"
-MUX_SOCK="/tmp/inferno-usbmuxd.sock"
+# Socket paths. Overridable so a second restore (a different iOS build, out of a
+# different INFERNO_DATA) can run alongside the first without the two VMs and
+# their host stacks colliding.
+USB_SOCK="${INFERNO_USB_CONN_ADDR:-/tmp/InfernoUSBRemote}"
+BROKER_SOCK="${INFERNO_USBD_BROKER_SOCK:-/tmp/inferno-usbd.sock}"
+MUX_SOCK="${INFERNO_MUX_SOCK:-/tmp/inferno-usbmuxd.sock}"
 
 export PATH="$PREFIX/bin:$PREFIX/sbin:$PATH"
 export INFERNO_USBD_SOCK="$BROKER_SOCK"
@@ -70,6 +73,7 @@ sleep 1
 
 echo "== 3. main VM (t8030) =="
 INFERNO_DATA="$DATA_DIR" INFERNO_BUILD="${INFERNO_BUILD:-$HOME/Inferno/build}" \
+    INFERNO_USB_CONN_ADDR="$USB_SOCK" \
     RESTORE=1 "$HERE/run-main-vm.sh" &
 PIDS+=($!)
 

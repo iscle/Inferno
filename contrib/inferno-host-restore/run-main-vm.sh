@@ -27,21 +27,28 @@ USB_CONN_TYPE="${INFERNO_USB_CONN_TYPE:-unix}"
 USB_CONN_ADDR="${INFERNO_USB_CONN_ADDR:-/tmp/InfernoUSBRemote}"
 USB_CONN_PORT="${INFERNO_USB_CONN_PORT:-}"
 
-# Device-specific asset names for iPhone 11 (n104ap / iPhone12,1), iOS 14.0b5.
-BOARD="n104"
-TRUSTCACHE="Restore/Firmware/038-44135-124.dmg.trustcache"
-KERNEL="Restore/kernelcache.research.iphone12b"
-DTB="Restore/Firmware/all_flash/DeviceTree.${BOARD}ap.im4p"
-SEP_FW="sep-firmware.${BOARD}.RELEASE.new.img4"
-SEP_ROM="AppleSEPROM-Cebu-B1"
-TICKET="root_ticket.der"
+# Device-specific asset names. The defaults are for iPhone 11 (n104ap /
+# iPhone12,1) on iOS 14.0b5; every one of them can be overridden from the
+# environment so the same script can drive a different iOS build out of a
+# different INFERNO_DATA directory (the asset file names are build-specific —
+# the RAM disk / OS dmg numbers and the trust cache change with every build).
+BOARD="${INFERNO_BOARD:-n104}"
+TRUSTCACHE="${INFERNO_TRUSTCACHE:-Restore/Firmware/038-44135-124.dmg.trustcache}"
+KERNEL="${INFERNO_KERNEL:-Restore/kernelcache.research.iphone12b}"
+DTB="${INFERNO_DTB:-Restore/Firmware/all_flash/DeviceTree.${BOARD}ap.im4p}"
+SEP_FW="${INFERNO_SEP_FW:-sep-firmware.${BOARD}.RELEASE.new.img4}"
+SEP_ROM="${INFERNO_SEP_ROM:-AppleSEPROM-Cebu-B1}"
+TICKET="${INFERNO_TICKET:-root_ticket.der}"
 # Erase RAM disk (the smaller of the two small dmgs) — needed for --erase restore.
 RAMDISK="${INFERNO_RAMDISK:-Restore/038-44135-124.dmg}"
 
 # Whether to attach the restore RAM disk (-initrd). Set RESTORE=0 for a normal boot.
 RESTORE="${RESTORE:-1}"
 
-QEMU="$BUILD_DIR/qemu-system-aarch64"
+# The emulator binary. Normally the one in the build directory; INFERNO_QEMU can
+# point at a copy under a different name, which is handy when several VMs share
+# the host and one of them is torn down with a name-matching `pkill`.
+QEMU="${INFERNO_QEMU:-$BUILD_DIR/qemu-system-aarch64}"
 
 # --- sanity checks ---------------------------------------------------------
 cd "$DATA_DIR"
