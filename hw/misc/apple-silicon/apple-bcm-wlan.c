@@ -613,6 +613,7 @@ static const uint8_t apple_bcm_wlan_otp_cis[] = {
 #define WLC_SET_REGULATORY 47
 #define WLC_SCAN 50
 #define WLC_DISASSOC 52
+#define WLC_SET_KEY 45
 #define WLC_SET_ROAM_TRIGGER 55
 #define WLC_SET_ROAM_DELTA 57
 #define WLC_SET_PM 86
@@ -621,7 +622,9 @@ static const uint8_t apple_bcm_wlan_otp_cis[] = {
 #define WLC_GET_RSSI 127
 #define WLC_SET_WSEC 134
 #define WLC_GET_BSS_INFO 136
+#define WLC_SCB_AUTHORIZE 121
 #define WLC_SET_WPA_AUTH 165
+#define WLC_SET_WSEC_PMK 268
 #define WLC_GET_COUNTRY 83
 #define WLC_SET_COUNTRY 84
 #define WLC_GET_VALID_CHANNELS 217
@@ -2304,6 +2307,16 @@ static const struct {
     { WLC_SET_ROAM_TRIGGER, NULL, apple_bcm_wlan_cmd_ok },
     { WLC_SET_ROAM_DELTA, NULL, apple_bcm_wlan_cmd_ok },
     { WLC_SET_SSID, NULL, apple_bcm_wlan_cmd_set_ssid },
+    { WLC_SET_VAR, "join", apple_bcm_wlan_cmd_set_ssid },
+    /*
+     * Key installation. Even an open network gets a key programmed (a
+     * 164-byte wl_wsec_key_t with algorithm "none"), and the join gives up if
+     * it is refused -- there is no key material for us to do anything with, so
+     * just accept it.
+     */
+    { WLC_SET_KEY, NULL, apple_bcm_wlan_cmd_ok },
+    { WLC_SCB_AUTHORIZE, NULL, apple_bcm_wlan_cmd_ok },
+    { WLC_SET_WSEC_PMK, NULL, apple_bcm_wlan_cmd_ok },
     { WLC_DISASSOC, NULL, apple_bcm_wlan_cmd_disassoc },
     /* What the host asks about the network once it believes it has joined. */
     { WLC_GET_BSS_INFO, NULL, apple_bcm_wlan_cmd_bss_info },
