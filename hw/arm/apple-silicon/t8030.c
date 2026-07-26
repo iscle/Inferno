@@ -1449,6 +1449,40 @@ static void t8030_create_wlan(AppleT8030MachineState *t8030)
      * arms its PCIe attach notifier.
      */
 
+    /*
+     * Give pci-bridge2 a "clkreq-wait-time" (milliseconds) so iOS delays its
+     * boot-time bring-up of the WLAN port.
+     *
+     * AppleEmbeddedPCIEPort::enableGated stores this property at +0x1bc and,
+     * when it is non-zero, busy-waits up to that long for the endpoint to
+     * assert CLKREQ# (polling the "function-clkreq" AppleARMFunction) before
+     * declaring the port up. The stock T8030 device tree omits the property
+     * entirely, so iOS brings pci-bridge2 up immediately -- which means the
+     * endpoint's IOPCIDevice nub is created and published by the boot-time
+     * IOPCIConfigurator pass *before* AppleBCMWLANBusInterfacePCIe::
+     * deferredStart has installed its "wlan" publish notification. IOKit then
+     * invokes notifyPCIeAttached synchronously from addMatchingNotification,
+     * i.e. before the driver has stored the returned IONotifier* into
+     * this->[0x410]; the handler compares the two, silently no-ops, the attach
+     * is never signalled, and deferredStart fails 10 s later in
+     * waitForBusAttachWithTimeoutGated ("BCMWLAN Device Not Enumerated-line
+     * 1599", readable as com.apple.wlan.init_failure_string on /arm-io/wlan).
+     *
+     * Delaying the port bring-up reorders the two, and matches hardware: the
+     * BCM4378 is only powered up once its driver runs, so its link really does
+     * train late and CLKREQ# really is absent at boot.
+     */
+    {
+        const char *env = getenv("INFERNO_WLAN_CLKREQ_WAIT_MS");
+        uint32_t wait_ms = env != NULL ? (uint32_t)strtoul(env, NULL, 0) : 5000;
+        AppleDTNode *bridge2 =
+            apple_dt_get_node(t8030->device_tree, "arm-io/apcie/pci-bridge2");
+        assert_nonnull(bridge2);
+        if (wait_ms != 0) {
+            apple_dt_set_prop_u32(bridge2, "clkreq-wait-time", wait_ms);
+        }
+    }
+
     ApplePCIEPort *port = APPLE_PCIE_PORT(
         object_property_get_link(OBJECT(t8030), "pcie.bridge2", &error_fatal));
     PCIDevice *pci_dev = PCI_DEVICE(port);
