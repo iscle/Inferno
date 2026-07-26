@@ -122,6 +122,19 @@ case "${INFERNO_DISPLAY:-cocoa}" in
     *)    CMD+=( -display cocoa,zoom-to-fit=on,zoom-interpolation=on,show-cursor=on );;
 esac
 
+# Host networking for the emulated Broadcom Wi-Fi endpoint.
+#
+# The t8030 machine looks up a netdev with id "wlan0" and, when it finds one,
+# attaches the BCM4378 endpoint's NIC to it; without one the emulated Wi-Fi
+# still associates with the fake access point but carries no traffic. libslirp
+# ("user") needs no privileges and gives the guest 10.0.2.15 with a gateway and
+# DNS resolver at 10.0.2.2/10.0.2.3.
+#
+# Override with INFERNO_NETDEV (e.g. a vmnet/tap backend), or set it to "none"
+# to leave the interface unconnected.
+NETDEV="${INFERNO_NETDEV:-user,id=wlan0}"
+[ "$NETDEV" != "none" ] && CMD+=( -netdev "$NETDEV" )
+
 if [ "$RESTORE" = "1" ]; then
     [ -e "$RAMDISK" ] || { echo "error: RESTORE=1 but RAM disk missing: $RAMDISK" >&2; exit 1; }
     CMD+=( -initrd "$RAMDISK" )
