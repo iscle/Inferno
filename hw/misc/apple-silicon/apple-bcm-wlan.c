@@ -17,11 +17,14 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  *
  * PHASE 1 status: this is a *stub* endpoint. It presents plausible PCI config
- * space and a backplane/chipcommon window that reports a BCM4378 so that iOS
- * 14's AppleBCMWLANBusInterfacePCIe driver can probe, match and begin chip
- * recognition. The msgbuf / firmware-download / ring protocol is NOT
- * implemented yet (Phase 2). Every unhandled access is logged so the exact
- * host access pattern can be observed and implemented incrementally.
+ * space plus the chip-recognition / backplane access layer -- the four
+ * remappable BAR0 window registers in config space, the eight 4 KiB BAR0
+ * windows they steer, and enough of ChipCommon, the GCI core, the PCIe2 core
+ * and the AI wrappers for iOS 14's AppleBCMWLANBusInterfacePCIe driver to
+ * probe, match and get through checkHardware()/prepareHardware(). The msgbuf /
+ * firmware-download / ring protocol is NOT implemented yet (Phase 2). Every
+ * unhandled access is logged so the exact host access pattern can be observed
+ * and implemented incrementally.
  */
 
 #include "qemu/osdep.h"
@@ -83,52 +86,119 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMWLANState, APPLE_BCM_WLAN)
 #define APPLE_BCM_WLAN_DEVICE_BAR2_SIZE (8 * MiB)
 
 /*
- * SiliconBackplane / ChipCommon.
+ * Broadcom-proprietary PCI config registers.
  *
- * The host slides a window over the backplane by writing the target backplane
- * base into BAR0_WINDOW (0x80). It then accesses the selected core through the
- * low part of BAR0. ChipCommon on AXI-backplane BCM43xx parts enumerates at
- * 0x18000000; its first register (offset 0) is CHIPID.
+ * BAR0 is carved into eight 4 KiB windows (kBCOM4378ChipBackplaneWindows); four
+ * of them are *remappable*, i.e. the host picks which backplane address the
+ * window points at by writing that address into one of these config registers.
+ * AppleBCMWLANChipBackplane::validateWindow() writes a base and then reads the
+ * very same config register back, requiring an exact match, so these must
+ * behave as plain 32-bit read/write scratch storage.
+ *
+ * 0x88 is the SPROM/backplane control register. Bit 6 is a backplane-access
+ * enable that the driver sets before touching BAR0 and clears again on
+ * detach; we accept and store it but do not gate accesses on it, because
+ * nothing in the model needs the gate and mis-modelling the exact sequencing
+ * would only be a source of spurious failures.
+ */
+#define BCM_PCI_CFG_BAR0_WINDOW1 0x70 // remappable wrapper window, BAR0 0x1000
+#define BCM_PCI_CFG_BAR0_WINDOW4 0x74 // remappable core window, BAR0 0x4000
+#define BCM_PCI_CFG_BAR0_WINDOW5 0x78 // remappable wrapper window, BAR0 0x5000
+#define BCM_PCI_CFG_BAR0_WINDOW0 0x80 // remappable core window, BAR0 0x0000
+#define BCM_PCI_CFG_SPROM_CONTROL 0x88 // bit 6 == backplane access enable
+
+/*
+ * SiliconBackplane layout, transcribed from the driver's hardcoded per-chip
+ * tables (kBCOM4378ChipCores @0xfffffff00730d090 and kBCOM4378ChipWrappers
+ * @0xfffffff00730d0fc). Apple's driver does NOT walk the EROM, so only the
+ * addresses in those tables are ever generated.
+ *
+ * Cores (all 4 KiB): id0 ChipCommon 0x18000000, id1 D11 MAC 0x18031000,
+ * id2 ARM 0x18030000, id3 PCIe2 0x18001000, id6 GCI 0x18010000,
+ * id7 PMU 0x18012000. Wrappers (all 4 KiB, AI register layout) live in
+ * 0x18100000-0x1813FFFF: id0 CommonMaster 0x18100000, id2 ARMMaster
+ * 0x18130000 (the one used to reset the ARM core), id3 PCIeMaster 0x18101000.
+ */
+#define BCM_BACKPLANE_CHIPCOMMON_BASE 0x18000000ULL // ChipCoreID 0
+#define BCM_BACKPLANE_PCIE2_BASE 0x18001000ULL // ChipCoreID 3
+#define BCM_BACKPLANE_GCI_BASE 0x18010000ULL // ChipCoreID 6
+#define BCM_BACKPLANE_CORE_SIZE 0x1000ULL
+/* Every AI wrapper shares one register layout, so one handler serves them all. */
+#define BCM_BACKPLANE_WRAPPER_BASE 0x18100000ULL
+#define BCM_BACKPLANE_WRAPPER_END 0x18140000ULL
+#define BCM_BACKPLANE_NUM_WRAPPERS \
+    ((BCM_BACKPLANE_WRAPPER_END - BCM_BACKPLANE_WRAPPER_BASE) / 0x1000)
+
+/*
+ * ChipCommon registers.
  *
  * CHIPID encoding (bcma/ChipCommon):
  *   [15:0]  chip id       -> 0x4378
- *   [19:16] chip rev      -> 0x3   (plausible BCM4378 A0-ish rev; TODO verify)
+ *   [19:16] chip rev      -> 0x3
  *   [23:20] package       -> 0x0
- *   [27:24] num cores     -> 0x0   (not used for recognition here)
- *   [31:28] SoC interconnect type
+ *   [27:24] num cores / [31:28] SoC interconnect type
  *
- * TODO(phase-verify): confirm rev/package/socitype encoding the AppleBCMWLAN
- * chip-recognition path actually checks; the driver may read the EROM to count
- * cores, which this stub does not model yet.
+ * Note the chip is recognised purely from the *PCI* device id (0x4425 ->
+ * chipNumberFromDeviceID -> 0x111A); CHIPID is never actually read by
+ * AppleBCMWLAN, so the exact rev/package encoding does not matter.
  */
-#define BCM_BACKPLANE_CHIPCOMMON_BASE 0x18000000ULL
-#define BCM_CHIPCOMMON_CHIPID_OFFSET 0x0
+#define BCM_CHIPCOMMON_CHIPID 0x000
+#define BCM_CHIPCOMMON_CAPABILITIES 0x004
+#define BCM_CHIPCOMMON_GPIOOUT 0x064
+#define BCM_CHIPCOMMON_GPIOOUTEN 0x068
+#define BCM_CHIPCOMMON_GPIOCONTROL 0x06C
+#define BCM_CHIPCOMMON_GCI_INDIRECT_ADDR 0xC40
+#define BCM_CHIPCOMMON_GCI_CHIPCTRL 0xE00
+
 #define BCM4378_CHIP_ID 0x4378
 #define BCM4378_CHIP_REV 0x3
 #define BCM4378_CHIP_PACKAGE 0x0
-#define BCM4378_CHIPID_VALUE                                    \
+#define BCM4378_CHIPID_VALUE                                         \
     ((BCM4378_CHIP_ID & 0xFFFF) | ((BCM4378_CHIP_REV & 0xF) << 16) | \
      ((BCM4378_CHIP_PACKAGE & 0xF) << 20))
 
-/* BAR0 register offsets (brcmfmac PCIe core register names). */
-#define BCM_PCIE_REG_INTMASK 0x24 // BRCMF_PCIE_PCIE2REG_INTMASK
-#define BCM_PCIE_REG_MAILBOXINT 0x48 // BRCMF_PCIE_PCIE2REG_MAILBOXINT
-#define BCM_PCIE_REG_MAILBOXMASK 0x4C // BRCMF_PCIE_PCIE2REG_MAILBOXMASK
-#define BCM_PCIE_REG_CONFIGADDR 0x120
-#define BCM_PCIE_REG_CONFIGDATA 0x124
-#define BCM_PCIE_REG_H2D_MAILBOX_0 0x140 // BRCMF_PCIE_PCIE2REG_H2D_MAILBOX_0
-#define BCM_PCIE_REG_H2D_MAILBOX_1 0x144 // BRCMF_PCIE_PCIE2REG_H2D_MAILBOX_1
-#define BCM_PCIE_REG_D2H_MAILBOX_0 0x148
-#define BCM_PCIE_REG_D2H_MAILBOX_1 0x14C
-#define BCM_PCIE_BAR0_WINDOW 0x80 // BRCMF_PCIE_BAR0_WINDOW
-#define BCM_PCIE_BAR0_CORE2_WINDOW 0x70
+/*
+ * ChipCommon capabilities (offset 0x04), a.k.a. the SROM escape hatch.
+ *
+ * Bit 30 (CC_CAP_SROM) is the ONLY bit AppleBCMWLAN looks at, and we report it
+ * CLEAR on purpose: readChipProvisioningData() then bails out immediately with
+ * "Chip does not support SPROM" instead of running the SROM/OTP read sequence
+ * (ChipCommon 0x190/0x194/0x198, 0x400 words) and parsing the result as
+ * Broadcom CIS tuples with a valid checksum, SROM version 0x10 and a signature
+ * word -- none of which we model. The traced call site treats the failure as
+ * non-fatal (it only picks between two constants).
+ */
+#define BCM_CHIPCOMMON_CAP_SROM (1U << 30)
+#define BCM_CHIPCOMMON_CAPABILITIES_VALUE (0x00000000U & ~BCM_CHIPCOMMON_CAP_SROM)
 
 /*
- * Everything below the first control register is treated as the sliding
- * backplane window: after the host programs BAR0_WINDOW, reads in [0, 0x48)
- * are serviced as backplane[window_base + offset].
+ * PCIe2 core registers (ChipCoreID 3). Apple's mailbox registers are at
+ * 0xC30/0xC34, not at brcmfmac's 0x48/0x4C.
  */
-#define BCM_PCIE_BAR0_WINDOW_REGION_END 0x48
+#define BCM_PCIE2_CONFIGADDR 0x120
+#define BCM_PCIE2_CONFIGDATA 0x124
+#define BCM_PCIE2_H2D_DOORBELL_0 0x140
+#define BCM_PCIE2_H2D_MAILBOX_DATA 0x144
+#define BCM_PCIE2_POWER_CONTROL 0x1E8 // written by forcePowerLite()
+#define BCM_PCIE2_MAILBOXINT 0xC30 // device -> host status, write-1-to-clear
+#define BCM_PCIE2_MAILBOXMASK 0xC34
+
+/* GCI core registers (ChipCoreID 6). */
+#define BCM_GCI_INDEX 0x040
+#define BCM_GCI_STATUS 0x204 // bit 6 must read 0, see checkHardware()
+#define BCM_GCI_STATUS_FAIL (1U << 6)
+#define BCM_GCI_STATUS_VALUE (0x00000000U & ~BCM_GCI_STATUS_FAIL)
+#define BCM_GCI_CHIPCTRL 0xE64
+
+/* AI (wrapper) registers, identical for every wrapper. */
+#define BCM_AI_IOCTRL 0x408
+#define BCM_AI_RESETCTRL 0x800
+#define BCM_AI_RESETSTATUS 0x804
+
+/* One BAR0 window == one 4 KiB backplane aperture. */
+#define APPLE_BCM_WLAN_WINDOW_SIZE 0x1000
+#define APPLE_BCM_WLAN_NUM_WINDOWS \
+    (APPLE_BCM_WLAN_DEVICE_BAR0_SIZE / APPLE_BCM_WLAN_WINDOW_SIZE)
 
 struct AppleBCMWLANDeviceState {
     PCIDevice parent_obj;
@@ -142,20 +212,32 @@ struct AppleBCMWLANDeviceState {
     MemoryRegion *dma_mr;
     AddressSpace *dma_as;
 
-    /* Host-programmed sliding backplane window base (BAR0_WINDOW @ 0x80). */
-    uint32_t backplane_window;
-    uint32_t backplane_window2; // BAR0_CORE2_WINDOW @ 0x70
+    /*
+     * ChipCommon shadow registers. The remaining ChipCommon space is left
+     * unimplemented on purpose so `-d unimp` keeps reporting what the driver
+     * touches next.
+     */
+    uint32_t cc_gpioout;
+    uint32_t cc_gpioouten;
+    uint32_t cc_gpiocontrol;
+    uint32_t cc_gci_indirect_addr;
+    uint32_t cc_gci_chipctrl;
 
-    /* Mailbox / interrupt shadow registers (Phase-1 no-ops). */
-    uint32_t intmask;
-    uint32_t intstatus;
-    uint32_t mailboxint;
-    uint32_t mailboxmask;
-    uint32_t h2d_mailbox_0;
-    uint32_t h2d_mailbox_1;
-    uint32_t d2h_mailbox_0;
-    uint32_t d2h_mailbox_1;
-    uint32_t configaddr;
+    /* GCI core shadow registers. */
+    uint32_t gci_index;
+    uint32_t gci_chipctrl;
+
+    /* PCIe2 core shadow registers. */
+    uint32_t pcie_configaddr;
+    uint32_t pcie_h2d_doorbell_0;
+    uint32_t pcie_h2d_mailbox_data;
+    uint32_t pcie_power_control;
+    uint32_t pcie_mailboxint;
+    uint32_t pcie_mailboxmask;
+
+    /* Per-wrapper AI registers, indexed by (backplane_addr >> 12) & 0x3F. */
+    uint32_t wrapper_ioctrl[BCM_BACKPLANE_NUM_WRAPPERS];
+    uint32_t wrapper_resetctrl[BCM_BACKPLANE_NUM_WRAPPERS];
 };
 
 struct AppleBCMWLANState {
@@ -213,83 +295,323 @@ static G_GNUC_UNUSED bool apple_bcm_wlan_dma_write(AppleBCMWLANDeviceState *s,
 }
 
 /*
- * Resolve a read that falls inside the currently-selected backplane window.
- * Returns true and fills *out if it is a register we model (currently only
- * ChipCommon CHIPID); otherwise returns false so the caller logs it.
+ * PCI config-space access to the Broadcom-proprietary registers.
+ *
+ * The window registers and the SPROM control register are made writable in
+ * realize() by opening up their wmask, so pci_default_{read,write}_config()
+ * already implements them as exact-read-back 32-bit scratch storage at any
+ * access width. These overrides exist only to trace them; every other offset
+ * (PM @0x40, MSI @0x50, Express @0xD0, AER @0x100, the BARs, ...) is left
+ * entirely to the parent implementation.
  */
-static bool apple_bcm_wlan_backplane_read(AppleBCMWLANDeviceState *s,
-                                          hwaddr addr, uint64_t *out)
+static bool apple_bcm_wlan_cfg_is_broadcom_reg(uint32_t addr, int len)
 {
-    uint64_t backplane_addr = (uint64_t)s->backplane_window + addr;
+    static const uint32_t regs[] = {
+        BCM_PCI_CFG_BAR0_WINDOW1, BCM_PCI_CFG_BAR0_WINDOW4,
+        BCM_PCI_CFG_BAR0_WINDOW5, BCM_PCI_CFG_BAR0_WINDOW0,
+        BCM_PCI_CFG_SPROM_CONTROL,
+    };
+    size_t i;
 
-    if (backplane_addr ==
-        (BCM_BACKPLANE_CHIPCOMMON_BASE + BCM_CHIPCOMMON_CHIPID_OFFSET)) {
-        *out = BCM4378_CHIPID_VALUE;
+    for (i = 0; i < ARRAY_SIZE(regs); i++) {
+        if (addr < regs[i] + 4 && regs[i] < addr + len) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint32_t apple_bcm_wlan_device_config_read(PCIDevice *dev,
+                                                  uint32_t addr, int len)
+{
+    uint32_t val;
+
+    val = pci_default_read_config(dev, addr, len);
+
+    if (apple_bcm_wlan_cfg_is_broadcom_reg(addr, len)) {
         qemu_log_mask(LOG_UNIMP,
-                      "%s: backplane ChipCommon CHIPID read -> 0x%08x "
-                      "(window_base=0x%08x off=0x" HWADDR_FMT_plx ")\n",
-                      __func__, BCM4378_CHIPID_VALUE, s->backplane_window, addr);
-        return true;
+                      "%s: CFG READ @ 0x%02x value: 0x%x len %d\n", __func__,
+                      addr, val, len);
     }
 
-    return false;
+    return val;
+}
+
+static void apple_bcm_wlan_device_config_write(PCIDevice *dev, uint32_t addr,
+                                               uint32_t val, int len)
+{
+    if (apple_bcm_wlan_cfg_is_broadcom_reg(addr, len)) {
+        qemu_log_mask(LOG_UNIMP,
+                      "%s: CFG WRITE @ 0x%02x value: 0x%x len %d\n", __func__,
+                      addr, val, len);
+    }
+
+    pci_default_write_config(dev, addr, val, len);
+}
+
+/*
+ * BAR0 window table (kBCOM4378ChipBackplaneWindows @0xfffffff00730d21c).
+ *
+ * Eight 4 KiB apertures; an access at BAR0 offset `index * 0x1000 + off` is
+ * dispatched to backplane address `base + off`. Four windows take their base
+ * from a config register (remappable), four are pinned to a fixed core. The
+ * last two entries are never used by the driver but are modelled the same way
+ * the table describes them.
+ */
+typedef struct AppleBCMWLANBackplaneWindow {
+    const char *name;
+    uint8_t cfg_reg; // config register steering the window, 0 when fixed
+    uint64_t fixed_base; // backplane base when cfg_reg == 0
+} AppleBCMWLANBackplaneWindow;
+
+static const AppleBCMWLANBackplaneWindow
+    apple_bcm_wlan_backplane_windows[APPLE_BCM_WLAN_NUM_WINDOWS] = {
+        { "core@cfg0x80", BCM_PCI_CFG_BAR0_WINDOW0, 0 },
+        { "wrapper@cfg0x70", BCM_PCI_CFG_BAR0_WINDOW1, 0 },
+        { "pcie2", 0, BCM_BACKPLANE_PCIE2_BASE },
+        { "chipcommon", 0, BCM_BACKPLANE_CHIPCOMMON_BASE },
+        { "core@cfg0x74", BCM_PCI_CFG_BAR0_WINDOW4, 0 },
+        { "wrapper@cfg0x78", BCM_PCI_CFG_BAR0_WINDOW5, 0 },
+        { "pcie2(unused)", 0, BCM_BACKPLANE_PCIE2_BASE },
+        { "chipcommon(unused)", 0, BCM_BACKPLANE_CHIPCOMMON_BASE },
+    };
+
+static uint64_t apple_bcm_wlan_window_base(AppleBCMWLANDeviceState *s,
+                                           unsigned index)
+{
+    const AppleBCMWLANBackplaneWindow *win =
+        &apple_bcm_wlan_backplane_windows[index];
+
+    if (win->cfg_reg == 0) {
+        return win->fixed_base;
+    }
+    return pci_get_long(PCI_DEVICE(s)->config + win->cfg_reg);
+}
+
+/*
+ * Backplane register reads.
+ *
+ * CRITICAL: never return 0xFFFFFFFF. AppleBCMWLANChipBackplane::readRegister32
+ * treats an all-ones result as a dead chip, returns 0xE3FF830A and its
+ * forcePowerLite() caller turns that into a kernel panic. Unimplemented
+ * registers therefore read as 0.
+ */
+static uint32_t apple_bcm_wlan_backplane_read(AppleBCMWLANDeviceState *s,
+                                              uint64_t addr)
+{
+    uint64_t off;
+
+    if (addr - BCM_BACKPLANE_CHIPCOMMON_BASE < BCM_BACKPLANE_CORE_SIZE) {
+        off = addr - BCM_BACKPLANE_CHIPCOMMON_BASE;
+        switch (off) {
+        case BCM_CHIPCOMMON_CHIPID:
+            return BCM4378_CHIPID_VALUE;
+        case BCM_CHIPCOMMON_CAPABILITIES:
+            /* SROM escape hatch, see BCM_CHIPCOMMON_CAPABILITIES_VALUE. */
+            return BCM_CHIPCOMMON_CAPABILITIES_VALUE;
+        case BCM_CHIPCOMMON_GPIOOUT:
+            return s->cc_gpioout;
+        case BCM_CHIPCOMMON_GPIOOUTEN:
+            return s->cc_gpioouten;
+        case BCM_CHIPCOMMON_GPIOCONTROL:
+            return s->cc_gpiocontrol;
+        case BCM_CHIPCOMMON_GCI_INDIRECT_ADDR:
+            return s->cc_gci_indirect_addr;
+        case BCM_CHIPCOMMON_GCI_CHIPCTRL:
+            return s->cc_gci_chipctrl;
+        default:
+            break;
+        }
+    } else if (addr - BCM_BACKPLANE_PCIE2_BASE < BCM_BACKPLANE_CORE_SIZE) {
+        off = addr - BCM_BACKPLANE_PCIE2_BASE;
+        switch (off) {
+        case BCM_PCIE2_CONFIGADDR:
+            return s->pcie_configaddr;
+        case BCM_PCIE2_CONFIGDATA:
+            /*
+             * Indirect access to the PCIe core's own config space is not
+             * modelled. Read as 0 rather than echoing back what was written:
+             * the bring-up sequence writes 0xFFFFFFFF here (to clear sticky
+             * error bits) and reading that value back would be fatal.
+             */
+            return 0;
+        case BCM_PCIE2_H2D_DOORBELL_0:
+            return s->pcie_h2d_doorbell_0;
+        case BCM_PCIE2_H2D_MAILBOX_DATA:
+            return s->pcie_h2d_mailbox_data;
+        case BCM_PCIE2_POWER_CONTROL:
+            return s->pcie_power_control;
+        case BCM_PCIE2_MAILBOXINT:
+            return s->pcie_mailboxint;
+        case BCM_PCIE2_MAILBOXMASK:
+            return s->pcie_mailboxmask;
+        default:
+            break;
+        }
+    } else if (addr - BCM_BACKPLANE_GCI_BASE < BCM_BACKPLANE_CORE_SIZE) {
+        off = addr - BCM_BACKPLANE_GCI_BASE;
+        switch (off) {
+        case BCM_GCI_INDEX:
+            /* checkHardware() writes 4 here and requires 4 back. */
+            return s->gci_index;
+        case BCM_GCI_STATUS:
+            /* Bit 6 set == "GCI not ready"; checkHardware() fails 0xE00002CA. */
+            return BCM_GCI_STATUS_VALUE;
+        case BCM_GCI_CHIPCTRL:
+            return s->gci_chipctrl;
+        default:
+            break;
+        }
+    } else if (addr >= BCM_BACKPLANE_WRAPPER_BASE &&
+               addr < BCM_BACKPLANE_WRAPPER_END) {
+        unsigned index = (addr - BCM_BACKPLANE_WRAPPER_BASE) / 0x1000;
+
+        off = addr & 0xFFF;
+        switch (off) {
+        case BCM_AI_IOCTRL:
+            return s->wrapper_ioctrl[index];
+        case BCM_AI_RESETCTRL:
+            return s->wrapper_resetctrl[index];
+        case BCM_AI_RESETSTATUS:
+            /*
+             * loadChipImage() asserts reset (RESETCTRL bit0 = 1) and then
+             * polls RESETSTATUS for bit0 to go clear within a second. There is
+             * no core behind the wrapper to actually reset, so report the
+             * reset as always already complete; a real chip completes this in
+             * microseconds anyway.
+             */
+            return 0;
+        default:
+            break;
+        }
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "%s: UNIMP backplane READ @ 0x%" PRIx64 " -> 0\n", __func__,
+                  addr);
+    return 0;
+}
+
+static void apple_bcm_wlan_backplane_write(AppleBCMWLANDeviceState *s,
+                                           uint64_t addr, uint32_t data)
+{
+    uint64_t off;
+
+    if (addr - BCM_BACKPLANE_CHIPCOMMON_BASE < BCM_BACKPLANE_CORE_SIZE) {
+        off = addr - BCM_BACKPLANE_CHIPCOMMON_BASE;
+        switch (off) {
+        case BCM_CHIPCOMMON_GPIOOUT:
+            s->cc_gpioout = data;
+            return;
+        case BCM_CHIPCOMMON_GPIOOUTEN:
+            s->cc_gpioouten = data;
+            return;
+        case BCM_CHIPCOMMON_GPIOCONTROL:
+            s->cc_gpiocontrol = data;
+            return;
+        case BCM_CHIPCOMMON_GCI_INDIRECT_ADDR:
+            s->cc_gci_indirect_addr = data;
+            return;
+        case BCM_CHIPCOMMON_GCI_CHIPCTRL:
+            s->cc_gci_chipctrl = data;
+            return;
+        default:
+            break;
+        }
+    } else if (addr - BCM_BACKPLANE_PCIE2_BASE < BCM_BACKPLANE_CORE_SIZE) {
+        off = addr - BCM_BACKPLANE_PCIE2_BASE;
+        switch (off) {
+        case BCM_PCIE2_CONFIGADDR:
+            s->pcie_configaddr = data;
+            return;
+        case BCM_PCIE2_CONFIGDATA:
+            /* Swallowed; see the read side. */
+            return;
+        case BCM_PCIE2_H2D_DOORBELL_0:
+            /*
+             * Host -> device doorbell. The written value is a microsecond
+             * timestamp, not a command, so it carries no information: any
+             * write means "the host queued work on the msgbuf rings". Phase 2
+             * will consume the rings from here.
+             */
+            s->pcie_h2d_doorbell_0 = data;
+            qemu_log_mask(LOG_UNIMP,
+                          "%s: H2D doorbell 0 rung (value 0x%x ignored)\n",
+                          __func__, data);
+            return;
+        case BCM_PCIE2_H2D_MAILBOX_DATA:
+            s->pcie_h2d_mailbox_data = data;
+            return;
+        case BCM_PCIE2_POWER_CONTROL:
+            s->pcie_power_control = data;
+            return;
+        case BCM_PCIE2_MAILBOXINT:
+            /*
+             * Device -> host status, write-1-to-clear. The bits must stay
+             * asserted until the host acknowledges them, which is exactly what
+             * the driver's ISR does: v = read(INT); write(INT, v).
+             */
+            s->pcie_mailboxint &= ~data;
+            return;
+        case BCM_PCIE2_MAILBOXMASK:
+            s->pcie_mailboxmask = data;
+            return;
+        default:
+            break;
+        }
+    } else if (addr - BCM_BACKPLANE_GCI_BASE < BCM_BACKPLANE_CORE_SIZE) {
+        off = addr - BCM_BACKPLANE_GCI_BASE;
+        switch (off) {
+        case BCM_GCI_INDEX:
+            s->gci_index = data;
+            return;
+        case BCM_GCI_CHIPCTRL:
+            /* prepareHardware() does a (v & ~3) | 1 read-modify-write. */
+            s->gci_chipctrl = data;
+            return;
+        default:
+            break;
+        }
+    } else if (addr >= BCM_BACKPLANE_WRAPPER_BASE &&
+               addr < BCM_BACKPLANE_WRAPPER_END) {
+        unsigned index = (addr - BCM_BACKPLANE_WRAPPER_BASE) / 0x1000;
+
+        off = addr & 0xFFF;
+        switch (off) {
+        case BCM_AI_IOCTRL:
+            /* loadChipImage() writes 0x23 and requires 0x23 back. */
+            s->wrapper_ioctrl[index] = data;
+            return;
+        case BCM_AI_RESETCTRL:
+            s->wrapper_resetctrl[index] = data;
+            return;
+        default:
+            break;
+        }
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "%s: UNIMP backplane WRITE @ 0x%" PRIx64 " value 0x%x\n",
+                  __func__, addr, data);
 }
 
 static uint64_t apple_bcm_wlan_device_bar0_read(void *opaque, hwaddr addr,
                                                 unsigned size)
 {
     AppleBCMWLANDeviceState *s = opaque;
-    uint64_t val = 0;
+    unsigned index = addr / APPLE_BCM_WLAN_WINDOW_SIZE;
+    uint64_t backplane_addr =
+        apple_bcm_wlan_window_base(s, index) + (addr % APPLE_BCM_WLAN_WINDOW_SIZE);
+    uint32_t val;
 
-    switch (addr) {
-    case BCM_PCIE_REG_INTMASK:
-        val = s->intmask;
-        break;
-    case BCM_PCIE_REG_MAILBOXINT:
-        val = s->mailboxint;
-        break;
-    case BCM_PCIE_REG_MAILBOXMASK:
-        val = s->mailboxmask;
-        break;
-    case BCM_PCIE_BAR0_CORE2_WINDOW:
-        val = s->backplane_window2;
-        break;
-    case BCM_PCIE_BAR0_WINDOW:
-        val = s->backplane_window;
-        break;
-    case BCM_PCIE_REG_CONFIGADDR:
-        val = s->configaddr;
-        break;
-    case BCM_PCIE_REG_H2D_MAILBOX_0:
-        val = s->h2d_mailbox_0;
-        break;
-    case BCM_PCIE_REG_H2D_MAILBOX_1:
-        val = s->h2d_mailbox_1;
-        break;
-    case BCM_PCIE_REG_D2H_MAILBOX_0:
-        val = s->d2h_mailbox_0;
-        break;
-    case BCM_PCIE_REG_D2H_MAILBOX_1:
-        val = s->d2h_mailbox_1;
-        break;
-    default:
-        /* Anything in the low region is the sliding backplane window. */
-        if (addr < BCM_PCIE_BAR0_WINDOW_REGION_END &&
-            apple_bcm_wlan_backplane_read(s, addr, &val)) {
-            break;
-        }
-        qemu_log_mask(LOG_UNIMP,
-                      "%s: UNIMP READ @ 0x" HWADDR_FMT_plx
-                      " size %u (window_base=0x%08x, in_window=%d)\n",
-                      __func__, addr, size, s->backplane_window,
-                      addr < BCM_PCIE_BAR0_WINDOW_REGION_END);
-        break;
-    }
+    val = apple_bcm_wlan_backplane_read(s, backplane_addr);
 
     qemu_log_mask(LOG_UNIMP,
-                  "%s: READ @ 0x" HWADDR_FMT_plx " value: 0x%" PRIx64
-                  " size %u\n",
-                  __func__, addr, val, size);
+                  "%s: READ @ 0x" HWADDR_FMT_plx " (window %u %s, backplane "
+                  "0x%" PRIx64 ") value: 0x%x size %u\n",
+                  __func__, addr, index,
+                  apple_bcm_wlan_backplane_windows[index].name, backplane_addr,
+                  val, size);
     return val;
 }
 
@@ -297,48 +619,18 @@ static void apple_bcm_wlan_device_bar0_write(void *opaque, hwaddr addr,
                                              uint64_t data, unsigned size)
 {
     AppleBCMWLANDeviceState *s = opaque;
+    unsigned index = addr / APPLE_BCM_WLAN_WINDOW_SIZE;
+    uint64_t backplane_addr =
+        apple_bcm_wlan_window_base(s, index) + (addr % APPLE_BCM_WLAN_WINDOW_SIZE);
 
     qemu_log_mask(LOG_UNIMP,
-                  "%s: WRITE @ 0x" HWADDR_FMT_plx " value: 0x%" PRIx64
-                  " size %u\n",
-                  __func__, addr, data, size);
+                  "%s: WRITE @ 0x" HWADDR_FMT_plx " (window %u %s, backplane "
+                  "0x%" PRIx64 ") value: 0x%" PRIx64 " size %u\n",
+                  __func__, addr, index,
+                  apple_bcm_wlan_backplane_windows[index].name, backplane_addr,
+                  data, size);
 
-    switch (addr) {
-    case BCM_PCIE_BAR0_WINDOW:
-        s->backplane_window = (uint32_t)data;
-        qemu_log_mask(LOG_UNIMP, "%s: BAR0_WINDOW slid to 0x%08x\n", __func__,
-                      s->backplane_window);
-        break;
-    case BCM_PCIE_BAR0_CORE2_WINDOW:
-        s->backplane_window2 = (uint32_t)data;
-        break;
-    case BCM_PCIE_REG_INTMASK:
-        s->intmask = (uint32_t)data;
-        break;
-    case BCM_PCIE_REG_MAILBOXINT:
-        /* Write-1-to-clear on real HW; Phase 1 just records the value. */
-        s->mailboxint = (uint32_t)data;
-        break;
-    case BCM_PCIE_REG_MAILBOXMASK:
-        s->mailboxmask = (uint32_t)data;
-        break;
-    case BCM_PCIE_REG_CONFIGADDR:
-        s->configaddr = (uint32_t)data;
-        break;
-    case BCM_PCIE_REG_H2D_MAILBOX_0:
-        /* Host doorbell -> device. Phase 2 will consume the msgbuf rings. */
-        s->h2d_mailbox_0 = (uint32_t)data;
-        break;
-    case BCM_PCIE_REG_H2D_MAILBOX_1:
-        s->h2d_mailbox_1 = (uint32_t)data;
-        break;
-    default:
-        qemu_log_mask(LOG_UNIMP,
-                      "%s: UNIMP WRITE @ 0x" HWADDR_FMT_plx " value 0x%" PRIx64
-                      " (window_base=0x%08x)\n",
-                      __func__, addr, data, s->backplane_window);
-        break;
-    }
+    apple_bcm_wlan_backplane_write(s, backplane_addr, (uint32_t)data);
 }
 
 static const MemoryRegionOps bar0_ops = {
@@ -421,6 +713,20 @@ static void apple_bcm_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
      */
     pcie_aer_init(dev, 1, 0x100, PCI_ERR_SIZEOF, &error_fatal);
 
+    /*
+     * Open up the Broadcom-proprietary config registers so they behave as
+     * plain 32-bit read/write scratch storage: pci_default_write_config()
+     * only lets a byte through where wmask is set, and validateWindow()
+     * requires the window base it just wrote to read back unchanged. Done
+     * after the capabilities are installed so it cannot silently make a
+     * capability register writable if one ever moves on top of them.
+     */
+    pci_set_long(dev->wmask + BCM_PCI_CFG_BAR0_WINDOW1, 0xFFFFFFFF);
+    pci_set_long(dev->wmask + BCM_PCI_CFG_BAR0_WINDOW4, 0xFFFFFFFF);
+    pci_set_long(dev->wmask + BCM_PCI_CFG_BAR0_WINDOW5, 0xFFFFFFFF);
+    pci_set_long(dev->wmask + BCM_PCI_CFG_BAR0_WINDOW0, 0xFFFFFFFF);
+    pci_set_long(dev->wmask + BCM_PCI_CFG_SPROM_CONTROL, 0xFFFFFFFF);
+
     /* T8030 combo chip links at 5GT; mirror the baseband link-cap fill. */
     if (s->port->maximum_link_speed == 2) {
         pcie_cap_fill_link_ep_usp(dev, QEMU_PCI_EXP_LNK_X1,
@@ -464,17 +770,31 @@ static void apple_bcm_wlan_device_qdev_reset_hold(Object *obj, ResetType type)
     pci_set_word(dev->config + PCI_COMMAND,
                  PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
 
-    s->backplane_window = 0;
-    s->backplane_window2 = 0;
-    s->intmask = 0;
-    s->intstatus = 0;
-    s->mailboxint = 0;
-    s->mailboxmask = 0;
-    s->h2d_mailbox_0 = 0;
-    s->h2d_mailbox_1 = 0;
-    s->d2h_mailbox_0 = 0;
-    s->d2h_mailbox_1 = 0;
-    s->configaddr = 0;
+    /* Backplane window / SPROM control registers live in config space. */
+    pci_set_long(dev->config + BCM_PCI_CFG_BAR0_WINDOW1, 0);
+    pci_set_long(dev->config + BCM_PCI_CFG_BAR0_WINDOW4, 0);
+    pci_set_long(dev->config + BCM_PCI_CFG_BAR0_WINDOW5, 0);
+    pci_set_long(dev->config + BCM_PCI_CFG_BAR0_WINDOW0, 0);
+    pci_set_long(dev->config + BCM_PCI_CFG_SPROM_CONTROL, 0);
+
+    s->cc_gpioout = 0;
+    s->cc_gpioouten = 0;
+    s->cc_gpiocontrol = 0;
+    s->cc_gci_indirect_addr = 0;
+    s->cc_gci_chipctrl = 0;
+
+    s->gci_index = 0;
+    s->gci_chipctrl = 0;
+
+    s->pcie_configaddr = 0;
+    s->pcie_h2d_doorbell_0 = 0;
+    s->pcie_h2d_mailbox_data = 0;
+    s->pcie_power_control = 0;
+    s->pcie_mailboxint = 0;
+    s->pcie_mailboxmask = 0;
+
+    memset(s->wrapper_ioctrl, 0, sizeof(s->wrapper_ioctrl));
+    memset(s->wrapper_resetctrl, 0, sizeof(s->wrapper_resetctrl));
 }
 
 static void apple_bcm_wlan_device_pci_uninit(PCIDevice *dev)
@@ -493,6 +813,8 @@ static void apple_bcm_wlan_device_class_init(ObjectClass *class,
 
     c->realize = apple_bcm_wlan_device_pci_realize;
     c->exit = apple_bcm_wlan_device_pci_uninit;
+    c->config_read = apple_bcm_wlan_device_config_read;
+    c->config_write = apple_bcm_wlan_device_config_write;
     c->vendor_id = APPLE_BCM_WLAN_PCI_VENDOR_ID;
     c->device_id = APPLE_BCM_WLAN_PCI_DEVICE_ID;
     c->revision = APPLE_BCM_WLAN_PCI_REVISION;

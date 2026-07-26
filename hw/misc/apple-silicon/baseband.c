@@ -935,8 +935,28 @@ static SMCResult smc_key_gP11_read(SMCKey *key, SMCKeyData *data,
             key->info.size, length);
     DPRINTF("%s: value: 0x%08x ; length: 0x%08x\n", __func__, value, length);
 
+    /*
+     * gP11 is the AMFM (Wi-Fi / bluetooth-pcie bridge) PMU function key. It
+     * speaks the same AppleSMCPMU command protocol as gP09 (the baseband's
+     * key), so accept the same generic commands. Answering these instead of
+     * failing every one matters: AppleBCMWLANPortInterfacePCIeAMFM's port
+     * control polls this key, and an error reply leaves it spinning until it
+     * times out.
+     */
     switch (value) {
-    // gP11 is actually for amfm (wifi/bluetooth-pcie bridge)
+    case 0x02000000: {
+        // function-pmu_exton
+        DPRINTF("%s: pmu_exton\n", __func__);
+        return SMC_RESULT_SUCCESS;
+    }
+    case 0x06000000: {
+        // AppleSMCPMU::getVectorType; 0x0/0x1 mean "Level", anything else
+        // means "Edge" (mirrors gP09).
+        DPRINTF("%s: getVectorType\n", __func__);
+        tmpval0 = 0x2;
+        stl_le_p(data->data, tmpval0);
+        return SMC_RESULT_SUCCESS;
+    }
     default:
         DPRINTF("%s: UNKNOWN VALUE: 0x%08x\n", __func__, value);
         return SMC_RESULT_BAD_FUNC_PARAMETER;
@@ -965,8 +985,29 @@ static SMCResult smc_key_gP11_write(SMCKey *key, SMCKeyData *data,
 
     DPRINTF("%s: value: 0x%08x ; length: 0x%08x\n", __func__, value, length);
 
+    /*
+     * Same AppleSMCPMU command set as gP09, for the AMFM (Wi-Fi /
+     * bluetooth-pcie bridge) port. The port itself is brought up through the
+     * apcie registers, so these only have to be acknowledged.
+     */
     switch (value) {
-    // gP11 is actually for amfm (wifi/bluetooth-pcie bridge)
+    case 0x04000000: {
+        // disableVectorHard/IENA
+        DPRINTF("%s: disableVectorHard\n", __func__);
+        return SMC_RESULT_SUCCESS;
+    }
+    case 0x04000001: {
+        // enableVector/IENA
+        DPRINTF("%s: enableVector\n", __func__);
+        return SMC_RESULT_SUCCESS;
+    }
+    case 0x07000000:
+    case 0x07000001: {
+        // function-pmu_exton_config; bit0 selects the pull-down override.
+        DPRINTF("%s: pmuExtOnConfigGated/pmu_exton_config enable: %d\n",
+                __func__, (value & 1) != 0);
+        return SMC_RESULT_SUCCESS;
+    }
     default:
         DPRINTF("%s: UNKNOWN VALUE: 0x%08x\n", __func__, value);
         return SMC_RESULT_BAD_FUNC_PARAMETER;

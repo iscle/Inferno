@@ -1440,8 +1440,14 @@ static void t8030_create_wlan(AppleT8030MachineState *t8030)
     // AppleEmbeddedPCIEPortControlFunction path (apcie perst/clkreq/LTSSM,
     // already modeled and working for the baseband) instead of the
     // AppleMultiFunctionManager / SMC gP11 handshake we don't emulate.
-    fprintf(stderr, "[wlan] stripped amfm-managed-port-control from %d node(s)\n",
-            t8030_dt_strip_prop(t8030->device_tree, "amfm-managed-port-control"));
+    /*
+     * Keep "amfm-managed-port-control". It selects the AMFM variants of the
+     * driver's platform function and port interface, which get their
+     * "function-reg_on" and "function-pcie_port_control" from the amfm node.
+     * The non-AMFM variants look those up on the wlan node instead, which does
+     * not carry them, so stripping this makes deferredStart bail before it ever
+     * arms its PCIe attach notifier.
+     */
 
     ApplePCIEPort *port = APPLE_PCIE_PORT(
         object_property_get_link(OBJECT(t8030), "pcie.bridge2", &error_fatal));
