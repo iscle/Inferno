@@ -1484,19 +1484,35 @@ static int apple_bcm_wlan_cmd_country(AppleBCMWLANDeviceState *s,
 /*
  * The channels we claim to support: the 2.4 GHz band plus the usual
  * non-DFS 5 GHz channels. Reported as a wl_uint32_list_t -- a count followed
- * by that many 32-bit channel numbers.
+ * by that many 32-bit entries.
  */
-static const uint32_t apple_bcm_wlan_channels[] = {
-    1,  2,  3,  4,  5,   6,   7,   8,   9,   10,  11,
-    36, 40, 44, 48, 149, 153, 157, 161, 165,
-};
+static const uint8_t apple_bcm_wlan_channels_2g[] = { 1, 2, 3, 4,  5, 6,
+                                                      7, 8, 9, 10, 11 };
+static const uint8_t apple_bcm_wlan_channels_5g[] = { 36,  40,  44,  48, 149,
+                                                      153, 157, 161, 165 };
 
-static int apple_bcm_wlan_cmd_channels(AppleBCMWLANDeviceState *s,
-                                       const void *arg, const uint8_t *in,
-                                       uint16_t inlen, uint8_t *out,
-                                       uint16_t outmax, uint16_t *outlen)
+/*
+ * chanspec_t, the D11AC encoding used by every part from the 4350 onwards:
+ * the channel number in the low byte, the bandwidth and (for wide channels)
+ * the position of the control sub-band in the middle, and the band on top.
+ * A plain 20 MHz channel needs no sub-band.
+ */
+#define BCM_CHANSPEC_CHAN_MASK 0x00FF
+#define BCM_CHANSPEC_BW_20 0x1000
+#define BCM_CHANSPEC_BAND_2G 0x0000
+#define BCM_CHANSPEC_BAND_5G 0xC000
+
+#define BCM_CHANSPEC_2G(ch) (BCM_CHANSPEC_BAND_2G | BCM_CHANSPEC_BW_20 | (ch))
+#define BCM_CHANSPEC_5G(ch) (BCM_CHANSPEC_BAND_5G | BCM_CHANSPEC_BW_20 | (ch))
+
+/* The channel the fake access point beacons on. */
+#define APPLE_BCM_WLAN_AP_CHANNEL 6
+
+static int apple_bcm_wlan_cmd_u32_list(AppleBCMWLANDeviceState *s,
+                                       const uint32_t *list, size_t count,
+                                       uint8_t *out, uint16_t outmax,
+                                       uint16_t *outlen)
 {
-    size_t count = ARRAY_SIZE(apple_bcm_wlan_channels);
     size_t i;
 
     if (outmax < sizeof(uint32_t) * (count + 1)) {
@@ -1504,10 +1520,56 @@ static int apple_bcm_wlan_cmd_channels(AppleBCMWLANDeviceState *s,
     }
     stl_le_p(out, count);
     for (i = 0; i < count; i++) {
-        stl_le_p(out + sizeof(uint32_t) * (i + 1), apple_bcm_wlan_channels[i]);
+        stl_le_p(out + sizeof(uint32_t) * (i + 1), list[i]);
     }
     *outlen = sizeof(uint32_t) * (count + 1);
     return BCME_OK;
+}
+
+/* WLC_GET_VALID_CHANNELS: plain channel numbers. */
+static int apple_bcm_wlan_cmd_channels(AppleBCMWLANDeviceState *s,
+                                       const void *arg, const uint8_t *in,
+                                       uint16_t inlen, uint8_t *out,
+                                       uint16_t outmax, uint16_t *outlen)
+{
+    uint32_t list[ARRAY_SIZE(apple_bcm_wlan_channels_2g) +
+                  ARRAY_SIZE(apple_bcm_wlan_channels_5g)];
+    size_t n = 0, i;
+
+    for (i = 0; i < ARRAY_SIZE(apple_bcm_wlan_channels_2g); i++) {
+        list[n++] = apple_bcm_wlan_channels_2g[i];
+    }
+    for (i = 0; i < ARRAY_SIZE(apple_bcm_wlan_channels_5g); i++) {
+        list[n++] = apple_bcm_wlan_channels_5g[i];
+    }
+    return apple_bcm_wlan_cmd_u32_list(s, list, n, out, outmax, outlen);
+}
+
+/*
+ * GET_VAR "chanspecs": the same set, but as chanspecs.
+ *
+ * AppleBCMWLANCore::handleGetChanSpecs (@0xfffffff0094ded5c) reads the count
+ * at +0x00, clamps it to 110 and copies the LOW 16 BITS of each following u32
+ * into its own table at core+0x1c5e, with the count at core+0x1c5c. Without
+ * this the driver's channel table stays empty ("cannot get chanspecs"), which
+ * leaves it with nothing to scan.
+ */
+static int apple_bcm_wlan_cmd_chanspecs(AppleBCMWLANDeviceState *s,
+                                        const void *arg, const uint8_t *in,
+                                        uint16_t inlen, uint8_t *out,
+                                        uint16_t outmax, uint16_t *outlen)
+{
+    uint32_t list[ARRAY_SIZE(apple_bcm_wlan_channels_2g) +
+                  ARRAY_SIZE(apple_bcm_wlan_channels_5g)];
+    size_t n = 0, i;
+
+    for (i = 0; i < ARRAY_SIZE(apple_bcm_wlan_channels_2g); i++) {
+        list[n++] = BCM_CHANSPEC_2G(apple_bcm_wlan_channels_2g[i]);
+    }
+    for (i = 0; i < ARRAY_SIZE(apple_bcm_wlan_channels_5g); i++) {
+        list[n++] = BCM_CHANSPEC_5G(apple_bcm_wlan_channels_5g[i]);
+    }
+    return apple_bcm_wlan_cmd_u32_list(s, list, n, out, outmax, outlen);
 }
 
 /*
@@ -1564,6 +1626,7 @@ static const struct {
     { WLC_SET_REGULATORY, NULL, apple_bcm_wlan_cmd_ok },
     { WLC_SET_RADIO, NULL, apple_bcm_wlan_cmd_ok },
     { WLC_GET_VALID_CHANNELS, NULL, apple_bcm_wlan_cmd_channels },
+    { WLC_GET_VAR, "chanspecs", apple_bcm_wlan_cmd_chanspecs },
 };
 
 static int apple_bcm_wlan_ioctl(AppleBCMWLANDeviceState *s, uint8_t ifidx,
