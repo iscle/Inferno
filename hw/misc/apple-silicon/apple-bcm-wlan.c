@@ -184,6 +184,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMWLANState, APPLE_BCM_WLAN)
 #define BCM_PCIE2_MAILBOXINT 0xC30 // device -> host status, write-1-to-clear
 #define BCM_PCIE2_MAILBOXMASK 0xC34
 
+/*
+ * The only MAILBOXINT bit we may ever raise.
+ *
+ * AppleBCMWLANBusInterfacePCIe's ISR reads MAILBOXINT, writes the value straight
+ * back (write-1-to-clear) and then dispatches on it. It ignores everything
+ * outside 0x00010100, and the 0x100 ("D2H mailbox data") arm of that dispatch
+ * NULL-dereferences in this build, so 0x00010000 -- "the device wrote to a D2H
+ * ring" -- is the one bit that is both understood and safe.
+ */
+#define BCM_PCIE2_MAILBOXINT_D2H_DB0 0x00010000U
+
 /* GCI core registers (ChipCoreID 6). */
 #define BCM_GCI_INDEX 0x040
 #define BCM_GCI_STATUS 0x204 // bit 6 must read 0, see checkHardware()
@@ -336,9 +347,16 @@ static const uint8_t apple_bcm_wlan_otp_cis[] = {
  */
 #define BCM_SHARED_INFO_ADDR (BCM_MEM_FW_RAM_BASE + 0x1C0000)
 #define BCM_RING_INFO_ADDR (BCM_SHARED_INFO_ADDR + 0x80)
-#define BCM_RINGMEM_ADDR (BCM_SHARED_INFO_ADDR + 0x100)
-#define BCM_H2D_MB_DATA_ADDR (BCM_SHARED_INFO_ADDR + 0x300)
-#define BCM_D2H_MB_DATA_ADDR (BCM_SHARED_INFO_ADDR + 0x310)
+#define BCM_H2D_MB_DATA_ADDR (BCM_SHARED_INFO_ADDR + 0x100)
+#define BCM_D2H_MB_DATA_ADDR (BCM_SHARED_INFO_ADDR + 0x110)
+/*
+ * The ring-descriptor array. One 16-byte descriptor per ring, and the host
+ * fills in *every* ring it might ever create: the two common H2D rings, the
+ * three common D2H rings, and one per TX flow ring. With 40 flow rings that is
+ * 45 descriptors, so reserve a comfortable 4 KiB.
+ */
+#define BCM_RINGMEM_ADDR (BCM_SHARED_INFO_ADDR + 0x1000)
+#define BCM_RINGMEM_MAX_RINGS 128
 
 /*
  * pciedev_shared_t. Only four fields are ever READ by the driver; everything
@@ -389,8 +407,133 @@ static const uint8_t apple_bcm_wlan_otp_cis[] = {
 #define BCM_RING_INFO_MAX_TX_FLOWRINGS_OFF 0x34
 #define BCM_RING_INFO_MAX_SUBMISSION_QUEUES_OFF 0x36
 
-/* Five 16-byte ring descriptors; the host fills them in. */
-#define BCM_RINGMEM_SIZE 0x50
+/*
+ * ring_info_t continued: the four host DMA addresses of the ring-index arrays
+ * and the ring counts. The host writes 0x14..0x33; we only ever read them.
+ */
+#define BCM_RING_INFO_H2D_W_IDX_HOSTADDR_OFF 0x14
+#define BCM_RING_INFO_H2D_R_IDX_HOSTADDR_OFF 0x1C
+#define BCM_RING_INFO_D2H_W_IDX_HOSTADDR_OFF 0x24
+#define BCM_RING_INFO_D2H_R_IDX_HOSTADDR_OFF 0x2C
+#define BCM_RING_INFO_MAX_COMPLETION_RINGS_OFF 0x38
+
+/*
+ * ring_mem_t, one per ring, written by the host into the array at
+ * ring_info.ringmem_ptr. AppleBCMWLANBusInterfacePCIe::fillRingEndpointMemory
+ * (@0xfffffff0095cf208 for submission rings, @0xfffffff0095d1a24 for completion
+ * rings) writes exactly these fields.
+ */
+#define BCM_RINGMEM_ENTRY_SIZE 0x10
+#define BCM_RINGMEM_IDX_OFF 0x00 // u16, the ring's own id
+#define BCM_RINGMEM_TYPE_OFF 0x02 // u8
+#define BCM_RINGMEM_MAX_ITEM_OFF 0x04 // u16
+#define BCM_RINGMEM_LEN_ITEMS_OFF 0x06 // u16
+#define BCM_RINGMEM_BASE_ADDR_OFF 0x08 // u32 low, u32 high
+
+/*
+ * Ring types, from the ring objects' getRingType(). Standard msgbuf numbering:
+ * the two H2D common rings are the control submit ring and the RX-post ring,
+ * the three D2H common rings are the control/TX/RX completion rings, and TX
+ * flow rings get their own type.
+ */
+#define BCM_RING_TYPE_H2D_CTRL_SUBMIT 0
+#define BCM_RING_TYPE_D2H_CTRL_COMPLETE 1
+#define BCM_RING_TYPE_H2D_RXPOST_SUBMIT 2
+#define BCM_RING_TYPE_D2H_RX_COMPLETE 3
+#define BCM_RING_TYPE_D2H_TX_COMPLETE 4
+#define BCM_RING_TYPE_H2D_TXFLOW 5
+
+/*
+ * msgbuf message types, shared by both directions. Confirmed against
+ * AppleBCMWLANBusInterfacePCIe::fillControlSubmitRing (@0xfffffff0095cd6e0),
+ * which emits 0x1B/0x1C/0x23/0x25/0x26/0x29/0x2B/0x2C and the ioctl request,
+ * and ::drainControlCompleteRing (@0xfffffff0095cf70c), whose two jump tables
+ * cover 0x01..0x14 and 0x1D..0x2E.
+ */
+#define BCM_MSGBUF_TYPE_IOCTLPTR_REQ 0x09
+#define BCM_MSGBUF_TYPE_IOCTLPTR_REQ_ACK 0x0A
+#define BCM_MSGBUF_TYPE_IOCTLRESP_BUF_POST 0x0B
+#define BCM_MSGBUF_TYPE_IOCTL_CMPLT 0x0C
+#define BCM_MSGBUF_TYPE_EVENT_BUF_POST 0x0D
+#define BCM_MSGBUF_TYPE_WL_EVENT 0x0E
+#define BCM_MSGBUF_TYPE_H2D_RING_CREATE 0x1B
+#define BCM_MSGBUF_TYPE_D2H_RING_CREATE 0x1C
+#define BCM_MSGBUF_TYPE_H2D_RING_CREATE_CMPLT 0x1D
+#define BCM_MSGBUF_TYPE_D2H_RING_CREATE_CMPLT 0x1E
+
+/*
+ * Common message header, 8 bytes, at the front of every ring item:
+ *
+ *   0x00 u8  msgtype
+ *   0x01 u8  ifidx
+ *   0x02 u8  flags -- bit 7 is the ring's phase bit
+ *   0x03 u8  epoch
+ *   0x04 u32 request_id
+ *
+ * The phase bit alternates every time the producer wraps the ring, so the
+ * consumer can tell a fresh item from a stale one even before the index
+ * arrives. AppleBCMWLANPCIeCompletionRing::initWithOptions (@0xfffffff0095ebe88)
+ * starts a D2H ring's expected phase at 1 and ::requestRingDrain
+ * (@0xfffffff0095ec10c) flips it on every wrap, so our first message must carry
+ * bit 7 SET. A mismatch is only a logged fault, not a hard error.
+ */
+#define BCM_MSGBUF_HDR_MSGTYPE_OFF 0x00
+#define BCM_MSGBUF_HDR_IFIDX_OFF 0x01
+#define BCM_MSGBUF_HDR_FLAGS_OFF 0x02
+#define BCM_MSGBUF_HDR_REQUEST_ID_OFF 0x04
+#define BCM_MSGBUF_FLAG_PHASE 0x80
+
+/*
+ * ioctl_req_msg_t (H2D control submit, 40 bytes). Built at
+ * 0xfffffff0095ce9c0..0xfffffff0095cea94.
+ */
+#define BCM_IOCTL_REQ_CMD_OFF 0x08 // u32
+#define BCM_IOCTL_REQ_TRANS_ID_OFF 0x0C // u16
+#define BCM_IOCTL_REQ_INPUT_LEN_OFF 0x0E // u16
+#define BCM_IOCTL_REQ_OUTPUT_LEN_OFF 0x10 // u16
+#define BCM_IOCTL_REQ_BUF_ADDR_OFF 0x18 // u32 low, u32 high
+
+/*
+ * ioctl_resp_evt_buf_post_msg_t (H2D control submit, 40 bytes). Built by
+ * AppleBCMWLANBusInterfacePCIe::submitControlBufferMsg (@0xfffffff0095d9c80),
+ * which serves message types 0x0B, 0x0D and 0x25.
+ */
+#define BCM_BUF_POST_HOST_BUF_LEN_OFF 0x08 // u16
+#define BCM_BUF_POST_HOST_BUF_ADDR_OFF 0x10 // u32 low, u32 high
+
+/*
+ * ioctl_comp_resp_msg_t (D2H control complete, 24 bytes). Parsed at
+ * 0xfffffff0095cfdf8: request_id identifies the response buffer the host posted
+ * earlier, resp_len is how much of it we filled, and status is the BCME code.
+ */
+#define BCM_IOCTL_CMPLT_STATUS_OFF 0x08 // s16
+#define BCM_IOCTL_CMPLT_FLOW_RING_ID_OFF 0x0A // u16
+#define BCM_IOCTL_CMPLT_RESP_LEN_OFF 0x0C // u16
+#define BCM_IOCTL_CMPLT_TRANS_ID_OFF 0x0E // u16
+#define BCM_IOCTL_CMPLT_CMD_OFF 0x10 // u32
+
+/* Ring item sizes we produce. */
+#define BCM_H2D_CTRL_ITEM_SIZE 40
+#define BCM_D2H_CTRL_ITEM_SIZE 24
+
+/*
+ * WLC command numbers and BCME status codes.
+ *
+ * Everything we do not implement answers BCME_UNSUPPORTED; the driver maps a
+ * BCME code -N onto 0xE3FF81NN and explicitly tolerates "unsupported" for
+ * optional features, so a blanket -23 is the correct default rather than a
+ * generic failure.
+ */
+#define WLC_GET_VAR 262
+#define WLC_SET_VAR 263
+
+#define BCME_OK 0
+#define BCME_ERROR (-1)
+#define BCME_UNSUPPORTED (-23)
+#define BCME_BUFTOOSHORT (-24)
+
+/* How many host ioctl-response / event buffers we keep queued. */
+#define BCM_MAX_POSTED_BUFS 256
 
 /*
  * Ring geometry, mirroring brcmfmac's msgbuf defaults. The driver panics
@@ -401,6 +544,34 @@ static const uint8_t apple_bcm_wlan_otp_cis[] = {
  */
 #define BCM_MAX_TX_FLOWRINGS 40
 #define BCM_MAX_SUBMISSION_QUEUES (BCM_MAX_TX_FLOWRINGS + 2)
+
+/*
+ * One msgbuf ring, as described by its ring_mem_t descriptor plus the index
+ * slot the host allocated for it.
+ *
+ * The producer's index lives in host DMA memory (a u32 per ring, taken from
+ * the arrays whose addresses ring_info carries); so does the consumer's. For an
+ * H2D ring the host owns the write index and we own the read index; for a D2H
+ * ring it is the other way round.
+ */
+typedef struct AppleBCMWLANRing {
+    bool valid;
+    unsigned slot; // index into the ringmem descriptor array
+    uint16_t id; // index into the H2D or D2H index arrays
+    uint8_t type;
+    uint16_t max_item;
+    uint16_t len_items;
+    uint64_t base_addr; // host DMA address of the item array
+    uint32_t index; // our own end: read index (H2D) / write index (D2H)
+    uint8_t phase; // D2H only, see BCM_MSGBUF_FLAG_PHASE
+} AppleBCMWLANRing;
+
+/* A host buffer posted to us for an ioctl response or an event. */
+typedef struct AppleBCMWLANPostedBuf {
+    uint32_t request_id;
+    uint64_t addr;
+    uint16_t len;
+} AppleBCMWLANPostedBuf;
 
 /* One BAR0 window == one 4 KiB backplane aperture. */
 #define APPLE_BCM_WLAN_WINDOW_SIZE 0x1000
@@ -446,6 +617,22 @@ struct AppleBCMWLANDeviceState {
 
     /* OTP fuse array as seen through ChipCoreID 8, see apple_bcm_wlan_otp_cis. */
     uint8_t otp[BCM_OTP_IMAGE_SIZE];
+
+    /*
+     * msgbuf state. Everything here is (re)discovered from the ring_info the
+     * host filled in, on the first doorbell after the firmware handshake.
+     */
+    bool rings_discovered;
+    uint64_t h2d_w_idx_addr, h2d_r_idx_addr;
+    uint64_t d2h_w_idx_addr, d2h_r_idx_addr;
+    AppleBCMWLANRing h2d_ctrl;
+    AppleBCMWLANRing d2h_ctrl;
+
+    /* Host buffers posted for ioctl responses and for events. */
+    AppleBCMWLANPostedBuf ioctl_resp_bufs[BCM_MAX_POSTED_BUFS];
+    unsigned ioctl_resp_head, ioctl_resp_count;
+    AppleBCMWLANPostedBuf event_bufs[BCM_MAX_POSTED_BUFS];
+    unsigned event_head, event_count;
 };
 
 struct AppleBCMWLANState {
@@ -458,27 +645,15 @@ struct AppleBCMWLANState {
     PCIBus *pci_bus;
 };
 
-/* Raise the endpoint's interrupt (MSI if enabled, else legacy INTx). */
-/* Phase-1: plumbing kept for Phase 2 (msgbuf completion IRQs). */
-static G_GNUC_UNUSED void apple_bcm_wlan_set_irq(void *opaque, int irq_num,
-                                                 int level)
-{
-    AppleBCMWLANState *s = opaque;
-    PCIDevice *pci_dev = PCI_DEVICE(s->device);
-
-    if (msi_enabled(pci_dev)) {
-        if (level) {
-            msi_notify(pci_dev, 0);
-        }
-    } else {
-        pci_set_irq(pci_dev, level);
-    }
-}
-
-/* DMA helpers over the port's DART address space (Phase-2 msgbuf rings). */
-static G_GNUC_UNUSED bool apple_bcm_wlan_dma_read(AppleBCMWLANDeviceState *s,
-                                                  uint64_t offset,
-                                                  uint64_t size, uint8_t *buf)
+/*
+ * DMA helpers.
+ *
+ * The endpoint sits behind the apcie DART, so host addresses handed to us over
+ * msgbuf are IOVAs and must go through the port's own AddressSpace -- never
+ * cpu_physical_memory_*().
+ */
+static bool apple_bcm_wlan_dma_read(AppleBCMWLANDeviceState *s, uint64_t offset,
+                                    uint64_t size, uint8_t *buf)
 {
     if (dma_memory_read(s->dma_as, offset, buf, size, MEMTXATTRS_UNSPECIFIED) !=
         MEMTX_OK) {
@@ -489,9 +664,9 @@ static G_GNUC_UNUSED bool apple_bcm_wlan_dma_read(AppleBCMWLANDeviceState *s,
     return true;
 }
 
-static G_GNUC_UNUSED bool apple_bcm_wlan_dma_write(AppleBCMWLANDeviceState *s,
-                                                   uint64_t offset,
-                                                   uint64_t size, uint8_t *buf)
+static bool apple_bcm_wlan_dma_write(AppleBCMWLANDeviceState *s,
+                                     uint64_t offset, uint64_t size,
+                                     uint8_t *buf)
 {
     if (dma_memory_write(s->dma_as, offset, buf, size,
                          MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
@@ -605,6 +780,7 @@ static uint64_t apple_bcm_wlan_window_base(AppleBCMWLANDeviceState *s,
  * registers therefore read as 0.
  */
 static void apple_bcm_wlan_publish_shared_info(AppleBCMWLANDeviceState *s);
+static void apple_bcm_wlan_h2d_doorbell(AppleBCMWLANDeviceState *s);
 
 static uint32_t apple_bcm_wlan_backplane_read(AppleBCMWLANDeviceState *s,
                                               uint64_t addr)
@@ -751,15 +927,13 @@ static void apple_bcm_wlan_backplane_write(AppleBCMWLANDeviceState *s,
             return;
         case BCM_PCIE2_H2D_DOORBELL_0:
             /*
-             * Host -> device doorbell. The written value is a microsecond
-             * timestamp, not a command, so it carries no information: any
-             * write means "the host queued work on the msgbuf rings". Phase 2
-             * will consume the rings from here.
+             * Host -> device doorbell. AppleBCMWLANBusInterfacePCIe::hitDoorbell
+             * (@0xfffffff0095d96f4) writes a microsecond timestamp here, so the
+             * value carries no information: any write means "the host queued
+             * work on the H2D rings".
              */
             s->pcie_h2d_doorbell_0 = data;
-            qemu_log_mask(LOG_UNIMP,
-                          "%s: H2D doorbell 0 rung (value 0x%x ignored)\n",
-                          __func__, data);
+            apple_bcm_wlan_h2d_doorbell(s);
             return;
         case BCM_PCIE2_H2D_MAILBOX_DATA:
             s->pcie_h2d_mailbox_data = data;
@@ -852,7 +1026,9 @@ static void apple_bcm_wlan_publish_shared_info(AppleBCMWLANDeviceState *s)
     QEMU_BUILD_BUG_ON(BCM_SHARED_INFO_ADDR < BCM_MEM_FW_RAM_BASE);
     QEMU_BUILD_BUG_ON(BCM_SHARED_INFO_ADDR + BCM_SHARED_SIZE >
                       BCM_MEM_FW_RAM_END);
-    QEMU_BUILD_BUG_ON(BCM_RINGMEM_ADDR + BCM_RINGMEM_SIZE > BCM_MEM_FW_RAM_END);
+    QEMU_BUILD_BUG_ON(BCM_RINGMEM_ADDR +
+                          BCM_RINGMEM_MAX_RINGS * BCM_RINGMEM_ENTRY_SIZE >
+                      BCM_MEM_FW_RAM_END);
     QEMU_BUILD_BUG_ON(BCM_MEM_FW_RAM_END > APPLE_BCM_WLAN_DEVICE_BAR2_SIZE);
 
     memset(ram + BCM_SHARED_INFO_ADDR, 0, BCM_SHARED_SIZE);
@@ -871,7 +1047,15 @@ static void apple_bcm_wlan_publish_shared_info(AppleBCMWLANDeviceState *s)
     stw_le_p(ram + BCM_RING_INFO_ADDR + BCM_RING_INFO_MAX_SUBMISSION_QUEUES_OFF,
              BCM_MAX_SUBMISSION_QUEUES);
 
-    memset(ram + BCM_RINGMEM_ADDR, 0, BCM_RINGMEM_SIZE);
+    memset(ram + BCM_RINGMEM_ADDR,
+           0, BCM_RINGMEM_MAX_RINGS * BCM_RINGMEM_ENTRY_SIZE);
+
+    /* A fresh firmware means fresh rings. */
+    s->rings_discovered = false;
+    memset(&s->h2d_ctrl, 0, sizeof(s->h2d_ctrl));
+    memset(&s->d2h_ctrl, 0, sizeof(s->d2h_ctrl));
+    s->ioctl_resp_head = s->ioctl_resp_count = 0;
+    s->event_head = s->event_count = 0;
 
     /* Last: hand the driver the pointer it is spinning on. */
     stl_le_p(ram + BCM_SHARED_INFO_PTR_ADDR, BCM_SHARED_INFO_ADDR);
@@ -879,6 +1063,572 @@ static void apple_bcm_wlan_publish_shared_info(AppleBCMWLANDeviceState *s)
     qemu_log_mask(LOG_UNIMP,
                   "%s: firmware released, published pciedev_shared_t @ 0x%x\n",
                   __func__, BCM_SHARED_INFO_ADDR);
+}
+
+/*
+ * ============================ msgbuf ring engine ============================
+ *
+ * Three memories are in play and it is easy to mix them up:
+ *
+ *   - the ring *descriptors* (ring_info_t and the ring_mem_t array) live in
+ *     chip RAM, i.e. inside BAR2, and the host writes them over MMIO. We read
+ *     them straight out of the backing RAM.
+ *   - the ring *items* live in host memory, at IOVAs the host puts in the
+ *     descriptors. Reached by DMA through the DART.
+ *   - the ring *indices* also live in host memory, as four arrays of u32 (one
+ *     entry per ring, 4-byte stride -- see AppleBCMWLANPCIeCompletionRing::
+ *     initWithOptions @0xfffffff0095ebf50, which computes each ring's index
+ *     pointer as arraybase + slot * 4). Also reached by DMA.
+ */
+
+static uint8_t *apple_bcm_wlan_tcm(AppleBCMWLANDeviceState *s, uint32_t addr,
+                                   uint32_t len)
+{
+    if (addr < BCM_MEM_FW_RAM_BASE || addr + len > BCM_MEM_FW_RAM_END) {
+        return NULL;
+    }
+    return memory_region_get_ram_ptr(&s->bar2) + addr;
+}
+
+static bool apple_bcm_wlan_read_index(AppleBCMWLANDeviceState *s,
+                                      uint64_t array, unsigned slot,
+                                      uint32_t *out)
+{
+    uint8_t buf[4];
+
+    if (array == 0) {
+        return false;
+    }
+    if (!apple_bcm_wlan_dma_read(s, array + slot * 4, sizeof(buf), buf)) {
+        return false;
+    }
+    *out = ldl_le_p(buf);
+    return true;
+}
+
+static void apple_bcm_wlan_write_index(AppleBCMWLANDeviceState *s,
+                                       uint64_t array, unsigned slot,
+                                       uint32_t val)
+{
+    uint8_t buf[4];
+
+    if (array == 0) {
+        return;
+    }
+    stl_le_p(buf, val);
+    apple_bcm_wlan_dma_write(s, array + slot * 4, sizeof(buf), buf);
+}
+
+/* Pick the ring_mem_t entry out of chip RAM and sanity-check it. */
+static bool apple_bcm_wlan_load_ring(AppleBCMWLANDeviceState *s,
+                                     uint32_t ringmem_ptr, unsigned slot,
+                                     AppleBCMWLANRing *ring)
+{
+    const uint8_t *e =
+        apple_bcm_wlan_tcm(s, ringmem_ptr + slot * BCM_RINGMEM_ENTRY_SIZE,
+                           BCM_RINGMEM_ENTRY_SIZE);
+
+    if (e == NULL) {
+        return false;
+    }
+
+    ring->slot = slot;
+    ring->id = lduw_le_p(e + BCM_RINGMEM_IDX_OFF);
+    ring->type = e[BCM_RINGMEM_TYPE_OFF];
+    ring->max_item = lduw_le_p(e + BCM_RINGMEM_MAX_ITEM_OFF);
+    ring->len_items = lduw_le_p(e + BCM_RINGMEM_LEN_ITEMS_OFF);
+    ring->base_addr = ldl_le_p(e + BCM_RINGMEM_BASE_ADDR_OFF) |
+                      ((uint64_t)ldl_le_p(e + BCM_RINGMEM_BASE_ADDR_OFF + 4)
+                       << 32);
+    ring->valid = ring->base_addr != 0 && ring->max_item != 0 &&
+                  ring->len_items != 0;
+    return ring->valid;
+}
+
+/*
+ * Learn the ring layout from what the host wrote into ring_info.
+ *
+ * The two rings we need are found by ring TYPE rather than by a hardcoded slot,
+ * because the slot numbering is the host's business.
+ *
+ * Note the two numbering spaces. The descriptor's position in the ringmem array
+ * is one thing (iOS lays out: 0 H2D control submit, 1 H2D RX post, 2 D2H control
+ * complete, 3 D2H TX complete, 4 D2H RX complete, then the TX flow rings), and
+ * the ring's own id -- which is what indexes the H2D and D2H index arrays, and
+ * restarts from 0 for the D2H set -- is another.
+ */
+static void apple_bcm_wlan_discover_rings(AppleBCMWLANDeviceState *s)
+{
+    const uint8_t *ri = apple_bcm_wlan_tcm(s, BCM_RING_INFO_ADDR,
+                                           BCM_RING_INFO_SIZE);
+    uint32_t ringmem_ptr;
+    unsigned nrings, slot;
+
+    if (ri == NULL) {
+        return;
+    }
+
+    ringmem_ptr = ldl_le_p(ri + BCM_RING_INFO_RINGMEM_PTR_OFF);
+    s->h2d_w_idx_addr = ldq_le_p(ri + BCM_RING_INFO_H2D_W_IDX_HOSTADDR_OFF);
+    s->h2d_r_idx_addr = ldq_le_p(ri + BCM_RING_INFO_H2D_R_IDX_HOSTADDR_OFF);
+    s->d2h_w_idx_addr = ldq_le_p(ri + BCM_RING_INFO_D2H_W_IDX_HOSTADDR_OFF);
+    s->d2h_r_idx_addr = ldq_le_p(ri + BCM_RING_INFO_D2H_R_IDX_HOSTADDR_OFF);
+
+    nrings = lduw_le_p(ri + BCM_RING_INFO_MAX_SUBMISSION_QUEUES_OFF) +
+             lduw_le_p(ri + BCM_RING_INFO_MAX_COMPLETION_RINGS_OFF);
+    if (nrings == 0 || nrings > BCM_RINGMEM_MAX_RINGS) {
+        nrings = BCM_RINGMEM_MAX_RINGS;
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "%s: ring_info ringmem 0x%x h2d_w 0x%" PRIx64 " h2d_r 0x%"
+                  PRIx64 " d2h_w 0x%" PRIx64 " d2h_r 0x%" PRIx64
+                  " flowrings %u subq %u compl %u\n",
+                  __func__, ringmem_ptr, s->h2d_w_idx_addr, s->h2d_r_idx_addr,
+                  s->d2h_w_idx_addr, s->d2h_r_idx_addr,
+                  lduw_le_p(ri + BCM_RING_INFO_MAX_TX_FLOWRINGS_OFF),
+                  lduw_le_p(ri + BCM_RING_INFO_MAX_SUBMISSION_QUEUES_OFF),
+                  lduw_le_p(ri + BCM_RING_INFO_MAX_COMPLETION_RINGS_OFF));
+
+    for (slot = 0; slot < nrings; slot++) {
+        AppleBCMWLANRing ring = { 0 };
+
+        if (!apple_bcm_wlan_load_ring(s, ringmem_ptr, slot, &ring)) {
+            continue;
+        }
+
+        qemu_log_mask(LOG_UNIMP,
+                      "%s: ring slot %u id %u type %u max_item %u len_items %u "
+                      "base 0x%" PRIx64 "\n",
+                      __func__, slot, ring.id, ring.type, ring.max_item,
+                      ring.len_items, ring.base_addr);
+
+        switch (ring.type) {
+        case BCM_RING_TYPE_H2D_CTRL_SUBMIT:
+            s->h2d_ctrl = ring;
+            break;
+        case BCM_RING_TYPE_D2H_CTRL_COMPLETE:
+            s->d2h_ctrl = ring;
+            /*
+             * The host expects the first item it ever reads out of a D2H ring
+             * to carry phase 1 (initWithOptions stores 1 at ring+0x80).
+             */
+            s->d2h_ctrl.phase = 1;
+            break;
+        default:
+            break;
+        }
+    }
+
+    s->rings_discovered = s->h2d_ctrl.valid && s->d2h_ctrl.valid;
+    if (!s->rings_discovered) {
+        qemu_log_mask(LOG_UNIMP,
+                      "%s: control rings not (yet) described: h2d %d d2h %d\n",
+                      __func__, s->h2d_ctrl.valid, s->d2h_ctrl.valid);
+    }
+}
+
+/* Tell the host a D2H ring grew: sticky MAILBOXINT bit plus the single MSI. */
+static void apple_bcm_wlan_signal_d2h(AppleBCMWLANDeviceState *s)
+{
+    PCIDevice *pci_dev = PCI_DEVICE(s);
+
+    s->pcie_mailboxint |= BCM_PCIE2_MAILBOXINT_D2H_DB0;
+
+    if ((s->pcie_mailboxint & s->pcie_mailboxmask) == 0) {
+        return;
+    }
+
+    if (msi_enabled(pci_dev)) {
+        msi_notify(pci_dev, 0);
+    } else {
+        pci_set_irq(pci_dev, 1);
+    }
+}
+
+/*
+ * Append one item to the D2H control completion ring.
+ *
+ * The write index is ours; the host reads it out of the d2h_w index array. The
+ * phase bit flips on every wrap, matching ::requestRingDrain.
+ */
+static void apple_bcm_wlan_d2h_ctrl_post(AppleBCMWLANDeviceState *s,
+                                         uint8_t *item)
+{
+    AppleBCMWLANRing *ring = &s->d2h_ctrl;
+    uint32_t read_index;
+
+    if (!ring->valid || ring->len_items < BCM_D2H_CTRL_ITEM_SIZE) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: no D2H control ring\n", __func__);
+        return;
+    }
+
+    /* Refuse to overrun the host: leave one slot free as the full marker. */
+    if (apple_bcm_wlan_read_index(s, s->d2h_r_idx_addr, ring->id,
+                                  &read_index) &&
+        (ring->index + 1) % ring->max_item == read_index % ring->max_item) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: D2H control ring full\n", __func__);
+        return;
+    }
+
+    if (ring->phase) {
+        item[BCM_MSGBUF_HDR_FLAGS_OFF] |= BCM_MSGBUF_FLAG_PHASE;
+    }
+
+    apple_bcm_wlan_dma_write(s, ring->base_addr + ring->index * ring->len_items,
+                             BCM_D2H_CTRL_ITEM_SIZE, item);
+
+    ring->index++;
+    if (ring->index >= ring->max_item) {
+        ring->index = 0;
+        ring->phase ^= 1;
+    }
+
+    apple_bcm_wlan_write_index(s, s->d2h_w_idx_addr, ring->id, ring->index);
+    apple_bcm_wlan_signal_d2h(s);
+}
+
+/*
+ * The ioctl dispatcher.
+ *
+ * `in` is the request payload the host DMA'd in (for GET_VAR/SET_VAR: the
+ * NUL-terminated iovar name followed by its value), `out` is the buffer we may
+ * fill with a response. Returns a BCME status; BCME_UNSUPPORTED is the correct
+ * answer for anything we do not model, and the driver is written to cope with
+ * it for every command but one.
+ */
+typedef int (*AppleBCMWLANCommandFn)(AppleBCMWLANDeviceState *s,
+                                     const void *arg, const uint8_t *in,
+                                     uint16_t inlen, uint8_t *out,
+                                     uint16_t outmax, uint16_t *outlen);
+
+/* Succeed with an empty reply. The natural answer to a configuration write. */
+static int apple_bcm_wlan_cmd_ok(AppleBCMWLANDeviceState *s, const void *arg,
+                                 const uint8_t *in, uint16_t inlen,
+                                 uint8_t *out, uint16_t outmax,
+                                 uint16_t *outlen)
+{
+    return BCME_OK;
+}
+
+/* Succeed with a zeroed 32-bit reply: "no error", "feature off", "zero". */
+static int apple_bcm_wlan_cmd_zero_u32(AppleBCMWLANDeviceState *s,
+                                       const void *arg, const uint8_t *in,
+                                       uint16_t inlen, uint8_t *out,
+                                       uint16_t outmax, uint16_t *outlen)
+{
+    if (outmax < sizeof(uint32_t)) {
+        return BCME_BUFTOOSHORT;
+    }
+    stl_le_p(out, 0);
+    *outlen = sizeof(uint32_t);
+    return BCME_OK;
+}
+
+/* Succeed with a constant NUL-terminated string from the command table. */
+static int apple_bcm_wlan_cmd_string(AppleBCMWLANDeviceState *s,
+                                     const void *arg, const uint8_t *in,
+                                     uint16_t inlen, uint8_t *out,
+                                     uint16_t outmax, uint16_t *outlen)
+{
+    size_t len = strlen(arg) + 1;
+
+    if (len > outmax) {
+        return BCME_BUFTOOSHORT;
+    }
+    memcpy(out, arg, len);
+    *outlen = len;
+    return BCME_OK;
+}
+
+/*
+ * The firmware version banner.
+ *
+ * This is the one reply AppleBCMWLANCore::setupFirmware refuses to proceed
+ * without ("iovar get version command failed"); it logs the string verbatim as
+ * "Firmware Version:". Real Broadcom firmware answers with this exact shape --
+ * an interface tag, a build timestamp, a dotted version and an FWID.
+ */
+#define APPLE_BCM_WLAN_FW_VERSION \
+    "wl0: Jan  1 2020 00:00:00 version 18.20.244.5 FWID 01-deadbeef"
+
+/*
+ * CLM (regulatory database) version banner, in the multi-line "key: value"
+ * form real firmware returns. setupFirmware logs it and, on failure, treats
+ * the error as the outcome of the whole regulatory download.
+ */
+#define APPLE_BCM_WLAN_CLM_VERSION           \
+    "API: 12.2\nData: 9.10.39\nCompiler: 1.29.4\n" \
+    "ClmImport: 1.36.3\nCustomization: v1\nCreation: 2020-01-01 00:00:00\n"
+
+/* Same idea for the TX-power-cap database. */
+#define APPLE_BCM_WLAN_TXCAP_VERSION \
+    "TxCap API: 1.0\nData: 1.0.0\nCreation: 2020-01-01 00:00:00\n"
+
+/*
+ * Everything the emulated firmware answers.
+ *
+ * Anything absent from this table gets BCME_UNSUPPORTED, which the driver maps
+ * to 0xE3FF8117 and tolerates for every optional feature -- so this only has to
+ * grow when a failure actually blocks bring-up. `iovar` is NULL for a plain
+ * WLC command and the iovar name for GET_VAR/SET_VAR; `arg` is passed to the
+ * handler.
+ */
+static const struct {
+    uint32_t cmd;
+    const char *iovar;
+    AppleBCMWLANCommandFn fn;
+    const void *arg;
+} apple_bcm_wlan_commands[] = {
+    { WLC_GET_VAR, "ver", apple_bcm_wlan_cmd_string,
+      APPLE_BCM_WLAN_FW_VERSION },
+    /*
+     * Regulatory (CLM) and TX-power-cap blob download. setupFirmware pushes the
+     * .clmb / .txcb files it loaded from /usr/share/firmware/wifi down in
+     * chunks, reads back a status word and then asks for the resulting
+     * database version; any of those failing is reported as "Download clmb
+     * failed". We swallow the blobs and describe a plausible database.
+     */
+    { WLC_SET_VAR, "clmload", apple_bcm_wlan_cmd_ok },
+    { WLC_GET_VAR, "clmload_status", apple_bcm_wlan_cmd_zero_u32 },
+    { WLC_GET_VAR, "clmver", apple_bcm_wlan_cmd_string,
+      APPLE_BCM_WLAN_CLM_VERSION },
+    { WLC_SET_VAR, "txcapload", apple_bcm_wlan_cmd_ok },
+    { WLC_GET_VAR, "txcapload_status", apple_bcm_wlan_cmd_zero_u32 },
+    { WLC_GET_VAR, "txcapver", apple_bcm_wlan_cmd_string,
+      APPLE_BCM_WLAN_TXCAP_VERSION },
+};
+
+static int apple_bcm_wlan_ioctl(AppleBCMWLANDeviceState *s, uint8_t ifidx,
+                                uint32_t cmd, const uint8_t *in, uint16_t inlen,
+                                uint8_t *out, uint16_t outmax,
+                                uint16_t *outlen)
+{
+    const char *iovar = NULL;
+    size_t i;
+    int status = BCME_UNSUPPORTED;
+
+    *outlen = 0;
+
+    if (cmd == WLC_GET_VAR || cmd == WLC_SET_VAR) {
+        /*
+         * A var request is the NUL-terminated iovar name followed by its value.
+         * The caller over-allocated `in` by one byte and zeroed it, but a
+         * malformed request with no terminator is still refused outright.
+         */
+        uint16_t n;
+
+        for (n = 0; n < inlen; n++) {
+            if (in[n] == '\0') {
+                iovar = (const char *)in;
+                break;
+            }
+        }
+    }
+
+    for (i = 0; i < ARRAY_SIZE(apple_bcm_wlan_commands); i++) {
+        if (apple_bcm_wlan_commands[i].cmd != cmd) {
+            continue;
+        }
+        if (apple_bcm_wlan_commands[i].iovar != NULL &&
+            (iovar == NULL ||
+             strcmp(apple_bcm_wlan_commands[i].iovar, iovar) != 0)) {
+            continue;
+        }
+        status = apple_bcm_wlan_commands[i].fn(s, apple_bcm_wlan_commands[i].arg,
+                                               in, inlen, out, outmax, outlen);
+        break;
+    }
+
+    qemu_log_mask(LOG_UNIMP,
+                  "%s: ifidx %u cmd %u (%s) iovar '%s' inlen %u outmax %u -> "
+                  "%d (%u bytes)\n",
+                  __func__, ifidx, cmd,
+                  cmd == WLC_GET_VAR ? "GET_VAR" :
+                  cmd == WLC_SET_VAR ? "SET_VAR" :
+                                       "ioctl",
+                  iovar ? iovar : "", inlen, outmax, status, *outlen);
+    return status;
+}
+
+/* Handle one MSGBUF_TYPE_IOCTLPTR_REQ from the H2D control submit ring. */
+static void apple_bcm_wlan_handle_ioctl_req(AppleBCMWLANDeviceState *s,
+                                            const uint8_t *msg)
+{
+    uint8_t ack[BCM_D2H_CTRL_ITEM_SIZE];
+    uint8_t cmplt[BCM_D2H_CTRL_ITEM_SIZE];
+    g_autofree uint8_t *in = NULL;
+    g_autofree uint8_t *out = NULL;
+    AppleBCMWLANPostedBuf resp;
+    uint32_t request_id = ldl_le_p(msg + BCM_MSGBUF_HDR_REQUEST_ID_OFF);
+    uint8_t ifidx = msg[BCM_MSGBUF_HDR_IFIDX_OFF];
+    uint32_t cmd = ldl_le_p(msg + BCM_IOCTL_REQ_CMD_OFF);
+    uint16_t trans_id = lduw_le_p(msg + BCM_IOCTL_REQ_TRANS_ID_OFF);
+    uint16_t inlen = lduw_le_p(msg + BCM_IOCTL_REQ_INPUT_LEN_OFF);
+    uint16_t outlen_req = lduw_le_p(msg + BCM_IOCTL_REQ_OUTPUT_LEN_OFF);
+    uint64_t in_addr = ldl_le_p(msg + BCM_IOCTL_REQ_BUF_ADDR_OFF) |
+                       ((uint64_t)ldl_le_p(msg + BCM_IOCTL_REQ_BUF_ADDR_OFF + 4)
+                        << 32);
+    uint16_t resp_len = 0;
+    uint16_t outmax;
+    int status;
+
+    /*
+     * Acknowledge the request first. The ACK releases the host's request
+     * buffer and moves the command from the "to send" to the "in flight"
+     * queue; the completion below then finishes it.
+     */
+    memset(ack, 0, sizeof(ack));
+    ack[BCM_MSGBUF_HDR_MSGTYPE_OFF] = BCM_MSGBUF_TYPE_IOCTLPTR_REQ_ACK;
+    ack[BCM_MSGBUF_HDR_IFIDX_OFF] = ifidx;
+    stl_le_p(ack + BCM_MSGBUF_HDR_REQUEST_ID_OFF, request_id);
+    apple_bcm_wlan_d2h_ctrl_post(s, ack);
+
+    if (s->ioctl_resp_count == 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: no ioctl response buffer posted, dropping cmd %u\n",
+                      __func__, cmd);
+        return;
+    }
+    resp = s->ioctl_resp_bufs[s->ioctl_resp_head];
+    s->ioctl_resp_head = (s->ioctl_resp_head + 1) % BCM_MAX_POSTED_BUFS;
+    s->ioctl_resp_count--;
+
+    if (inlen != 0 && in_addr != 0) {
+        in = g_malloc0(inlen + 1u);
+        if (!apple_bcm_wlan_dma_read(s, in_addr, inlen, in)) {
+            inlen = 0;
+        }
+    }
+
+    outmax = MIN(outlen_req, resp.len);
+    out = g_malloc0(outmax + 1u);
+
+    status = apple_bcm_wlan_ioctl(s, ifidx, cmd, in, inlen, out, outmax,
+                                  &resp_len);
+    if (status != BCME_OK) {
+        resp_len = 0;
+    }
+    if (resp_len != 0) {
+        apple_bcm_wlan_dma_write(s, resp.addr, resp_len, out);
+    }
+
+    memset(cmplt, 0, sizeof(cmplt));
+    cmplt[BCM_MSGBUF_HDR_MSGTYPE_OFF] = BCM_MSGBUF_TYPE_IOCTL_CMPLT;
+    cmplt[BCM_MSGBUF_HDR_IFIDX_OFF] = ifidx;
+    /* The completion is matched to the *response buffer*, not to the request. */
+    stl_le_p(cmplt + BCM_MSGBUF_HDR_REQUEST_ID_OFF, resp.request_id);
+    stw_le_p(cmplt + BCM_IOCTL_CMPLT_STATUS_OFF, (uint16_t)(int16_t)status);
+    stw_le_p(cmplt + BCM_IOCTL_CMPLT_RESP_LEN_OFF, resp_len);
+    stw_le_p(cmplt + BCM_IOCTL_CMPLT_TRANS_ID_OFF, trans_id);
+    stl_le_p(cmplt + BCM_IOCTL_CMPLT_CMD_OFF, cmd);
+    apple_bcm_wlan_d2h_ctrl_post(s, cmplt);
+}
+
+/*
+ * Acknowledge a dynamic ring creation.
+ *
+ * The driver tracks the request by the common header's request_id (the
+ * completion handlers at 0xfffffff0095cf9a8 and 0xfffffff0095d01f0 look it up
+ * in a hash table and then require the u16 status at +0x08 to be zero), so an
+ * echo of the request id plus a zero status is a complete answer. Nothing else
+ * is needed: these rings carry firmware debug logs, which we never produce.
+ */
+static void apple_bcm_wlan_ack_ring_create(AppleBCMWLANDeviceState *s,
+                                           const uint8_t *msg, uint8_t type)
+{
+    uint8_t cmplt[BCM_D2H_CTRL_ITEM_SIZE];
+
+    memset(cmplt, 0, sizeof(cmplt));
+    cmplt[BCM_MSGBUF_HDR_MSGTYPE_OFF] = type;
+    cmplt[BCM_MSGBUF_HDR_IFIDX_OFF] = msg[BCM_MSGBUF_HDR_IFIDX_OFF];
+    stl_le_p(cmplt + BCM_MSGBUF_HDR_REQUEST_ID_OFF,
+             ldl_le_p(msg + BCM_MSGBUF_HDR_REQUEST_ID_OFF));
+    apple_bcm_wlan_d2h_ctrl_post(s, cmplt);
+}
+
+static void apple_bcm_wlan_post_buf(AppleBCMWLANPostedBuf *pool, unsigned head,
+                                    unsigned *count, const uint8_t *msg)
+{
+    AppleBCMWLANPostedBuf *slot;
+
+    if (*count >= BCM_MAX_POSTED_BUFS) {
+        return;
+    }
+    slot = &pool[(head + *count) % BCM_MAX_POSTED_BUFS];
+    slot->request_id = ldl_le_p(msg + BCM_MSGBUF_HDR_REQUEST_ID_OFF);
+    slot->len = lduw_le_p(msg + BCM_BUF_POST_HOST_BUF_LEN_OFF);
+    slot->addr = ldl_le_p(msg + BCM_BUF_POST_HOST_BUF_ADDR_OFF) |
+                 ((uint64_t)ldl_le_p(msg + BCM_BUF_POST_HOST_BUF_ADDR_OFF + 4)
+                  << 32);
+    (*count)++;
+}
+
+/* Drain everything the host queued on the H2D control submit ring. */
+static void apple_bcm_wlan_h2d_doorbell(AppleBCMWLANDeviceState *s)
+{
+    AppleBCMWLANRing *ring = &s->h2d_ctrl;
+    uint8_t msg[BCM_H2D_CTRL_ITEM_SIZE];
+    uint32_t write_index;
+    unsigned guard;
+
+    if (!s->rings_discovered) {
+        apple_bcm_wlan_discover_rings(s);
+        if (!s->rings_discovered) {
+            return;
+        }
+    }
+
+    if (!apple_bcm_wlan_read_index(s, s->h2d_w_idx_addr, ring->id,
+                                   &write_index)) {
+        return;
+    }
+    if (write_index >= ring->max_item) {
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: bogus H2D write index %u\n",
+                      __func__, write_index);
+        return;
+    }
+
+    for (guard = 0; ring->index != write_index && guard < ring->max_item;
+         guard++) {
+        if (!apple_bcm_wlan_dma_read(s,
+                                     ring->base_addr +
+                                         ring->index * ring->len_items,
+                                     MIN(ring->len_items, sizeof(msg)), msg)) {
+            break;
+        }
+
+        switch (msg[BCM_MSGBUF_HDR_MSGTYPE_OFF]) {
+        case BCM_MSGBUF_TYPE_IOCTLRESP_BUF_POST:
+            apple_bcm_wlan_post_buf(s->ioctl_resp_bufs, s->ioctl_resp_head,
+                                    &s->ioctl_resp_count, msg);
+            break;
+        case BCM_MSGBUF_TYPE_EVENT_BUF_POST:
+            apple_bcm_wlan_post_buf(s->event_bufs, s->event_head,
+                                    &s->event_count, msg);
+            break;
+        case BCM_MSGBUF_TYPE_IOCTLPTR_REQ:
+            apple_bcm_wlan_handle_ioctl_req(s, msg);
+            break;
+        case BCM_MSGBUF_TYPE_H2D_RING_CREATE:
+            apple_bcm_wlan_ack_ring_create(
+                s, msg, BCM_MSGBUF_TYPE_H2D_RING_CREATE_CMPLT);
+            break;
+        case BCM_MSGBUF_TYPE_D2H_RING_CREATE:
+            apple_bcm_wlan_ack_ring_create(
+                s, msg, BCM_MSGBUF_TYPE_D2H_RING_CREATE_CMPLT);
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP, "%s: UNIMP H2D control message type 0x%x\n",
+                          __func__, msg[BCM_MSGBUF_HDR_MSGTYPE_OFF]);
+            break;
+        }
+
+        ring->index = (ring->index + 1) % ring->max_item;
+    }
+
+    /* Hand the consumed space back to the host. */
+    apple_bcm_wlan_write_index(s, s->h2d_r_idx_addr, ring->id, ring->index);
 }
 
 static uint64_t apple_bcm_wlan_device_bar0_read(void *opaque, hwaddr addr,
@@ -1065,6 +1815,16 @@ static void apple_bcm_wlan_device_qdev_reset_hold(Object *obj, ResetType type)
 
     memset(s->wrapper_ioctrl, 0, sizeof(s->wrapper_ioctrl));
     memset(s->wrapper_resetctrl, 0, sizeof(s->wrapper_resetctrl));
+
+    s->rings_discovered = false;
+    s->h2d_w_idx_addr = 0;
+    s->h2d_r_idx_addr = 0;
+    s->d2h_w_idx_addr = 0;
+    s->d2h_r_idx_addr = 0;
+    memset(&s->h2d_ctrl, 0, sizeof(s->h2d_ctrl));
+    memset(&s->d2h_ctrl, 0, sizeof(s->d2h_ctrl));
+    s->ioctl_resp_head = s->ioctl_resp_count = 0;
+    s->event_head = s->event_count = 0;
 
     /* Unprogrammed fuses read as 0; the CIS sits at kBCOM4378ChipUserOTP. */
     QEMU_BUILD_BUG_ON(BCM_OTP_CIS_OFFSET + sizeof(apple_bcm_wlan_otp_cis) >
