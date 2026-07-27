@@ -129,9 +129,10 @@ static void apple_pcie_set_own_irq(ApplePCIEPort *port, int level)
 
     /*
      * Register 0x104 is a MASK: a SET bit means that source is masked off.
-     * AppleT803xPCIePort::enableInterrupts starts by writing 0x0fffffff (mask
-     * everything), and enableVector() then CLEARS the bits it wants delivered
-     * -- the observed progression on a T8030 port is 0x0fffffff -> 0xfb512fff
+     * AppleT803xPCIePort::enableInterrupts @0xfffffff008c09450 writes it from
+     * its own shadow copy at [port + 0x20c] and then clears 0x100 with
+     * 0x04aed000; enableVector() CLEARS the bits it wants delivered -- the
+     * observed progression on a T8030 port is 0x0fffffff -> 0xfb512fff
      * -> 0xfb512f0f, i.e. link-up (bit 12) and link-down (bit 14) end up
      * unmasked, which is exactly what AppleEmbeddedPCIEPort::enableGated needs:
      * it starts link training and then commandSleep()s until handleLinkUp()
@@ -322,6 +323,15 @@ static void machine_set_gpio(int interrupt_num, int level)
     qemu_set_irq(qdev_get_gpio_in(gpio, interrupt_num), level);
 }
 
+/*
+ * PCIE_ROOT_PORT's own config_write, which this device's override replaces.
+ * Everything that is not special-cased has to reach it: it is what runs the
+ * AER, AER-root and slot-capability handling on top of the plain bridge write.
+ */
+static void (*apple_pcie_port_parent_config_write)(PCIDevice *d,
+                                                   uint32_t address,
+                                                   uint32_t val, int len);
+
 static uint32_t apple_pcie_port_bridge_config_read(PCIDevice *d,
                                                    uint32_t address, int len)
 {
@@ -408,7 +418,7 @@ static void apple_pcie_port_bridge_config_write(PCIDevice *d, uint32_t address,
         DPRINTF("%s: bridge_config: WRITE DEFAULT @ 0x%x value:"
                 " 0x%x\n",
                 __func__, address, val);
-        pci_bridge_write_config(d, address, val, len);
+        apple_pcie_port_parent_config_write(d, address, val, len);
         break;
     }
 }
@@ -429,17 +439,33 @@ static bool apple_pcie_port_link_up(ApplePCIEPort *port)
            (port->port_ltssm_enable & 1) != 0;
 }
 
-/* Is the secondary bus of the port that owns `busnum` reachable? */
-static bool apple_pcie_host_bus_reachable(ApplePCIEHost *host, uint8_t busnum)
+/*
+ * Is `dev` on the bus at all?
+ *
+ * Walk up from the device to the root, and refuse it if any root port along
+ * the way has not trained its link. It has to be done by walking the topology:
+ * `port->bus_nr` is the port's own device number on bus 0, whereas the bus
+ * number in a configuration request is the guest-assigned SECONDARY bus of
+ * whichever port owns it, and the two are only equal by accident. On a live
+ * T8030 iOS gives 00:02.0 (wlan) secondary bus 2 but 00:03.0 (baseband)
+ * secondary bus 1, so matching the numbers gates bus 1 on port 1 -- a port
+ * with no device-tree node, hence not manual-enable, hence always "up".
+ */
+static bool apple_pcie_device_reachable(PCIDevice *dev)
 {
-    int i;
+    PCIBus *bus = pci_get_bus(dev);
 
-    for (i = 0; i < APCIE_MAX_PORTS; i++) {
-        ApplePCIEPort *port = host->pcie->ports[i];
+    while (bus != NULL) {
+        PCIDevice *parent = pci_bridge_get_device(bus);
 
-        if (port != NULL && port->bus_nr == busnum) {
-            return apple_pcie_port_link_up(port);
+        if (parent == NULL) {
+            break;
         }
+        if (object_dynamic_cast(OBJECT(parent), TYPE_APPLE_PCIE_PORT) &&
+            !apple_pcie_port_link_up(APPLE_PCIE_PORT(parent))) {
+            return false;
+        }
+        bus = pci_get_bus(parent);
     }
     return true;
 }
@@ -467,8 +493,7 @@ static uint64_t apple_pcie_root_conf_access(void *opaque, hwaddr addr,
      * boot-time PCI pass correctly finds nothing behind a manual-enable port
      * that its own autoEnable() deliberately left untrained.
      */
-    if (pcidev != NULL && busnum != 0 &&
-        !apple_pcie_host_bus_reachable(host, busnum)) {
+    if (pcidev != NULL && !apple_pcie_device_reachable(pcidev)) {
         pcidev = NULL;
     }
 
@@ -1183,6 +1208,12 @@ static void apple_pcie_port_config_write(void *opaque, hwaddr addr,
     case 0x104: // disableVectorHard/enableInterrupts/enableVector
         // (0xf << 4) == AER interrupts;
         port->port_interrupt_mask = data;
+        /*
+         * The line is (status & ~mask), so changing the mask changes the line:
+         * unmasking a source that latched while it was masked has to deliver
+         * it now. enableVector()/disableVectorHard() write this at runtime.
+         */
+        apple_pcie_set_own_irq(port, 0);
         break;
     case 0x108: // disableAERInterrupts
         // TODO
@@ -2289,27 +2320,18 @@ static void apple_pcie_port_interrupts_uninit(PCIDevice *d)
 }
 
 /*
- * If two MSI vector are allocated, Advanced Error Interrupt Message Number
- * is 1. otherwise 0.
- * 17.12.5.10 RPERRSTS,  32:27 bit Advanced Error Interrupt Message Number.
+ * Which of the port's MSI vectors carries an advanced error interrupt.
+ *
+ * The count is msi_nr_vectors_allocated(), i.e. 1 << MME -- a field the GUEST
+ * writes, and msi_init() advertises MMC = 8 here, so it can legitimately be
+ * 1, 2, 4 or 8. Report vector 0 for all of them, exactly as the generic root
+ * port (gen_rp_aer_vector) does; anything else used to abort() QEMU from
+ * rp_reset_hold on the next reset after the guest enabled more than two.
  */
 static uint8_t apple_pcie_aer_vector(const PCIDevice *d)
 {
     DPRINTF("%s: msi_nr_vectors_allocated(d) == %u\n", __func__,
             msi_nr_vectors_allocated(d));
-    switch (msi_nr_vectors_allocated(d)) {
-    case 1:
-        return 0;
-    case 2:
-        return 1;
-    case 4:
-    case 8:
-    case 16:
-    case 32:
-    default:
-        break;
-    }
-    abort();
     return 0;
 }
 
@@ -2354,6 +2376,7 @@ static void apple_pcie_port_class_init(ObjectClass *klass, const void *data)
     rpc->interrupts_init = apple_pcie_port_interrupts_init;
     rpc->interrupts_uninit = apple_pcie_port_interrupts_uninit;
     k->config_read = apple_pcie_port_bridge_config_read;
+    apple_pcie_port_parent_config_write = k->config_write;
     k->config_write = apple_pcie_port_bridge_config_write;
 
     dc->hotpluggable = false;
