@@ -171,6 +171,11 @@ struct AppleMTSPIState {
     /// Virtual-clock time at which the power statistics were last cleared,
     /// i.e. the start of the interval HID report 0x72 describes.
     uint64_t power_stats_since;
+    /// The report the host last selected by writing HID report 0x01, and so
+    /// the one the next read of report 0x01 describes. Zero until it selects
+    /// one, which no report ID ever is, so an unprompted read is answered with
+    /// the mismatch the host checks for.
+    uint8_t report_info_id;
 };
 
 static const VMStateDescription vmstate_apple_mt_spi = {
@@ -204,6 +209,7 @@ static const VMStateDescription vmstate_apple_mt_spi = {
             VMSTATE_STRUCT(stats, AppleMTSPIState, 0, vmstate_apple_mt_spi_stats,
                            AppleMTSPIStats),
             VMSTATE_UINT64(power_stats_since, AppleMTSPIState),
+            VMSTATE_UINT8(report_info_id, AppleMTSPIState),
             VMSTATE_END_OF_LIST(),
         },
 };
@@ -283,6 +289,7 @@ static const VMStateDescription vmstate_apple_mt_spi = {
 #define HID_PACKET_STATUS_ERROR_UNSUPPORTED (4)
 #define HID_PACKET_STATUS_ERROR_INCORRECT_LENGTH (5)
 
+#define HID_REPORT_INFO (0x01)
 #define HID_REPORT_BINARY_PATH_OR_IMAGE (0x44)
 #define HID_REPORT_POWER_STATS (0x72)
 #define HID_REPORT_POWER_STATS_DESC (0x73)
@@ -467,6 +474,59 @@ typedef struct {
 /// u16 when the payload is exactly two bytes and a u32 when it is exactly
 /// four; every other length decodes as zero.
 #define MT_STATUS_LEN (4)
+
+/*
+ * The remaining device-property reports. Their lengths are named because HID
+ * report 0x01 has to quote them, and a number quoted in one place and emitted
+ * in another drifts apart the moment either changes.
+ */
+#define MT_FAMILY_ID_LEN (1)
+#define MT_BASIC_DEVICE_INFO_LEN (5)
+#define MT_SENSOR_SURFACE_DESC_LEN (16)
+#define MT_SENSOR_REGION_PARAM_LEN (6)
+/// One region count byte followed by three seven-byte region descriptors.
+#define MT_SENSOR_REGION_DESC_LEN (1 + 3 * 7)
+/// A touch frame is the frame header plus the single contact this controller
+/// tracks; nothing here emits an image or a second path.
+#define MT_TOUCH_FRAME_LEN \
+    (sizeof(AppleMTSPIFrameHeader) + sizeof(AppleMTSPIPath))
+
+/*
+ * HID report 0x01, the report-information handshake. It is how every Apple HID
+ * device class in this kernelcache is asked for the length of one of its other
+ * reports - AppleMultitouchHIDService::getMultitouchReportInfo() and
+ * AppleActuatorHIDEventDriver::getActuatorReportInfoGated() are the same code
+ * against different devices. The host
+ *
+ *   1. *sets* feature report 0x01 as the two bytes { 0x01, report of interest },
+ *   2. *gets* feature report 0x01 back, asking for five bytes:
+ *
+ *          u8 report_id (0x01)
+ *          u8 report described, echoed back
+ *          u8 type
+ *          u16 length, little-endian and unaligned
+ *
+ * and rejects the answer outright unless byte 1 echoes the report it asked
+ * about. The length counts the report ID byte at offset 0, which is the same
+ * convention the host itself uses on the wire: it clears report 0xF8 with a
+ * 449-byte write - the personality's ReportLength - whose first byte is 0xF8.
+ *
+ * What the type byte means is *not* established. AppleMultitouchDevice::
+ * _getFeatureReportInfo() pre-initialises it to zero, and caches the answer
+ * only when it comes back zero and the length is non-zero; on the raw-SPI
+ * transport the same field is only four bits wide, packed above a twelve-bit
+ * length. Zero is therefore the one value known to be accepted, and it is what
+ * this controller answers, but no meaning is claimed for it.
+ *
+ * iOS 14.0b5 never asks this device for report 0x01 - not once across a boot,
+ * as neither a set nor a get of it appears in a trace. It is answered for
+ * correctness, not to fix anything observable.
+ */
+#define MT_REPORT_INFO_LEN (5)
+/// { report id, report of interest } - the write that selects the subject.
+#define MT_REPORT_INFO_SELECT_LEN (2)
+/// See above: the only type byte the host is known to accept.
+#define MT_REPORT_INFO_TYPE (0)
 
 /*
  * Two reports are deliberately left unimplemented, and both degrade quietly.
@@ -858,6 +918,30 @@ static bool apple_mt_spi_hid_hdr(const uint8_t *payload, uint16_t payload_len,
     return true;
 }
 
+/*
+ * Points @report at the report body carried after a HID header and returns its
+ * length. Both the declared length and the frame it arrived in are guest
+ * controlled, so the shorter of the two wins. Only call this once
+ * apple_mt_spi_hid_hdr() has accepted the same payload, which is what
+ * guarantees there is a header's worth of it to step over.
+ *
+ * The host lays a report out the same way this controller does: the report ID
+ * at byte 0 and the payload after it, with the declared length counting the ID.
+ * Confirmed on the wire - it clears report 0xF8 with a 449-byte write, the
+ * personality's ReportLength, whose first byte is 0xF8.
+ */
+static uint16_t apple_mt_spi_hid_report(const uint8_t *payload,
+                                        uint16_t payload_len,
+                                        const AppleMTSPIHIDHeader *hdr,
+                                        const uint8_t **report)
+{
+    uint16_t avail;
+
+    *report = payload + sizeof(*hdr);
+    avail = payload_len - sizeof(*hdr);
+    return MIN(hdr->payload_length, avail);
+}
+
 static void apple_mt_spi_push_hid_hdr(AppleMTSPIBuffer *buf, uint8_t type,
                                       uint8_t report_id, uint8_t packet_status,
                                       uint8_t frame_number,
@@ -1001,6 +1085,47 @@ static void apple_mt_spi_push_power_stats(AppleMTSPIState *s,
     apple_mt_spi_buf_push_data(buf, report, sizeof(report));
 }
 
+/*
+ * The length of a report as this controller answers it, counting the report ID
+ * byte at offset 0, or zero for a report it does not serve. This is what HID
+ * report 0x01 quotes, so every case here has to name the same constant the
+ * emitter below uses - a report described as one length and delivered at
+ * another is worse than one that is not described at all, which is what a zero
+ * says: AppleMultitouchDevice::_getFeatureReportInfo() declines to cache an
+ * entry whose length came back zero.
+ */
+static uint16_t apple_mt_spi_feature_report_len(uint8_t report_id)
+{
+    switch (report_id) {
+    case HID_REPORT_INFO:
+        return MT_REPORT_INFO_LEN;
+    // The touch frames themselves are input rather than feature reports, but
+    // they are still reports this controller emits at a length it knows.
+    case HID_REPORT_BINARY_PATH_OR_IMAGE:
+        return 1 + MT_TOUCH_FRAME_LEN;
+    // Already sized with the report ID byte included, as the host's own
+    // clearing writes of these two prove.
+    case HID_REPORT_POWER_STATS:
+        return MT_POWER_STATS_LEN;
+    case HID_REPORT_TRANSPORT_STATS:
+        return MT_TRANSPORT_STATS_LEN;
+    case HID_REPORT_STATUS:
+        return 1 + MT_STATUS_LEN;
+    case HID_REPORT_SENSOR_REGION_PARAM:
+        return 1 + MT_SENSOR_REGION_PARAM_LEN;
+    case HID_REPORT_SENSOR_REGION_DESC:
+        return 1 + MT_SENSOR_REGION_DESC_LEN;
+    case HID_REPORT_FAMILY_ID:
+        return 1 + MT_FAMILY_ID_LEN;
+    case HID_REPORT_BASIC_DEVICE_INFO:
+        return 1 + MT_BASIC_DEVICE_INFO_LEN;
+    case HID_REPORT_SENSOR_SURFACE_DESC:
+        return 1 + MT_SENSOR_SURFACE_DESC_LEN;
+    default:
+        return 0;
+    }
+}
+
 static void apple_mt_spi_handle_get_feature(AppleMTSPIState *s,
                                             const AppleMTSPIHIDHeader *req,
                                             uint8_t interface)
@@ -1017,27 +1142,47 @@ static void apple_mt_spi_handle_get_feature(AppleMTSPIState *s,
     packet = apple_mt_spi_new_packet(LL_PACKET_CONTROL, interface);
 
     switch (report_id) {
+    case HID_REPORT_INFO:
+        /*
+         * The report-information handshake documented above. The subject was
+         * chosen by the write of report 0x01 that the host always sends first;
+         * it is echoed back because the host drops an answer that names a
+         * different report than the one it asked about.
+         */
+        apple_mt_spi_push_report_hdr(
+            &packet->buf, HID_CONTROL_PACKET_SET_OUTPUT_REPORT, report_id,
+            HID_PACKET_STATUS_SUCCESS, frame_number, MT_REPORT_INFO_LEN - 1);
+        apple_mt_spi_buf_push_byte(&packet->buf, s->report_info_id);
+        apple_mt_spi_buf_push_byte(&packet->buf, MT_REPORT_INFO_TYPE);
+        apple_mt_spi_buf_push_word(
+            &packet->buf, apple_mt_spi_feature_report_len(s->report_info_id));
+        break;
     case HID_REPORT_FAMILY_ID:
-        apple_mt_spi_buf_ensure_capacity(&packet->buf, 9 + 1 + 2);
+        apple_mt_spi_buf_ensure_capacity(&packet->buf,
+                                         9 + MT_FAMILY_ID_LEN + 2);
         apple_mt_spi_push_report_byte(
             &packet->buf, HID_CONTROL_PACKET_SET_OUTPUT_REPORT, report_id,
             HID_PACKET_STATUS_SUCCESS, frame_number, MT_FAMILY_ID);
         break;
     case HID_REPORT_BASIC_DEVICE_INFO:
-        apple_mt_spi_buf_ensure_capacity(&packet->buf, 9 + 5 + 2);
-        apple_mt_spi_push_report_hdr(
-            &packet->buf, HID_CONTROL_PACKET_SET_OUTPUT_REPORT, report_id,
-            HID_PACKET_STATUS_SUCCESS, frame_number, 5);
+        apple_mt_spi_buf_ensure_capacity(&packet->buf,
+                                         9 + MT_BASIC_DEVICE_INFO_LEN + 2);
+        apple_mt_spi_push_report_hdr(&packet->buf,
+                                     HID_CONTROL_PACKET_SET_OUTPUT_REPORT,
+                                     report_id, HID_PACKET_STATUS_SUCCESS,
+                                     frame_number, MT_BASIC_DEVICE_INFO_LEN);
         apple_mt_spi_buf_push_byte(&packet->buf, MT_LITTLE_ENDIAN);
         apple_mt_spi_buf_push_byte(&packet->buf, MT_ROWS);
         apple_mt_spi_buf_push_byte(&packet->buf, MT_COLUMNS);
         apple_mt_spi_buf_push_word(&packet->buf, MT_BCD_VER);
         break;
     case HID_REPORT_SENSOR_SURFACE_DESC:
-        apple_mt_spi_buf_ensure_capacity(&packet->buf, 9 + 16 + 2);
-        apple_mt_spi_push_report_hdr(
-            &packet->buf, HID_CONTROL_PACKET_SET_OUTPUT_REPORT, report_id,
-            HID_PACKET_STATUS_SUCCESS, frame_number, 16);
+        apple_mt_spi_buf_ensure_capacity(&packet->buf,
+                                         9 + MT_SENSOR_SURFACE_DESC_LEN + 2);
+        apple_mt_spi_push_report_hdr(&packet->buf,
+                                     HID_CONTROL_PACKET_SET_OUTPUT_REPORT,
+                                     report_id, HID_PACKET_STATUS_SUCCESS,
+                                     frame_number, MT_SENSOR_SURFACE_DESC_LEN);
         apple_mt_spi_buf_push_dword(&packet->buf, MT_SENSOR_SURFACE_WIDTH);
         apple_mt_spi_buf_push_dword(&packet->buf, MT_SENSOR_SURFACE_HEIGHT);
         // these values might need to be different, especially considering the
@@ -1048,19 +1193,23 @@ static void apple_mt_spi_handle_get_feature(AppleMTSPIState *s,
         apple_mt_spi_buf_push_word(&packet->buf, MT_SENSOR_SURFACE_HEIGHT);
         break;
     case HID_REPORT_SENSOR_REGION_PARAM:
-        apple_mt_spi_buf_ensure_capacity(&packet->buf, 9 + 6 + 2);
-        apple_mt_spi_push_report_hdr(
-            &packet->buf, HID_CONTROL_PACKET_SET_OUTPUT_REPORT, report_id,
-            HID_PACKET_STATUS_SUCCESS, frame_number, 6);
+        apple_mt_spi_buf_ensure_capacity(&packet->buf,
+                                         9 + MT_SENSOR_REGION_PARAM_LEN + 2);
+        apple_mt_spi_push_report_hdr(&packet->buf,
+                                     HID_CONTROL_PACKET_SET_OUTPUT_REPORT,
+                                     report_id, HID_PACKET_STATUS_SUCCESS,
+                                     frame_number, MT_SENSOR_REGION_PARAM_LEN);
         apple_mt_spi_buf_push_word(&packet->buf, 0x0);
         apple_mt_spi_buf_push_word(&packet->buf, 0x7);
         apple_mt_spi_buf_push_word(&packet->buf, 0x200);
         break;
     case HID_REPORT_SENSOR_REGION_DESC:
-        apple_mt_spi_buf_ensure_capacity(&packet->buf, 9 + 22 + 2);
-        apple_mt_spi_push_report_hdr(
-            &packet->buf, HID_CONTROL_PACKET_SET_OUTPUT_REPORT, report_id,
-            HID_PACKET_STATUS_SUCCESS, frame_number, 22); // 1 + 7*3
+        apple_mt_spi_buf_ensure_capacity(&packet->buf,
+                                         9 + MT_SENSOR_REGION_DESC_LEN + 2);
+        apple_mt_spi_push_report_hdr(&packet->buf,
+                                     HID_CONTROL_PACKET_SET_OUTPUT_REPORT,
+                                     report_id, HID_PACKET_STATUS_SUCCESS,
+                                     frame_number, MT_SENSOR_REGION_DESC_LEN);
         apple_mt_spi_buf_push_byte(&packet->buf, 3); // region count
 
         apple_mt_spi_buf_push_byte(&packet->buf, 1); // type Multitouch
@@ -1121,12 +1270,30 @@ static void apple_mt_spi_handle_get_feature(AppleMTSPIState *s,
     apple_mt_spi_queue_packet(s, packet);
 }
 
-/// Applies a report the host has written to the controller. Only the two
-/// statistics reports have state behind them, and for those a write is the
-/// host clearing the interval it has just read.
-static void apple_mt_spi_apply_set_report(AppleMTSPIState *s, uint8_t report_id)
+/*
+ * Applies a report the host has written to the controller. @report points at
+ * the report as the host laid it out - the report ID at byte 0, then its
+ * payload - and @report_len is how much of it actually arrived.
+ *
+ * Only three reports have state behind them: a write of either statistics
+ * report is the host clearing the interval it has just read, and a write of
+ * report 0x01 selects the report a subsequent read of report 0x01 describes.
+ */
+static void apple_mt_spi_apply_set_report(AppleMTSPIState *s, uint8_t report_id,
+                                          const uint8_t *report,
+                                          uint16_t report_len)
 {
     switch (report_id) {
+    case HID_REPORT_INFO:
+        if (report_len < MT_REPORT_INFO_SELECT_LEN) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: write of report 0x%02X is %u bytes, too short "
+                          "to name a report to describe\n",
+                          __func__, report_id, report_len);
+            break;
+        }
+        s->report_info_id = report[1];
+        break;
     case HID_REPORT_TRANSPORT_STATS:
         s->stats = (AppleMTSPIStats){ 0 };
         break;
@@ -1142,12 +1309,14 @@ static void apple_mt_spi_apply_set_report(AppleMTSPIState *s, uint8_t report_id)
 
 static void apple_mt_spi_handle_set_feature(AppleMTSPIState *s,
                                             const AppleMTSPIHIDHeader *req,
-                                            uint8_t interface)
+                                            uint8_t interface,
+                                            const uint8_t *report,
+                                            uint16_t report_len)
 {
     AppleMTSPILLPacket *packet;
 
     s->stats.set_reports++;
-    apple_mt_spi_apply_set_report(s, req->report_id);
+    apple_mt_spi_apply_set_report(s, req->report_id, report, report_len);
 
     packet = apple_mt_spi_new_packet(LL_PACKET_CONTROL, interface);
     apple_mt_spi_push_hid_hdr(&packet->buf,
@@ -1163,6 +1332,8 @@ static void apple_mt_spi_handle_control(AppleMTSPIState *s)
     AppleMTSPILLHeader hdr;
     const uint8_t *payload;
     uint16_t payload_len;
+    const uint8_t *report;
+    uint16_t report_len;
 
     payload_len = apple_mt_spi_ll_payload(&s->rx, &payload, &hdr);
 
@@ -1179,7 +1350,10 @@ static void apple_mt_spi_handle_control(AppleMTSPIState *s)
         apple_mt_spi_handle_get_feature(s, &req, hdr.interface);
         break;
     case HID_CONTROL_PACKET_SET_FEATURE_REPORT:
-        apple_mt_spi_handle_set_feature(s, &req, hdr.interface);
+        report_len =
+            apple_mt_spi_hid_report(payload, payload_len, &req, &report);
+        apple_mt_spi_handle_set_feature(s, &req, hdr.interface, report,
+                                        report_len);
         break;
     default:
         qemu_log_mask(LOG_UNIMP,
@@ -1208,6 +1382,8 @@ static void apple_mt_spi_handle_output(AppleMTSPIState *s)
     AppleMTSPILLHeader hdr;
     const uint8_t *payload;
     uint16_t payload_len;
+    const uint8_t *report;
+    uint16_t report_len;
 
     payload_len = apple_mt_spi_ll_payload(&s->rx, &payload, &hdr);
 
@@ -1251,7 +1427,8 @@ static void apple_mt_spi_handle_output(AppleMTSPIState *s)
     }
 
     s->stats.output_reports++;
-    apple_mt_spi_apply_set_report(s, req.report_id);
+    report_len = apple_mt_spi_hid_report(payload, payload_len, &req, &report);
+    apple_mt_spi_apply_set_report(s, req.report_id, report, report_len);
 
     // Nothing goes back. The host does not wait on these: it clocks the frame
     // out and carries on. The only thing a lossless transfer adds is that the
@@ -1436,7 +1613,7 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
     apple_mt_spi_push_report_hdr(&packet->buf, HID_TRANSFER_PACKET_OUTPUT,
                                  HID_REPORT_BINARY_PATH_OR_IMAGE,
                                  HID_PACKET_STATUS_SUCCESS, s->frame,
-                                 sizeof(frame) + sizeof(path));
+                                 MT_TOUCH_FRAME_LEN);
     apple_mt_spi_buf_push_data(&packet->buf, &frame, sizeof(frame));
     apple_mt_spi_buf_push_data(&packet->buf, &path, sizeof(path));
 
@@ -1593,6 +1770,7 @@ static void apple_mt_spi_reset_enter(Object *obj, ResetType type)
     s->frame = 0;
     s->stats = (AppleMTSPIStats){ 0 };
     s->power_stats_since = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->report_info_id = 0;
 
     apple_mt_spi_buf_free(&s->tx);
     apple_mt_spi_buf_free(&s->rx);
