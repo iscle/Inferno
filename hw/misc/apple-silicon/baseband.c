@@ -236,7 +236,7 @@ static void apple_baseband_add_pcie_cap_hmap(AppleBasebandDeviceState *s,
                                              PCIDevice *dev)
 {
     DPRINTF("%s: pci_is_express: %d\n", __func__, pci_is_express(dev));
-    assert_cmpuint(sizeof(s->hmap), ==, 0x70);
+    QEMU_BUILD_BUG_ON(sizeof(custom_hmap_t) != 0x70);
     s->hmap = (custom_hmap_t){ 0 };
     s->hmap.vsec_id = 0x24;
     pcie_add_capability(dev, PCI_EXT_CAP_ID_VNDR, 0x0, s->hmap_hardcoded_offset,
@@ -311,8 +311,19 @@ apple_baseband_device_print_context_info(AppleBasebandDeviceState *s)
             return;
         }
 
-        assert_cmpuint(s->baseband_context0.version, ==, 0x1);
-        assert_cmpuint(s->baseband_context0.size, ==, 0x68);
+        /*
+         * Both fields come out of guest memory and the second one is the
+         * length of the DMA read just below, straight into this fixed-size
+         * struct -- so it has to be checked for real.
+         */
+        if (s->baseband_context0.version != 0x1 ||
+            s->baseband_context0.size != sizeof(s->baseband_context0)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: bad context header: version 0x%x size 0x%x\n",
+                          __func__, s->baseband_context0.version,
+                          s->baseband_context0.size);
+            return;
+        }
 
         if (!apple_baseband_dma_read_ptr(s, s->context_addr,
                                          s->baseband_context0.size,
@@ -1216,8 +1227,8 @@ static void apple_baseband_device_qdev_reset_hold(Object *obj, ResetType type)
         s->image_ptr = NULL;
     }
     s->baseband_context0 = (baseband_context0_t){ 0 };
-    assert_cmpuint(sizeof(s->baseband_context0), ==, 0x68);
-    assert_cmpuint(sizeof(custom_baseband0_t), ==, 60);
+    QEMU_BUILD_BUG_ON(sizeof(baseband_context0_t) != 0x68);
+    QEMU_BUILD_BUG_ON(sizeof(custom_baseband0_t) != 60);
 
     // TODO: pcie_cap_slot_reset can and will silently revert
     // set_power/set_enable when it's being done here

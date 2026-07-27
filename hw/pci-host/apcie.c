@@ -190,8 +190,26 @@ static void apple_pcie_port_msi_write(void *opaque, hwaddr addr, uint64_t data,
     // int msi_intr_index = 0;
     ////int msi_intr_index = 1;
     // int msi_intr_index = data;
-    int msi_intr_index = data % 8;
-    assert_cmpuint(msi_intr_index, <, APPLE_PCIE_NUM_MSI_BANKS);
+    /*
+     * `data` is the MSI data word the ENDPOINT writes, i.e. whatever the guest
+     * programmed into that endpoint's MSI capability, OR'd with the vector
+     * number. It is not ours to trust: a second vector, another endpoint or a
+     * different iOS build lands on a bank other than 0. Each port owns eight
+     * AIC lines (the DT gives every pci-bridge #msi-vectors = 8 and
+     * AppleT803xPCIePort::configMSIRange @0xfffffff008c09154 programs 0x124 =
+     * 0x31 for eight), so anything outside that is a guest error and is
+     * dropped rather than indexed with.
+     */
+    unsigned msi_intr_index = data % 8;
+
+    if (msi_intr_index >= APPLE_PCIE_NUM_MSI_BANKS) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: MSI data 0x%" PRIx64 " selects bank %u, only %d "
+                      "exist\n",
+                      __func__, data, msi_intr_index,
+                      APPLE_PCIE_NUM_MSI_BANKS);
+        return;
+    }
 
 #if 0
     port->msi.intr[msi_intr_index].status |=
@@ -261,7 +279,9 @@ void apple_pcie_port_temp_lower_msi_irq(ApplePCIEPort *port, int msi_intr_index)
     DPRINTF("%s: temporary function: bus_nr: %d ; msi_intr_index: %d\n",
             __func__, bus_nr, msi_intr_index);
 
-    assert_cmpuint(msi_intr_index, <, APPLE_PCIE_NUM_MSI_BANKS);
+    if (msi_intr_index < 0 || msi_intr_index >= APPLE_PCIE_NUM_MSI_BANKS) {
+        return;
+    }
 
     qemu_set_irq(host->msi_irqs[bus_nr * 8 + msi_intr_index], 0);
 }
@@ -532,6 +552,14 @@ static uint64_t apple_pcie_root_common_read(void *opaque, hwaddr addr,
     ApplePCIEHost *host = opaque;
     uint32_t val = 0;
 
+    if (addr + size > APCIE_COMMON_REGS_LENGTH) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: read past the register file @ 0x" HWADDR_FMT_plx
+                      "\n",
+                      __func__, addr);
+        return 0;
+    }
+
     switch (addr) {
     case 0x0:
         // break;
@@ -578,6 +606,15 @@ static void apple_pcie_root_common_write(void *opaque, hwaddr addr,
 
     DPRINTF("%s: WRITE @ 0x" HWADDR_FMT_plx " value: 0x" HWADDR_FMT_plx "\n",
             __func__, addr, data);
+
+    if (addr + size > APCIE_COMMON_REGS_LENGTH) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: write past the register file @ 0x" HWADDR_FMT_plx
+                      "\n",
+                      __func__, addr);
+        return;
+    }
+
     switch (addr) {
     case 0x0:
         // break;
@@ -1794,7 +1831,12 @@ static void apple_pcie_map_mmio_windows(ApplePCIEHost *host, AppleDTNode *node)
     }
 
     entries = prop->len / (7 * sizeof(uint32_t));
-    assert_cmpuint(entries, <=, APCIE_MAX_MMIO_WINDOWS);
+    if (entries > APCIE_MAX_MMIO_WINDOWS) {
+        error_setg(&error_fatal,
+                   "apcie: the ranges property describes %u windows, only"
+                   " %d are modelled",
+                   entries, APCIE_MAX_MMIO_WINDOWS);
+    }
     cells = (const uint32_t *)prop->data;
 
     for (i = 0; i < entries; i++) {
@@ -1905,7 +1947,12 @@ SysBusDevice *apple_pcie_from_node(AppleDTNode *node, uint32_t chip_id)
     }
     apple_pcie_map_mmio_windows(host, node);
 
-    assert_cmpuint(reg[common_index * 2 + 1], <=, APCIE_COMMON_REGS_LENGTH);
+    if (reg[common_index * 2 + 1] > APCIE_COMMON_REGS_LENGTH) {
+        error_setg(&error_fatal,
+                   "apcie: the root_common window is 0x%" PRIx64 " bytes, more"
+                   " than the 0x%x the register file models",
+                   reg[common_index * 2 + 1], APCIE_COMMON_REGS_LENGTH);
+    }
 
     memory_region_init_io(&host->root_cfg, OBJECT(host),
                           &apple_pcie_root_conf_ops, host, "root_cfg",

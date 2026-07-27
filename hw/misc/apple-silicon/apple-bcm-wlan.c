@@ -1247,7 +1247,15 @@ static void apple_bcm_wlan_publish_shared_info(AppleBCMWLANDeviceState *s)
 static uint8_t *apple_bcm_wlan_tcm(AppleBCMWLANDeviceState *s, uint32_t addr,
                                    uint32_t len)
 {
-    if (addr < BCM_MEM_FW_RAM_BASE || addr + len > BCM_MEM_FW_RAM_END) {
+    /*
+     * Both addr and len come from BAR2, which is plain guest-writable RAM, so
+     * the sum has to be computed wide: "addr + len" is unsigned int arithmetic
+     * and wraps, which let an address just below 4 GiB satisfy both halves of
+     * the test and return a pointer gigabytes past the mapping.
+     */
+    uint64_t end = (uint64_t)addr + len;
+
+    if (addr < BCM_MEM_FW_RAM_BASE || end > BCM_MEM_FW_RAM_END) {
         return NULL;
     }
     return memory_region_get_ram_ptr(&s->bar2) + addr;
@@ -2644,6 +2652,13 @@ static void apple_bcm_wlan_handle_ioctl_req(AppleBCMWLANDeviceState *s,
         if (!apple_bcm_wlan_dma_read(s, in_addr, inlen, in)) {
             inlen = 0;
         }
+    }
+    if (in == NULL) {
+        /*
+         * Nothing was read, so there is no input however long the request
+         * claims it is -- the iovar-name scan below walks `in` for inlen bytes.
+         */
+        inlen = 0;
     }
 
     outmax = MIN(outlen_req, resp.len);

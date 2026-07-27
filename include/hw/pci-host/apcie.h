@@ -74,8 +74,7 @@ typedef struct ApplePCIEMSI {
  */
 #define APPLE_PCIE_MSI_ASSERT_NS (500 * 1000)
 
-#define APPLE_PCIE_NUM_MSI_BANKS 1
-    // #define APPLE_PCIE_NUM_MSI_BANKS 8
+#define APPLE_PCIE_NUM_MSI_BANKS 8
 
     ApplePCIEMSIBank intr[APPLE_PCIE_NUM_MSI_BANKS];
 } ApplePCIEMSI;
