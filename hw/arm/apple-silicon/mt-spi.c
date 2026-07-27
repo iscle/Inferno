@@ -481,7 +481,32 @@ typedef struct {
  * in another drifts apart the moment either changes.
  */
 #define MT_FAMILY_ID_LEN (1)
-#define MT_BASIC_DEVICE_INFO_LEN (5)
+/*
+ * HID report 0xD3, the basic device information:
+ *
+ *     u8  endianness      1 little, 2 big
+ *     u8  sensor rows
+ *     u8  sensor columns
+ *     u16 bcdVersion      big-endian and unaligned, whatever the field above
+ *     u8  reserved[3]
+ *     u32 max packet size in the endianness the first byte declares
+ *
+ * AppleMultitouchDevice::decodeDeviceProperty() accepts anything from five
+ * bytes up, which is what this controller used to send; the last four are read
+ * only once at least twelve arrive. They become the device's "Max Packet Size"
+ * property, and maxFrameSize() - which sizes the buffers a MultitouchSupport
+ * client is handed - is exactly that property, or 1024 when it is missing.
+ *
+ * 1024 is what this device used to get by default, and it was never true of it:
+ * nothing here fragments a report across link-layer frames, so the largest one
+ * it can put on the wire is a single frame's payload less the HID header ahead
+ * of the report and the CRC behind it. Reporting that is what makes the
+ * property honest, and it costs nothing - a touch frame is 48 bytes, and the
+ * one consumer of the number multiplies it before allocating.
+ */
+#define MT_BASIC_DEVICE_INFO_LEN (12)
+#define MT_MAX_PACKET_SIZE \
+    (LL_PAYLOAD_MAX - sizeof(AppleMTSPIHIDHeader) - sizeof(uint16_t))
 #define MT_SENSOR_SURFACE_DESC_LEN (16)
 #define MT_SENSOR_REGION_PARAM_LEN (6)
 /// One region count byte followed by three seven-byte region descriptors.
@@ -1175,6 +1200,12 @@ static void apple_mt_spi_handle_get_feature(AppleMTSPIState *s,
         apple_mt_spi_buf_push_byte(&packet->buf, MT_ROWS);
         apple_mt_spi_buf_push_byte(&packet->buf, MT_COLUMNS);
         apple_mt_spi_buf_push_word(&packet->buf, MT_BCD_VER);
+        // Reserved, and skipped by the parser on its way to the last field.
+        apple_mt_spi_buf_push_byte(&packet->buf, 0);
+        apple_mt_spi_buf_push_word(&packet->buf, 0);
+        // Little-endian because the first byte of this report says so: the
+        // parser byte-swaps this field only when that byte reads 2.
+        apple_mt_spi_buf_push_dword(&packet->buf, MT_MAX_PACKET_SIZE);
         break;
     case HID_REPORT_SENSOR_SURFACE_DESC:
         apple_mt_spi_buf_ensure_capacity(&packet->buf,
@@ -1824,6 +1855,10 @@ static void apple_mt_instance_init(Object *obj)
     QEMU_BUILD_BUG_ON(sizeof(AppleMTSPIHIDHeader) != 8);
     QEMU_BUILD_BUG_ON(sizeof(AppleMTSPIFrameHeader) != 27);
     QEMU_BUILD_BUG_ON(sizeof(AppleMTSPIPath) != 20);
+    // HID report 0xD3 promises the host that no report exceeds this, and the
+    // transport statistics are by far the longest one this controller sends.
+    QEMU_BUILD_BUG_ON(MT_TRANSPORT_STATS_LEN > MT_MAX_PACKET_SIZE);
+    QEMU_BUILD_BUG_ON(1 + MT_TOUCH_FRAME_LEN > MT_MAX_PACKET_SIZE);
 
     qdev_init_gpio_out_named(DEVICE(s), &s->irq, APPLE_MT_SPI_IRQ, 1);
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, apple_mt_spi_timer_tick, s);
