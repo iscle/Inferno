@@ -926,105 +926,6 @@ static SMCResult smc_key_gP09_write(SMCKey *key, SMCKeyData *data,
     }
 }
 
-static SMCResult smc_key_gP11_read(SMCKey *key, SMCKeyData *data,
-                                   const void *in, uint8_t in_length)
-{
-    uint32_t value;
-    uint32_t tmpval0;
-
-    if (in == NULL) {
-        return SMC_RESULT_BAD_ARGUMENT_ERROR;
-    }
-
-    value = ldl_le_p(in);
-
-    uint32_t *data0 = data->data;
-    DPRINTF("%s: data->data: %p ; data0[0]: 0x%08x\n", __func__, data->data,
-            data0[0]);
-
-    DPRINTF("%s: key->info.size: 0x%08x ; length: 0x%08x\n", __func__,
-            key->info.size, length);
-    DPRINTF("%s: value: 0x%08x ; length: 0x%08x\n", __func__, value, length);
-
-    /*
-     * gP11 is the AMFM (Wi-Fi / bluetooth-pcie bridge) PMU function key. It
-     * speaks the same AppleSMCPMU command protocol as gP09 (the baseband's
-     * key), so accept the same generic commands. Answering these instead of
-     * failing every one matters: AppleBCMWLANPortInterfacePCIeAMFM's port
-     * control polls this key, and an error reply leaves it spinning until it
-     * times out.
-     */
-    switch (value) {
-    case 0x02000000: {
-        // function-pmu_exton
-        DPRINTF("%s: pmu_exton\n", __func__);
-        return SMC_RESULT_SUCCESS;
-    }
-    case 0x06000000: {
-        // AppleSMCPMU::getVectorType; 0x0/0x1 mean "Level", anything else
-        // means "Edge" (mirrors gP09).
-        DPRINTF("%s: getVectorType\n", __func__);
-        tmpval0 = 0x2;
-        stl_le_p(data->data, tmpval0);
-        return SMC_RESULT_SUCCESS;
-    }
-    default:
-        DPRINTF("%s: UNKNOWN VALUE: 0x%08x\n", __func__, value);
-        return SMC_RESULT_BAD_FUNC_PARAMETER;
-    }
-}
-
-static SMCResult smc_key_gP11_write(SMCKey *key, SMCKeyData *data,
-                                    const void *in, uint8_t in_length)
-{
-    uint32_t value;
-
-    AppleBasebandState *baseband = key->opaque;
-    ApplePCIEPort *port = baseband->device->port;
-    ApplePCIEHost *host = port->host;
-    ApplePCIEState *pcie = host->pcie;
-    PCIDevice *port_pci_dev = PCI_DEVICE(port);
-
-    if (in == NULL || in_length != key->info.size) {
-        return SMC_RESULT_BAD_ARGUMENT_ERROR;
-    }
-
-    value = ldl_le_p(in);
-
-    // Do not use data->data here, as it only contains the data last written to
-    // by the read function (smc_key_gP09_read)
-
-    DPRINTF("%s: value: 0x%08x ; length: 0x%08x\n", __func__, value, length);
-
-    /*
-     * Same AppleSMCPMU command set as gP09, for the AMFM (Wi-Fi /
-     * bluetooth-pcie bridge) port. The port itself is brought up through the
-     * apcie registers, so these only have to be acknowledged.
-     */
-    switch (value) {
-    case 0x04000000: {
-        // disableVectorHard/IENA
-        DPRINTF("%s: disableVectorHard\n", __func__);
-        return SMC_RESULT_SUCCESS;
-    }
-    case 0x04000001: {
-        // enableVector/IENA
-        DPRINTF("%s: enableVector\n", __func__);
-        return SMC_RESULT_SUCCESS;
-    }
-    case 0x07000000:
-    case 0x07000001: {
-        // function-pmu_exton_config; bit0 selects the pull-down override.
-        DPRINTF("%s: pmuExtOnConfigGated/pmu_exton_config enable: %d\n",
-                __func__, (value & 1) != 0);
-        return SMC_RESULT_SUCCESS;
-    }
-    default:
-        DPRINTF("%s: UNKNOWN VALUE: 0x%08x\n", __func__, value);
-        return SMC_RESULT_BAD_FUNC_PARAMETER;
-    }
-}
-
 SysBusDevice *apple_baseband_create(AppleDTNode *node, PCIBus *pci_bus,
                                     ApplePCIEPort *port)
 {
@@ -1067,10 +968,15 @@ SysBusDevice *apple_baseband_create(AppleDTNode *node, PCIBus *pci_bus,
     apple_smc_add_key_func(smc, 'gP09', 4, SMC_KEY_TYPE_UINT32,
                            SMC_ATTR_LE | SMC_ATTR_UNK_0x20, s,
                            smc_key_gP09_read, smc_key_gP09_write);
-    apple_smc_add_key_func(smc, 'gP11', 4, SMC_KEY_TYPE_UINT32,
-                           SMC_ATTR_LE | SMC_ATTR_UNK_0x20, s,
-                           smc_key_gP11_read, smc_key_gP11_write);
-    // TODO: gP09/gP11 are 0xf0, so gP07 should be as well.
+    /*
+     * 'gP11' is NOT the baseband's: /device-tree/amfm/function-reg_on is the
+     * only reference to it, so it belongs to the Wi-Fi / bluetooth-pcie combo
+     * part and is registered by apple-bcm-wlan.c. Registering it here too made
+     * apple_smc_insert_key() fail with error_fatal ("duplicate SMC key") the
+     * moment ENABLE_BASEBAND was turned back on, and the copy that used to
+     * live here rejected the only two values WL_REG_ON actually sends.
+     */
+    // TODO: gP09 is 0xf0, so gP07 should be as well.
     // TODO: missing, according to t8015, gP01/gp05/gp0e/gp0f/gp12/gp13/gp15
 
     return sbd;
