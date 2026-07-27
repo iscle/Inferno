@@ -16,15 +16,16 @@
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  *
- * PHASE 1 status: this is a *stub* endpoint. It presents plausible PCI config
- * space plus the chip-recognition / backplane access layer -- the four
- * remappable BAR0 window registers in config space, the eight 4 KiB BAR0
- * windows they steer, and enough of ChipCommon, the GCI core, the PCIe2 core
- * and the AI wrappers for iOS 14's AppleBCMWLANBusInterfacePCIe driver to
- * probe, match and get through checkHardware()/prepareHardware(). The msgbuf /
- * firmware-download / ring protocol is NOT implemented yet (Phase 2). Every
- * unhandled access is logged so the exact host access pattern can be observed
- * and implemented incrementally.
+ * What is modelled: PCI configuration space, the chip-recognition / backplane
+ * access layer (the remappable BAR0 window registers, the 4 KiB BAR0 windows
+ * they steer, ChipCommon, the GCI core, the PCIe2 core and the AI wrappers),
+ * the firmware-download handshake, the msgbuf ring protocol, and a synthetic
+ * access point: the guest scans, associates, and carries 802.3 frames over the
+ * rings to whatever netdev is attached. There is no radio, no real firmware
+ * and no cryptography -- association is granted at the event level.
+ *
+ * Every unhandled access is logged (LOG_UNIMP) so the host access pattern of a
+ * path we do not model yet can be observed.
  */
 
 #include "qemu/osdep.h"
@@ -163,15 +164,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMWLANState, APPLE_BCM_WLAN)
      ((BCM4378_CHIP_PACKAGE & 0xF) << 20))
 
 /*
- * ChipCommon capabilities (offset 0x04), a.k.a. the SROM escape hatch.
+ * ChipCommon capabilities (offset 0x04).
  *
- * Bit 30 (CC_CAP_SROM) is the ONLY bit AppleBCMWLAN looks at, and we report it
- * CLEAR on purpose: readChipProvisioningData() then bails out immediately with
- * "Chip does not support SPROM" instead of running the SROM/OTP read sequence
- * (ChipCommon 0x190/0x194/0x198, 0x400 words) and parsing the result as
- * Broadcom CIS tuples with a valid checksum, SROM version 0x10 and a signature
- * word -- none of which we model. The traced call site treats the failure as
- * non-fatal (it only picks between two constants).
+ * Reported as zero. Bit 30 (CC_CAP_SROM) is the one bit that would matter, and
+ * only to AppleBCMWLANBusInterfacePCIe::readChipProvisioningData -- which an
+ * exhaustive scan of __TEXT_EXEC (direct branches plus PAC vtable dispatch by
+ * discriminator) shows has no callers at all on this build. Neither it nor
+ * validateChipProvisioningData ever runs, so nothing here is load-bearing and
+ * the SROM read sequence at ChipCommon 0x190/0x194/0x198 need not be modelled.
+ * The provisioning data the driver DOES read is the OTP CIS tuple stream on
+ * ChipCoreID 8, further down this file.
  */
 #define BCM_CHIPCOMMON_CAP_SROM (1U << 30)
 #define BCM_CHIPCOMMON_CAPABILITIES_VALUE (0x00000000U & ~BCM_CHIPCOMMON_CAP_SROM)
@@ -1551,6 +1553,34 @@ static void apple_bcm_wlan_d2h_ctrl_post(AppleBCMWLANDeviceState *s,
 }
 
 /*
+ * Would `count` more items fit on this D2H ring?
+ *
+ * Callers pop a host-posted buffer before they build the completion that
+ * announces it, and a buffer popped for a completion that is then refused is
+ * a buffer the host never gets back: the pool bleeds until the driver reports
+ * "rx buffer request fail" or stalls its outbound queue. So ask first.
+ */
+static bool apple_bcm_wlan_d2h_has_room(AppleBCMWLANDeviceState *s,
+                                        AppleBCMWLANRing *ring, unsigned size,
+                                        unsigned count)
+{
+    uint32_t read_index, used;
+
+    if (!ring->valid || ring->len_items < size) {
+        return false;
+    }
+    if (!apple_bcm_wlan_read_index(s, s->d2h_r_idx_addr, ring->id,
+                                   &read_index)) {
+        /* No readable index: d2h_post does not gate on it either. */
+        return true;
+    }
+    read_index %= ring->max_item;
+    used = (ring->index + ring->max_item - read_index) % ring->max_item;
+    /* One slot always stays free as the full marker. */
+    return ring->max_item - 1 - used >= count;
+}
+
+/*
  * chanspec_t, the D11AC encoding used by every part from the 4350 onwards:
  * the channel number in the low byte, the bandwidth and (for wide channels)
  * the position of the control sub-band in the middle, and the band on top.
@@ -1738,6 +1768,13 @@ static void apple_bcm_wlan_post_event_on(AppleBCMWLANDeviceState *s,
     if (s->event_count == 0) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "%s: no event buffer posted, dropping event %u\n",
+                      __func__, event_type);
+        return;
+    }
+    if (!apple_bcm_wlan_d2h_has_room(s, &s->d2h_ctrl, BCM_D2H_CTRL_ITEM_SIZE,
+                                     1)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: no room to report event %u, keeping the buffer\n",
                       __func__, event_type);
         return;
     }
@@ -2627,6 +2664,20 @@ static void apple_bcm_wlan_handle_ioctl_req(AppleBCMWLANDeviceState *s,
     int status;
 
     /*
+     * The acknowledgement and the completion are two separate items on the
+     * same ring. Make sure both will fit before starting: consuming the
+     * response buffer for a completion the ring then refuses is exactly how a
+     * command goes missing and the driver reports an Outbound Queue Stall.
+     */
+    if (!apple_bcm_wlan_d2h_has_room(s, &s->d2h_ctrl, BCM_D2H_CTRL_ITEM_SIZE,
+                                     2)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: control ring full, dropping cmd %u\n", __func__,
+                      cmd);
+        return;
+    }
+
+    /*
      * Acknowledge the request first. The ACK releases the host's request
      * buffer and moves the command from the "to send" to the "in flight"
      * queue; the completion below then finishes it.
@@ -3089,12 +3140,15 @@ static ssize_t apple_bcm_wlan_receive(NetClientState *nc, const uint8_t *buf,
                       __func__, size, rx.len);
         return size;
     }
-    s->rx_head = (s->rx_head + 1) % BCM_MAX_RX_BUFS;
-    s->rx_count--;
-
+    if (!apple_bcm_wlan_d2h_has_room(s, &s->d2h_rx, BCM_D2H_RX_ITEM_SIZE, 1)) {
+        /* Drop the frame, but keep the buffer: it is the host's, not ours. */
+        return size;
+    }
     if (!apple_bcm_wlan_dma_write(s, rx.addr, size, (uint8_t *)buf)) {
         return size;
     }
+    s->rx_head = (s->rx_head + 1) % BCM_MAX_RX_BUFS;
+    s->rx_count--;
 
     memset(cmplt, 0, sizeof(cmplt));
     cmplt[BCM_MSGBUF_HDR_MSGTYPE_OFF] = BCM_MSGBUF_TYPE_RX_CMPLT;
@@ -3195,9 +3249,17 @@ static const MemoryRegionOps bar0_ops = {
  * fails, the manager never reports the chip as up, and the WLAN driver's port
  * enable never happens. The key therefore belongs to this device.
  *
- * The command encoding is the generic AppleSMCPMU one (the same one the
- * baseband's gP07/gP09 keys use): the top byte selects the function and the
- * low bits carry its argument.
+ * The command word is assembled by AppleSMCEmbeddedFunction::callFunction
+ * @0xfffffff0084df94c: it loads the 32-bit constant the device tree gave the
+ * function and then stores the caller's value over the LOW 16 BITS of it
+ * (`ldr w8,[dt_arg]; stur w8,[buf]; ldr w8,[caller]; sturh w8,[buf]`). So the
+ * value seen here is (dt_arg & 0xFFFF0000) | (caller & 0xFFFF), and the top
+ * half is an opaque per-function constant rather than a command selector.
+ * amfm's function-reg_on passes a device-tree argument of 0, so WL_REG_ON
+ * arrives as a literal 0 or 1 -- which is why the 0x00 case below is the one
+ * that matters. (The 0x02/0x04/0x06/0x07 families come from AppleSMCPMU's
+ * interrupt-controller methods, whose device-tree argument is 0x0N000000; no
+ * node on this platform routes them at gP11.)
  */
 static SMCResult apple_bcm_wlan_smc_gP11_read(SMCKey *key, SMCKeyData *data,
                                               const void *in, uint8_t in_length)
