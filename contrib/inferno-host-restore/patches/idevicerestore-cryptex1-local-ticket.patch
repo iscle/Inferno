@@ -1,0 +1,141 @@
+--- a/src/restore.c
++++ b/src/restore.c
+@@ -3661,6 +3661,121 @@
+ 	tss_request_add_cryptex_tags(request, parameters, NULL);
+ 
+ 	plist_free(parameters);
++
++	/*
++	 * Cryptex1 personalisation against an emulated device.
++	 *
++	 * Apple's TSS will not personalise a forged ECID, so tss_request_send()
++	 * returns NULL, the device never receives a FirmwareResponseData for the
++	 * Cryptex1 updater, and the restore dies at install_splat around 95%.
++	 *
++	 * It does not need a genuine ticket. The device side is
++	 * AMAuthInstallUpdaterCryptex1LocalPolicyStitchTicketData -- it *stitches*
++	 * the returned ticket into the local policy, which is ASN.1 assembly rather
++	 * than a signature check -- and the AP kernel's img4 trust evaluation is
++	 * already bypassed. The response only has to be well formed.
++	 *
++	 *   INFERNO_CRYPTEX_DUMP=<dir>   dump the device-generated request and the
++	 *                                assembled TSS request for inspection. The
++	 *                                request carries the six component digests
++	 *                                and the nonce a ticket has to certify.
++	 *   INFERNO_CRYPTEX_TICKET=<f>   synthesise the response in-process from
++	 *                                that request, wrapping this ticket. Doing
++	 *                                it in-process matters: it collapses a probe
++	 *                                cycle from two full restores to one.
++	 *   INFERNO_CRYPTEX_RESPONSE=<f> use a pre-built response plist instead.
++	 *
++	 * See contrib/inferno-host-restore/add_cryptex_objects.py for building the
++	 * ticket the device will accept.
++	 */
++	{
++		const char *dumpdir = getenv("INFERNO_CRYPTEX_DUMP");
++		if (dumpdir) {
++			char path[1024];
++			snprintf(path, sizeof(path), "%s/cryptex-%s-request.plist", dumpdir, s_updater_name);
++			plist_write_to_file(request, path, PLIST_FORMAT_XML, 0);
++			snprintf(path, sizeof(path), "%s/cryptex-%s-arguments.plist", dumpdir, s_updater_name);
++			plist_write_to_file(arguments, path, PLIST_FORMAT_XML, 0);
++			logger(LL_INFO, "dumped %s request/arguments to %s\n", s_updater_name, dumpdir);
++		}
++	}
++	/*
++	 * INFERNO_CRYPTEX_TICKET=<file>: synthesise the response in-process from the
++	 * device's own request. Echoing the device-generated nonces back is the part
++	 * most likely to decide it, and doing it here avoids a ~90 minute round trip
++	 * through a full ASR write just to author a response file.
++	 */
++	{
++		const char *tfile = getenv("INFERNO_CRYPTEX_TICKET");
++		if (tfile) {
++			FILE *tf = fopen(tfile, "rb");
++			if (!tf) {
++				logger(LL_ERROR, "INFERNO_CRYPTEX_TICKET: cannot open %s\n", tfile);
++				plist_free(request);
++				return NULL;
++			}
++			fseek(tf, 0, SEEK_END);
++			long tlen = ftell(tf);
++			fseek(tf, 0, SEEK_SET);
++			char *tbuf = malloc(tlen);
++			if (!tbuf || fread(tbuf, 1, tlen, tf) != (size_t)tlen) {
++				logger(LL_ERROR, "INFERNO_CRYPTEX_TICKET: cannot read %s\n", tfile);
++				fclose(tf); free(tbuf); plist_free(request); return NULL;
++			}
++			fclose(tf);
++
++			response = plist_new_dict();
++			plist_t st = plist_new_dict();
++			plist_dict_set_item(st, "code", plist_new_uint(0));
++			plist_dict_set_item(st, "message", plist_new_string("SUCCESS"));
++			plist_dict_set_item(response, "Status", st);
++
++			/* Echo the device's own nonce/identity fields back. */
++			/*
++			 * Key names taken from a captured DeviceGeneratedRequest -- the
++			 * cryptex ones contain commas ("Cryptex1,Nonce"), so a list of
++			 * comma-less guesses would silently echo nothing.
++			 */
++			static const char *echo[] = {
++				"Cryptex1,Nonce", "Cryptex1,NonceDomain", "Cryptex1,ChipID",
++				"Cryptex1,Type", "Cryptex1,SubType", "Cryptex1,ProductClass",
++				"Cryptex1,UDID", "Cryptex1,Version", "Cryptex1,ProductionMode",
++				"Cryptex1,PreauthorizationVersion", "ApSecurityDomain",
++				"UniqueBuildID",
++				"ApNonce", "SepNonce", "ApECID", "ApChipID", "ApBoardID",
++				"ApProductionMode", "ApSecurityMode", "Nonce", NULL
++			};
++			plist_t dgr = plist_dict_get_item(arguments, "DeviceGeneratedRequest");
++			for (int e = 0; echo[e]; e++) {
++				plist_t v = NULL;
++				if (dgr) v = plist_dict_get_item(dgr, echo[e]);
++				if (!v) v = plist_dict_get_item(p_info, echo[e]);
++				if (v) plist_dict_set_item(response, echo[e], plist_copy(v));
++			}
++
++			plist_dict_set_item(response, response_ticket,
++			                    plist_new_data(tbuf, tlen));
++			free(tbuf);
++			plist_free(request);
++			logger(LL_INFO, "synthesised local %s response (ticket %ld bytes, key '%s')\n",
++			       s_updater_name, tlen, response_ticket);
++			goto have_response;
++		}
++	}
++	{
++		const char *rfile = getenv("INFERNO_CRYPTEX_RESPONSE");
++		if (rfile) {
++			response = NULL;
++			plist_read_from_file(rfile, &response, NULL);
++			plist_free(request);
++			if (response == NULL) {
++				logger(LL_ERROR, "INFERNO_CRYPTEX_RESPONSE set but could not read %s\n", rfile);
++				return NULL;
++			}
++			logger(LL_INFO, "using local %s response from %s\n", s_updater_name, rfile);
++			goto have_response;
++		}
++	}
+ 
+ 	logger(LL_INFO, "Sending %s TSS request...\n", s_updater_name);
+ 	response = tss_request_send(request, client->tss_url);
+@@ -3670,6 +3785,8 @@
+ 		return NULL;
+ 	}
+ 
++have_response:
++
+ 	if (plist_dict_get_item(response, response_ticket)) {
+ 		logger(LL_INFO, "Received %s\n", response_ticket);
+ 	} else {
+@@ -5429,6 +5546,7 @@
+ 	plist_dict_set_item(opts, "SupportedDataTypes", restore_supported_data_types());
+ 	plist_dict_set_item(opts, "SupportedMessageTypes", restore_supported_message_types());
+ 
++
+ 	// FIXME: Should be adjusted for update behaviors
+ 	if (client->macos_variant) {
+ 		plist_dict_set_item(opts, "AddSystemPartitionPadding", plist_new_bool(1));

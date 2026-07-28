@@ -18,6 +18,9 @@ GTAGS
 *.depend_raw
 *.swp
 *.patch
+# ...but contrib/inferno-host-restore/patches/ exists to carry them, and
+# build-host-tools.sh applies them, so those are part of the tree.
+!contrib/inferno-host-restore/patches/*.patch
 *.gcov
 .cache/
 .DS_Store

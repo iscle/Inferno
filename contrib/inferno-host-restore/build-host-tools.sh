@@ -77,6 +77,18 @@ for entry in "${REPOS[@]}"; do
             && echo "    applied idevicerestore.patch" || echo "    (patch already applied or N/A)"
     fi
 
+    # Cryptex1 personalisation for an emulated device: Apple's TSS will not
+    # personalise a forged ECID, so let a locally built ticket be supplied.
+    # See patches/idevicerestore-cryptex1-local-ticket.patch for the reasoning.
+    if [ "$name" = "idevicerestore" ]; then
+        cx="$HERE/patches/idevicerestore-cryptex1-local-ticket.patch"
+        if [ -f "$cx" ] && patch -p1 -N --dry-run < "$cx" >/dev/null 2>&1; then
+            patch -p1 -N < "$cx" >/dev/null && echo "    applied cryptex1 local-ticket patch"
+        else
+            echo "    (cryptex1 local-ticket patch already applied or N/A)"
+        fi
+    fi
+
     ./autogen.sh --prefix="$PREFIX" $(extra_flags "$name") \
         || ./configure --prefix="$PREFIX" $(extra_flags "$name") \
         || { echo "configure failed for $name"; exit 1; }
