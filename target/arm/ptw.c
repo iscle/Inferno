@@ -1012,9 +1012,11 @@ static int simple_ap_to_rw_prot(CPUARMState *env, ARMMMUIdx mmu_idx, int ap)
  * @xn:      XN (execute-never) bits
  * @pxn:     PXN (privileged-execute-never) bits
  * @guarded: TRUE if accessing from GXF
+ * @bank:    Permission bank the page belongs to (0 = TTBR0, 1 = TTBR1)
  */
 static inline int
-pte_to_sprr_prot_is_guarded(CPUARMState *env, int ap, int xn, int pxn, bool guarded)
+pte_to_sprr_prot_is_guarded(CPUARMState *env, int ap, int xn, int pxn,
+                            bool guarded, int bank)
 {
     int el;
     int sprr_idx;
@@ -1030,7 +1032,17 @@ pte_to_sprr_prot_is_guarded(CPUARMState *env, int ap, int xn, int pxn, bool guar
     assert(el < 2);
 
     sprr_idx = ((ap << 2) | (xn << 1) | pxn) & 0xf;
-    sprr_perm = env->sprr.sprr_el_br_el1[el][el];
+    /*
+     * The bank is selected by the page, not by the accessing exception level:
+     * bank 0 holds the permissions for TTBR0 (user) pages and bank 1 those for
+     * TTBR1 (kernel) pages. Selecting the bank by exception level instead meant
+     * EL1 always read bank 1, so XNU's user-access window was never observed --
+     * user_access_enable()/disable() (inlined around the copies in copyio) open
+     * and close the window by rewriting SPRR_EL1BR0, toggling exactly the one
+     * nibble that makes a user page writable from EL1 -- and every kernel write
+     * to user memory was refused.
+     */
+    sprr_perm = env->sprr.sprr_el_br_el1[el][bank];
 
     attr = SPRR_EXTRACT_IDX_ATTR(sprr_perm, sprr_idx);
     prot = 0;
@@ -1089,11 +1101,13 @@ pte_to_sprr_prot_is_guarded(CPUARMState *env, int ap, int xn, int pxn, bool guar
  * @ap:      The 2-bit simple AP (AP[2:1])
  * @xn:      XN (execute-never) bits
  * @pxn:     PXN (privileged-execute-never) bits
+ * @bank:    Permission bank the page belongs to (0 = TTBR0, 1 = TTBR1)
  */
 static inline int
-pte_to_sprr_prot(CPUARMState *env, int ap, int xn, int pxn)
+pte_to_sprr_prot(CPUARMState *env, int ap, int xn, int pxn, int bank)
 {
-    return pte_to_sprr_prot_is_guarded(env, ap, xn, pxn, arm_is_guarded(env));
+    return pte_to_sprr_prot_is_guarded(env, ap, xn, pxn, arm_is_guarded(env),
+                                       bank);
 }
 
 static bool get_phys_addr_v5(CPUARMState *env, S1Translate *ptw,
@@ -2217,8 +2231,10 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
 
         user_rw = simple_ap_to_rw_prot_is_user(ap, true);
         if (arm_is_sprr_enabled(env)) {
-            prot_rw = pte_to_sprr_prot(env, ap, xn, pxn) & (PAGE_READ | PAGE_WRITE);
-            xn = pxn = !(pte_to_sprr_prot(env, ap, xn, pxn) & PAGE_EXEC);
+            prot_rw = pte_to_sprr_prot(env, ap, xn, pxn, param.select)
+                      & (PAGE_READ | PAGE_WRITE);
+            xn = pxn = !(pte_to_sprr_prot(env, ap, xn, pxn, param.select)
+                         & PAGE_EXEC);
         } else {
             prot_rw = simple_ap_to_rw_prot_is_user(ap, false);
         }
@@ -2234,7 +2250,7 @@ static bool get_phys_addr_lpae(CPUARMState *env, S1Translate *ptw,
             if (arm_is_sprr_enabled(env) && !arm_is_guarded(env)) {
                 if (!(result->f.prot & (1 << access_type))) {
                     int gl_prot = pte_to_sprr_prot_is_guarded(env, ap, xn,
-                                                                 pxn, true);
+                                                    pxn, true, param.select);
                     if (gl_prot & (1 << access_type)) {
                         fi->type = ARMFault_GXF_Abort;
                         goto do_fault;

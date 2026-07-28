@@ -172,7 +172,37 @@ static void sprr_perm_el0_write(CPUARMState *env, const ARMCPRegInfo *ri,
 
     raw_write(env, ri, perm);
 
+    /* See sprr_perm_el1_write(); the EL0 banks only affect EL0 translations. */
     tlb_flush_by_mmuidx(env_cpu(env), ARMMMUIdxBit_E10_0);
+}
+
+/* Write handler for the EL0BR1 bank, which carries no MPRR masking. */
+static void sprr_perm_el0br1_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                                   uint64_t value)
+{
+    raw_write(env, ri, value);
+    tlb_flush_by_mmuidx(env_cpu(env), ARMMMUIdxBit_E10_0);
+}
+
+static void sprr_perm_el1_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                                uint64_t value)
+{
+    raw_write(env, ri, value);
+    /*
+     * SPRR remaps what each descriptor's AP/XN encoding *means*, so changing a
+     * bank changes the effective permissions of every page already translated,
+     * without any page-table edit. The guest therefore has no reason to issue a
+     * TLBI, and cached translations must be dropped here or they keep the old
+     * permissions. XNU relies on this: user_access_enable()/user_access_disable()
+     * open and close the window around every copyin/copyout by rewriting
+     * SPRR_EL1BR0 and nothing else.
+     *
+     * Only EL1 translations of the EL1&0 regime can be affected, so flush those
+     * rather than the whole TLB -- this runs twice per copy, and dropping EL0's
+     * translations too would be a serious throughput regression.
+     */
+    tlb_flush_by_mmuidx(env_cpu(env),
+                        ARMMMUIdxBit_E10_1 | ARMMMUIdxBit_E10_1_PAN);
 }
 
 static uint64_t gxf_cpreg_raw_read(CPUARMState *env, const ARMCPRegInfo *ri)
@@ -541,6 +571,7 @@ static const ARMCPRegInfo apple_a13_gxf_cp_reginfo[] = {
         .opc2 = 6,
         .access = PL1_RW | PL0_R,
         .resetvalue = 0,
+        .writefn = sprr_perm_el0br1_write,
         .fieldoffset = offsetof(CPUARMState, sprr.sprr_el_br_el1[0][1]),
     },
     {
@@ -554,6 +585,7 @@ static const ARMCPRegInfo apple_a13_gxf_cp_reginfo[] = {
         .opc2 = 7,
         .access = PL1_RW,
         .resetvalue = 0,
+        .writefn = sprr_perm_el1_write,
         .fieldoffset = offsetof(CPUARMState, sprr.sprr_el_br_el1[1][0]),
     },
     {
@@ -568,7 +600,7 @@ static const ARMCPRegInfo apple_a13_gxf_cp_reginfo[] = {
         .access = PL1_RW,
         .resetvalue = 0,
         .readfn = raw_read,
-        .writefn = raw_write,
+        .writefn = sprr_perm_el1_write,
         .fieldoffset = offsetof(CPUARMState, sprr.sprr_el_br_el1[1][1]),
     },
     {
