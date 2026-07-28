@@ -243,9 +243,10 @@ static void t8030_create_s3c_uart(const AppleT8030MachineState *t8030,
     dev->id = g_strdup(name);
 }
 
-static void t8030_patch_kernel(MachoHeader64 *header, uint32_t build_version)
+static void t8030_patch_kernel(MachoHeader64 *header, uint32_t build_version,
+                               const char *root_snapshot_name)
 {
-    ck_patch_kernel(header);
+    ck_patch_kernel(header, root_snapshot_name);
 }
 
 static bool t8030_check_panic(AppleT8030MachineState *t8030)
@@ -2956,10 +2957,13 @@ static void t8030_init(MachineState *machine)
 
         g_phys_base = (hwaddr)apple_boot_get_macho_buffer(t8030->kernel);
 
-        t8030_patch_kernel(t8030->kernel, build_version);
+        t8030_patch_kernel(t8030->kernel, build_version,
+                           t8030->root_snapshot_name);
 
         t8030->trustcache = apple_boot_load_trustcache_file(
             t8030->trustcache_filename, &t8030->boot_info.trustcache_size);
+
+        t8030->boot_info.root_snapshot_name = t8030->root_snapshot_name;
 
         if (t8030->ticket_filename != NULL) {
             if (!g_file_get_contents(t8030->ticket_filename,
@@ -3181,6 +3185,7 @@ PROP_GETTER_SETTER(bool, force_dfu);
 PROP_GETTER_SETTER(int, usb_conn_type);
 PROP_STR_GETTER_SETTER(trustcache_filename);
 PROP_STR_GETTER_SETTER(ticket_filename);
+PROP_STR_GETTER_SETTER(root_snapshot_name);
 PROP_STR_GETTER_SETTER(sep_rom_filename);
 PROP_STR_GETTER_SETTER(sep_fw_filename);
 PROP_STR_GETTER_SETTER(securerom_filename);
@@ -3221,6 +3226,14 @@ static void t8030_class_init(ObjectClass *klass, const void *data)
     object_class_property_add_str(klass, "ticket", t8030_get_ticket_filename,
                                   t8030_set_ticket_filename);
     object_class_property_set_description(klass, "ticket", "AP Ticket");
+    object_class_property_add_str(klass, "root-snapshot-name",
+                                  t8030_get_root_snapshot_name,
+                                  t8030_set_root_snapshot_name);
+    object_class_property_set_description(
+        klass, "root-snapshot-name",
+        "APFS snapshot to root from (iOS 16+ seals the system volume and will "
+        "not root from its live filesystem). Read it off the restored image "
+        "with `diskutil apfs listSnapshots`.");
     object_class_property_add_str(klass, "sep-rom", t8030_get_sep_rom_filename,
                                   t8030_set_sep_rom_filename);
     object_class_property_set_description(klass, "sep-rom", "SEP ROM");

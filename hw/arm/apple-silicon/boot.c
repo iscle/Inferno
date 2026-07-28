@@ -565,6 +565,24 @@ void apple_boot_populate_dt(AppleDTNode *root, AppleBootInfo *info,
     apple_dt_set_prop_u64(child, "dram-base", info->dram_base);
     apple_dt_set_prop_u64(child, "dram-size", info->dram_size);
     apple_dt_set_prop_str(child, "firmware-version", "ChefKiss Inferno");
+
+    /*
+     * iOS 16+ roots from an APFS snapshot, and the kernel asks the device tree
+     * for its name first (`fs_lookup_root_snapshot_name`). Without it, the
+     * kernel falls back to rooting from the live filesystem, which a RELEASE
+     * build refuses to do on a sealed volume:
+     *
+     *   apfs_vfsop_mount: failed to find named root snapshot: Need authenticator
+     *   panic: "Rooting from the live fs of a sealed volume is not allowed"
+     *
+     * The name has to match the snapshot that actually exists on the restored
+     * container, so it is supplied rather than invented -- same as the ticket
+     * and the trust cache.
+     */
+    if (info->root_snapshot_name != NULL && *info->root_snapshot_name != '\0') {
+        apple_dt_set_prop_str(child, "root-snapshot-name",
+                              info->root_snapshot_name);
+    }
     apple_dt_set_prop_str(child, "system-firmware-version", QEMU_VERSION);
 
     apple_dt_set_prop_u32(child, "nvram-total-size", info->nvram_size);

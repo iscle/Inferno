@@ -57,6 +57,7 @@ typedef struct {
     AppleVideoArgs video_args;
     char *trustcache_filename;
     char *ticket_filename;
+    char *root_snapshot_name;
     char *sep_rom_filename;
     char *sep_fw_filename;
     char *securerom_filename;

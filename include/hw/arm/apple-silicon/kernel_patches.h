@@ -22,6 +22,12 @@
 
 #include "hw/arm/apple-silicon/boot.h"
 
-void ck_patch_kernel(MachoHeader64 *hdr);
+/*
+ * @root_snapshot_name: when non-NULL the device tree carries a
+ * `root-snapshot-name`, so the kernel can root from the APFS snapshot and the
+ * snapshot-disabling patch is skipped. Pass NULL to keep the old behaviour of
+ * forcing a live-filesystem root.
+ */
+void ck_patch_kernel(MachoHeader64 *hdr, const char *root_snapshot_name);
 
 #endif /* HW_ARM_APPLE_SILICON_KERNEL_PATCHES_H */

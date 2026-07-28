@@ -192,7 +192,7 @@ static void s8000_create_s3c_uart(const AppleS8000MachineState *s8000,
 
 static void s8000_patch_kernel(MachoHeader64 *header)
 {
-    ck_patch_kernel(header);
+    ck_patch_kernel(header, NULL);
 }
 
 static bool s8000_check_panic(AppleS8000MachineState *s8000)

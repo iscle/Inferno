@@ -761,7 +761,7 @@ static void ck_kp_pmap_cs_enforce_patch(CKPatcherRange *range)
                             sizeof(repl));
 }
 
-void ck_patch_kernel(MachoHeader64 *hdr)
+void ck_patch_kernel(MachoHeader64 *hdr, const char *root_snapshot_name)
 {
     MachoHeader64 *apfs_hdr;
     g_autofree CKPatcherRange *apfs_text;
@@ -780,7 +780,17 @@ void ck_patch_kernel(MachoHeader64 *hdr)
     if (apfs_cstring == NULL) {
         apfs_cstring = ck_kp_find_section_range(hdr, "__TEXT", "__cstring");
     }
-    ck_kp_apfs_snapshot_patch(apfs_cstring);
+    /*
+     * Corrupting `com.apple.os.update-` stops the kernel matching a snapshot
+     * name, so it roots from the live filesystem instead. That only works while
+     * the system volume is unsealed: iOS 16+ seals it, and a RELEASE kernel
+     * refuses to root live from a sealed volume. When we publish the snapshot
+     * name in the device tree there is nothing to work around, so leave the
+     * string alone and let the kernel find its snapshot.
+     */
+    if (root_snapshot_name == NULL || *root_snapshot_name == '\0') {
+        ck_kp_apfs_snapshot_patch(apfs_cstring);
+    }
 
     amfi_text =
         ck_kp_find_image_text(hdr, "com.apple.driver.AppleMobileFileIntegrity");

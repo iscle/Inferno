@@ -65,6 +65,10 @@ MACHINE="t8030"
 # installed OS from the restored disk (use for a normal boot after a restore);
 # "enter_recovery" forces recovery. Leave unset for the machine default.
 [ -n "${INFERNO_BOOT_MODE:-}" ] && MACHINE+=",boot-mode=$INFERNO_BOOT_MODE"
+# iOS 16+ seals the system volume and a RELEASE kernel will not root from its
+# live filesystem, so the kernel needs the name of the APFS snapshot to root
+# from. Read it off the restored image with `diskutil apfs listSnapshots`.
+[ -n "${INFERNO_ROOT_SNAPSHOT:-}" ] && MACHINE+=",root-snapshot-name=$INFERNO_ROOT_SNAPSHOT"
 MACHINE+=",trustcache=$TRUSTCACHE"
 MACHINE+=",ticket=$TICKET"
 MACHINE+=",sep-fw=$SEP_FW"
