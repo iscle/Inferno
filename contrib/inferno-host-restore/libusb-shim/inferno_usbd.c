@@ -519,6 +519,26 @@ static void *reader_thread(void *arg)
             int32_t st = (int32_t)resp.status;
             if (st == TCP_USB_RET_NAK && x->nak_retries++ < MAX_NAK_RETRIES) {
                 txn_reissue(l, x); /* transient control/OUT NAK */
+            } else if (st == TCP_USB_RET_NAK) {
+                /*
+                 * Budget exhausted: the device never answered this stage. Say so
+                 * and fail the transaction. Advancing the control stage machine
+                 * here would walk DATA -> STATUS -> complete(SUCCESS) and hand
+                 * the client a successful *zero-length* reply for a transfer the
+                 * device actually stalled, turning a hard failure into an
+                 * invisible one.
+                 */
+                logmsg("[txn] tag=%u stage=%d pid=0x%x NAK budget exhausted "
+                       "after %d retries; failing",
+                       x->tag, x->stage, x->cur_pid, MAX_NAK_RETRIES);
+                x->nak_retries = 0;
+                txn_complete(x, TCP_USB_RET_NAK);
+            } else if (st < 0) {
+                /* Any hard error ends the transaction, control or bulk alike. */
+                logmsg("[txn] tag=%u stage=%d pid=0x%x failed with status %d",
+                       x->tag, x->stage, x->cur_pid, st);
+                x->nak_retries = 0;
+                txn_complete(x, st);
             } else {
                 x->nak_retries = 0;
                 if (x->kind == TXN_BULK) txn_complete(x, st);
