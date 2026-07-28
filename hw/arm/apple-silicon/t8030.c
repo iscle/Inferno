@@ -1451,6 +1451,32 @@ static void t8030_create_wlan(AppleT8030MachineState *t8030)
      * manual-enable handling in hw/pci-host/apcie.c.
      */
 
+    /*
+     * Do NOT add "function-sac" here, however tempting the bring-up log makes
+     * it look.
+     *
+     * AppleBCMWLANCore::start asks for AppleARMFunctionSlowAdaptiveClocking on
+     * the "function-sac" property of the /arm-io/wlan node, and when it is not
+     * there it says so ("Could not create SAC function interface") and carries
+     * on; reportWiFiChanTransitionToSac then returns kIOReturnUnsupported for
+     * the rest of the boot, every few seconds, because addSacFreqListGated
+     * early-outs on the null interface.
+     *
+     * That is what real hardware does too. Slow adaptive clocking exists to
+     * keep display and camera clock spurs away from a radio, and on this
+     * product the victim Apple wired up is the cellular baseband, not Wi-Fi:
+     * in the shipped n104ap device tree "function-sac" appears on /baseband
+     * and nowhere else, while /arm-io/wlan and the PCIe endpoint node carry no
+     * function-* property at all. (The aggressors -- /arm-io/isp,
+     * /arm-io/mipi-dsim, the AOP proximity sensor -- use "function-saca".)
+     *
+     * Inventing one would be actively dangerous, not merely useless: the
+     * property's first word is the phandle of the parent that owns the
+     * function, and AppleARMFunction::withProvider resolves it with
+     * waitForMatchingService(..., -1). Point it at anything that never
+     * publishes and Wi-Fi bring-up blocks forever.
+     */
+
     ApplePCIEPort *port = APPLE_PCIE_PORT(
         object_property_get_link(OBJECT(t8030), "pcie.bridge2", &error_fatal));
     PCIDevice *pci_dev = PCI_DEVICE(port);
