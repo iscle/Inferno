@@ -45,6 +45,14 @@ RAMDISK="${INFERNO_RAMDISK:-Restore/038-44135-124.dmg}"
 # Whether to attach the restore RAM disk (-initrd). Set RESTORE=0 for a normal boot.
 RESTORE="${RESTORE:-1}"
 
+# Extra options appended to the root drive, e.g. ",cache=unsafe,aio=threads".
+# Measured on a 26.5 first boot after an erase restore -- the one-time filesystem
+# work is I/O bound, and those two options took the same boot from 28 minutes to
+# 12. Left opt-in rather than default: cache=unsafe discards flush guarantees, so
+# a host crash can corrupt the image. Fine for a disposable test image, not for
+# one you care about.
+INFERNO_ROOT_DRIVE_OPTS="${INFERNO_ROOT_DRIVE_OPTS:-}"
+
 # The emulator binary. Normally the one in the build directory; INFERNO_QEMU can
 # point at a copy under a different name, which is handy when several VMs share
 # the host and one of them is torn down with a name-matching `pkill`.
@@ -100,7 +108,7 @@ CMD=( "$QEMU"
     -serial mon:stdio
     -drive file=sep_nvram,if=pflash,format=raw
     -drive file=sep_ssc,if=pflash,format=raw
-    -drive file=root,format=raw,if=none,id=root
+    -drive "file=root,format=raw,if=none,id=root${INFERNO_ROOT_DRIVE_OPTS:-}"
         -device nvme-ns,drive=root,bus=nvme-bus.0,nsid=1,nstype=1,logical_block_size=4096,physical_block_size=4096
     -drive file=firmware,format=raw,if=none,id=firmware
         -device nvme-ns,drive=firmware,bus=nvme-bus.0,nsid=2,nstype=2,logical_block_size=4096,physical_block_size=4096
