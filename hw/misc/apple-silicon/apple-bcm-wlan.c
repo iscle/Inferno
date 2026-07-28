@@ -667,10 +667,22 @@ static const uint8_t apple_bcm_wlan_otp_cis[] = {
 #define BCM_FLOW_RING_ID_BASE 2
 
 /*
- * How often to re-assert the interrupt while the host still has unread D2H
- * items. Comfortably below the driver's 1.5 s command watchdog.
+ * How long to keep re-asserting the interrupt after we put something on a D2H
+ * ring, in case the message itself was lost.
+ *
+ * The window a message can be lost in is bounded: it is the time the host
+ * holds the vector masked, which is its own interrupt handler. So the retries
+ * are bounded too -- the first after 10 ms, then doubling, seven of them
+ * spanning 1.27 s, which is inside the driver's 1.5 s command watchdog. After
+ * that a ring the host still has not read is not a lost message, and hammering
+ * it further only starves the CPU fielding the interrupts.
+ *
+ * A retry sequence is started by a NEW D2H item and by nothing else, so a
+ * guest that has stopped draining -- an idle one, or one whose outbound queue
+ * has stalled -- goes quiet instead of taking 100 interrupts a second forever.
  */
 #define BCM_IRQ_RETRY_MS 10
+#define BCM_IRQ_RETRY_MAX 7
 
 /*
  * One msgbuf ring, as described by its ring_mem_t descriptor plus the index
@@ -776,6 +788,8 @@ struct AppleBCMWLANDeviceState {
      * whether we have told the host it is associated.
      */
     QEMUTimer *irq_retry_timer;
+    unsigned irq_retries_left;
+    unsigned irq_retry_delay_ms;
     QEMUTimer *escan_timer;
     QEMUTimer *join_timer;
     uint16_t escan_sync_id;
@@ -1456,15 +1470,18 @@ static void apple_bcm_wlan_signal_d2h(AppleBCMWLANDeviceState *s)
      * the whole of its own interrupt handler -- can be lost: the AIC's pending
      * state is a level that gets dropped again shortly after it is raised, and
      * if that happens before the host unmasks, the message is gone. The host
-     * has no doorbell to tell us it has drained a D2H ring, so instead keep
-     * nudging it while any D2H ring still has items it has not read.
+     * has no doorbell to tell us it has drained a D2H ring, so instead nudge it
+     * again a bounded number of times while the ring still has items it has not
+     * read.
      *
      * Without this a single lost message stalls a synchronous ioctl until the
      * driver's 1.5 s watchdog fires ("checkQueues: Outbound Queue Stall"),
      * which resets the chip and tears the association down.
      */
+    s->irq_retries_left = BCM_IRQ_RETRY_MAX;
+    s->irq_retry_delay_ms = BCM_IRQ_RETRY_MS;
     timer_mod(s->irq_retry_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + BCM_IRQ_RETRY_MS);
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + s->irq_retry_delay_ms);
 }
 
 /* Has the host consumed everything we put on this ring? */
@@ -1491,14 +1508,31 @@ static void apple_bcm_wlan_irq_retry_timer(void *opaque)
     if (!apple_bcm_wlan_d2h_ring_pending(s, &s->d2h_ctrl) &&
         !apple_bcm_wlan_d2h_ring_pending(s, &s->d2h_tx) &&
         !apple_bcm_wlan_d2h_ring_pending(s, &s->d2h_rx)) {
+        /* Drained: the message got through, there is nothing to make up for. */
+        s->irq_retries_left = 0;
         return;
     }
+
+    if (s->irq_retries_left == 0) {
+        /*
+         * The host has had more than a second to look and has not. That is not
+         * a lost message any more, it is a host that has stopped reading, and
+         * nudging it further only starves the CPU fielding the interrupts. Say
+         * so once and stop; the next item we post starts a fresh sequence.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: host has not drained a D2H ring after %d nudges\n",
+                      __func__, BCM_IRQ_RETRY_MAX);
+        return;
+    }
+    s->irq_retries_left--;
 
     if (msi_enabled(pci_dev)) {
         msi_notify(pci_dev, 0);
     }
+    s->irq_retry_delay_ms *= 2;
     timer_mod(s->irq_retry_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + BCM_IRQ_RETRY_MS);
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + s->irq_retry_delay_ms);
 }
 
 /*
@@ -3527,6 +3561,8 @@ static void apple_bcm_wlan_device_qdev_reset_hold(Object *obj, ResetType type)
     s->escan_reported = false;
     s->virt_if_bsscfgidx = 0;
     timer_del(s->irq_retry_timer);
+    s->irq_retries_left = 0;
+    s->irq_retry_delay_ms = BCM_IRQ_RETRY_MS;
     timer_del(s->escan_timer);
     timer_del(s->join_timer);
     timer_del(s->virt_if_timer);
