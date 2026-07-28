@@ -469,6 +469,36 @@ typedef struct {
 /// scanning, so all of its residency is reported against "Active".
 #define MT_POWER_STATE_ACTIVE (1)
 
+/*
+ * A poll of those two reports is a *get* and then a *set*, and only the set is
+ * reported upwards.
+ *
+ * AIDReporters::updateReportersData() walks one group per report ID. Per group
+ * it gets the feature report, hands the answer to every reporter in the group -
+ * discarding whatever they make of it, updateReportersGroupData() returns void,
+ * which is why a malformed report only ever showed up as the AIDReporter*.cpp
+ * complaints quoted above and never as a failure - and then calls
+ * clearReporterData(), whose IOReturn overwrites the group loop's result. So
+ * what AppleHIDTransportInterface::updateReportersData() finally returns, and
+ * logs as
+ *
+ *   AIDLog: [grape::updateReportersData]: ERROR!! ret == 0
+ *   ... AppleHIDTransportInterface.cpp, line: 741
+ *
+ * is the *last* group's clear, i.e. the set of feature report 0x72.
+ *
+ * The clear is a set-feature of ClearReportID whose buffer is the ID byte
+ * followed by ClearReportZeroPad ? getDataLength() - 1 : 0 zero bytes - note
+ * getDataLength(), the computed length, not the personality's ReportLength,
+ * which the 0x72 entry does not even carry. So the two writes are 449 bytes of
+ * { 0xF8, 0... } and 89 bytes of { 0x72, 0... }, and both have to be answered
+ * with success. This controller answers every set-feature with a
+ * SET_OUTPUT_REPORT reply carrying HID_PACKET_STATUS_SUCCESS, and the host
+ * takes it: the line-741 error was last seen before the reports above were
+ * answered properly, and a full boot of the current controller does not
+ * produce it - not one AppleHIDTransportInterface line all boot.
+ */
+
 /// HID report 0x7F latches the controller's critical errors.
 /// AppleMultitouchDevice::decodeDeviceProperty() reads it as a little-endian
 /// u16 when the payload is exactly two bytes and a u32 when it is exactly
