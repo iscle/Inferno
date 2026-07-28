@@ -66,6 +66,7 @@
 #include "hw/ssi/ssi.h"
 #include "hw/usb/apple_typec.h"
 #include "hw/watchdog/apple_wdt.h"
+#include "system/block-backend.h"
 #include "qemu/error-report.h"
 #include "qemu/guest-random.h"
 #include "qemu/log.h"
@@ -249,6 +250,62 @@ static void t8030_patch_kernel(MachoHeader64 *header, uint32_t build_version,
     ck_patch_kernel(header, root_snapshot_name);
 }
 
+/*
+ * Commit a staged panic log to the `panic_log` block backend.
+ *
+ * XNU stages the embedded panic log in the `pram` DRAM carveout and expects
+ * the next boot stage to move it to persistent storage: on real hardware iBoot
+ * reads the preserved carveout and commits it to the NAND panic-log region,
+ * where DumpPanic later finds it. This machine boots the kernel directly, so
+ * nothing plays iBoot's part and every panic log was simply dropped.
+ *
+ * The drive is the `panic_log` namespace already attached to the ANS NVMe
+ * controller, so the guest sees the committed log through the same namespace
+ * it would on hardware.
+ */
+static void t8030_commit_panic_log(AppleT8030MachineState *t8030,
+                                   const AppleEmbeddedPanicHeader *panic_info)
+{
+    BlockBackend *blk;
+    int64_t blk_len;
+    uint64_t len;
+    int ret;
+
+    blk = blk_by_name("panic_log");
+    if (blk == NULL) {
+        warn_report("a panic log was staged in DRAM but no `panic_log` drive "
+                    "is attached; the log has been lost");
+        return;
+    }
+
+    blk_len = blk_getlength(blk);
+    if (blk_len <= 0) {
+        warn_report("could not determine the `panic_log` drive's length; "
+                    "the panic log has been lost");
+        return;
+    }
+
+    /*
+     * Write the whole carveout rather than only the described extents: the
+     * header's offsets are relative to its own base, and a short write would
+     * leave the tail of an older panic behind.
+     */
+    len = MIN(t8030->panic_size, (uint64_t)blk_len);
+
+    ret = blk_pwrite(blk, 0, len, panic_info, 0);
+    if (ret < 0) {
+        warn_report("failed to commit the panic log to the `panic_log` drive: "
+                    "%s", strerror(-ret));
+        return;
+    }
+
+    info_report("committed a %" PRIu64 "-byte panic log (os_version `%.*s`, "
+                "panic_log_len %u, stackshot_len %u) to the `panic_log` drive",
+                len, EMBEDDED_PANIC_HEADER_OSVERSION_LEN,
+                panic_info->os_version, panic_info->panic_log_len,
+                panic_info->stackshot_len);
+}
+
 static bool t8030_check_panic(AppleT8030MachineState *t8030)
 {
     AppleEmbeddedPanicHeader *panic_info;
@@ -267,6 +324,15 @@ static bool t8030_check_panic(AppleT8030MachineState *t8030)
                       t8030->panic_size, MEMTXATTRS_UNSPECIFIED);
 
     ret = panic_info->magic == EMBEDDED_PANIC_MAGIC;
+
+    /*
+     * Only now is `panic_info` the sole surviving copy, since the carveout has
+     * already been zeroed above. Persist it before freeing it.
+     */
+    if (ret) {
+        t8030_commit_panic_log(t8030, panic_info);
+    }
+
     g_free(panic_info);
     return ret;
 }
