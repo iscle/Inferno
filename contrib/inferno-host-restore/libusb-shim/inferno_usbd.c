@@ -127,6 +127,7 @@ typedef struct {
     uint32_t buf_len;     /* requested length */
     uint32_t actual;      /* bytes received (IN) */
     int nak_retries;      /* serving-phase NAK re-issue counter */
+    uint64_t nak_until_ns; /* serving-phase NAK deadline (0 = not yet NAKed) */
     uint64_t submit_ns;   /* timing: when the request was written to the link */
 } txn_t;
 
@@ -194,7 +195,28 @@ static int drain_payload(int fd, uint32_t length)
  * drops a token (USB is experimental), so a header that never arrives becomes
  * TXN_TIMEOUT and the caller re-issues rather than blocking forever.
  */
-#define MAX_NAK_RETRIES 400  /* ~4s of NAKs (device busy during bring-up) */
+#define MAX_NAK_RETRIES 400  /* sync/enumeration phase only (see below) */
+
+/*
+ * Serving-phase NAK budget.
+ *
+ * A NAK means "not ready yet, ask again" -- USB 2.0 gives a control transfer up
+ * to 5 seconds to complete, so the budget has to be a *deadline*, not a retry
+ * count. It used to be 400 re-issues, which measured at 5.5-9.2 ms on this link
+ * because the reader re-issues the instant the NAK lands, with no pacing: a
+ * device that legitimately needs longer than ~8 ms to arm its next TRB (arming
+ * the status stage of a SET_CONFIGURATION, say, which runs a whole interface
+ * activation first) was being declared dead three orders of magnitude early.
+ *
+ * The pacing matters as much as the deadline. The emulated controller posts an
+ * XFERNOTREADY event to the guest's event ring for every token it NAKs, so
+ * spinning for five seconds would bury the guest under hundreds of thousands of
+ * events and overflow the ring -- trading this failure for a "No space for
+ * events" panic. Sleep between re-issues so a stalled stage costs a bounded
+ * number of events instead.
+ */
+#define NAK_BUDGET_NS   (5ull * 1000000000ull) /* USB control transfer timeout */
+#define NAK_PACE_NS     (200ull * 1000ull)     /* 200 us between re-issues */
 
 static int tcpusb_txn_sync(tcpusb_link *l, int pid, uint8_t ep, void *io_buf,
                            uint16_t *io_len)
@@ -517,7 +539,13 @@ static void *reader_thread(void *arg)
 
         if (x && !is_async) {
             int32_t st = (int32_t)resp.status;
-            if (st == TCP_USB_RET_NAK && x->nak_retries++ < MAX_NAK_RETRIES) {
+            if (st == TCP_USB_RET_NAK && !x->nak_until_ns) {
+                x->nak_until_ns = now_ns() + NAK_BUDGET_NS;
+            }
+            if (st == TCP_USB_RET_NAK && now_ns() < x->nak_until_ns) {
+                struct timespec pace = { 0, (long)NAK_PACE_NS };
+                x->nak_retries++;
+                nanosleep(&pace, NULL);
                 txn_reissue(l, x); /* transient control/OUT NAK */
             } else if (st == TCP_USB_RET_NAK) {
                 /*
@@ -529,18 +557,20 @@ static void *reader_thread(void *arg)
                  * invisible one.
                  */
                 logmsg("[txn] tag=%u stage=%d pid=0x%x NAK budget exhausted "
-                       "after %d retries; failing",
-                       x->tag, x->stage, x->cur_pid, MAX_NAK_RETRIES);
-                x->nak_retries = 0;
+                       "after %d retries in %llu us; failing",
+                       x->tag, x->stage, x->cur_pid, x->nak_retries,
+                       (unsigned long long)(x->submit_ns
+                           ? (now_ns() - x->submit_ns) / 1000 : 0));
+                x->nak_retries = 0; x->nak_until_ns = 0;
                 txn_complete(x, TCP_USB_RET_NAK);
             } else if (st < 0) {
                 /* Any hard error ends the transaction, control or bulk alike. */
                 logmsg("[txn] tag=%u stage=%d pid=0x%x failed with status %d",
                        x->tag, x->stage, x->cur_pid, st);
-                x->nak_retries = 0;
+                x->nak_retries = 0; x->nak_until_ns = 0;
                 txn_complete(x, st);
             } else {
-                x->nak_retries = 0;
+                x->nak_retries = 0; x->nak_until_ns = 0;
                 if (x->kind == TXN_BULK) txn_complete(x, st);
                 else control_advance(rc, x);
             }
@@ -588,6 +618,7 @@ static int submit_control(tcpusb_link *l, txn_table *t, int cfd, uint32_t tag,
         if (!x->in && out_data) memcpy(x->buf, out_data, sp->wLength);
     }
     x->id = next_id(l);
+    x->submit_ns = now_ns();
     uint8_t setup_buf[8]; memcpy(setup_buf, sp, 8);
     VLOG("[sub] control bmReq=0x%x bReq=0x%x wVal=0x%x wIdx=0x%x wLen=%u id=%llu",
          sp->bmRequestType, sp->bRequest, sp->wValue, sp->wIndex, sp->wLength,
