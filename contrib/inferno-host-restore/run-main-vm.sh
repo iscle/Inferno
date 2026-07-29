@@ -53,6 +53,21 @@ RESTORE="${RESTORE:-1}"
 # one you care about.
 INFERNO_ROOT_DRIVE_OPTS="${INFERNO_ROOT_DRIVE_OPTS:-}"
 
+# Number of vCPUs (INFERNO_SMP). One vCPU is consumed by the emulated SEP --
+# t8030_real_cpu_count() is `smp.cpus - (sep_fw != NULL)` -- so the guest gets
+# INFERNO_SMP-1 application cores.
+#
+# Only 7 and 6 work. The A13 is 4 efficiency + 2 performance cores, and
+# t8030_cpu_setup() trims the device tree's `cpus` children from the end while
+# always creating both clusters; at 4 application cores or fewer the performance
+# cluster is left empty and XNU's per-CPU-kind accounting overruns its
+# allocation, panicking early in boot with
+#   [recount_track_cpu_kind]: element modified after free
+# Measured on iOS 26.5: 7 and 6 boot; 5, 4, 3 and 2 all panic that way.
+#
+# Reducing 7 -> 6 does not help throughput: the datamigrator's starvation ratio
+# (runnable vs running, from the panic stackshot) got *worse*, 5.13x -> 7.21x.
+
 # The emulator binary. Normally the one in the build directory; INFERNO_QEMU can
 # point at a copy under a different name, which is handy when several VMs share
 # the host and one of them is torn down with a name-matching `pkill`.
@@ -104,7 +119,7 @@ CMD=( "$QEMU"
     -kernel "$KERNEL"
     -dtb "$DTB"
     -append "$APPEND"
-    -smp 7 -m "${INFERNO_RAM:-4G}"
+    -smp "${INFERNO_SMP:-7}" -m "${INFERNO_RAM:-4G}"
     -serial mon:stdio
     -drive file=sep_nvram,if=pflash,format=raw
     -drive file=sep_ssc,if=pflash,format=raw
