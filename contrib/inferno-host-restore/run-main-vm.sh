@@ -45,6 +45,23 @@ RAMDISK="${INFERNO_RAMDISK:-Restore/038-44135-124.dmg}"
 # Whether to attach the restore RAM disk (-initrd). Set RESTORE=0 for a normal boot.
 RESTORE="${RESTORE:-1}"
 
+# Snapshot mode. "1" appends ,snapshot=on to *every* drive, including the two SEP
+# pflash devices (sep_nvram, sep_ssc), so a run leaves the device images
+# untouched.
+#
+# It has to be all-or-nothing. Snapshotting the NAND drives but leaving the SEP
+# pflash writable desynchronises the SEP irrecoverably: SEPOS rewrites the
+# SEP-xART Locker into sep_ssc while the matching xART records on the (discarded)
+# root and effaceable images are thrown away, and the next boot dies in
+#   SEP Panic: :sks /sks
+# right after "D-key effaceable locker does not exist, attempt to init it
+# implicitly". The SSC keeps four identical copies of each slot, all rewritten
+# together, so there is no older copy to recover from and no way back short of a
+# re-restore. Zeroing sep_ssc instead trades that for
+#   SEP Panic: :sars/sars
+# (anti-replay rollback). Hence the check below.
+INFERNO_SNAPSHOT_DRIVES="${INFERNO_SNAPSHOT_DRIVES:-0}"
+
 # Extra options appended to the root drive, e.g. ",cache=unsafe,aio=threads".
 # Measured on a 26.5 first boot after an erase restore -- the one-time filesystem
 # work is I/O bound, and those two options took the same boot from 28 minutes to
@@ -72,6 +89,20 @@ INFERNO_ROOT_DRIVE_OPTS="${INFERNO_ROOT_DRIVE_OPTS:-}"
 # point at a copy under a different name, which is handy when several VMs share
 # the host and one of them is torn down with a name-matching `pkill`.
 QEMU="${INFERNO_QEMU:-$BUILD_DIR/qemu-system-aarch64}"
+
+# --- snapshot mode ---------------------------------------------------------
+case "$INFERNO_SNAPSHOT_DRIVES" in
+    0) SNAP="";;
+    1) SNAP=",snapshot=on";;
+    *) echo "error: INFERNO_SNAPSHOT_DRIVES must be 0 or 1" >&2; exit 1;;
+esac
+if [ "$INFERNO_SNAPSHOT_DRIVES" != "1" ] &&
+   [ "${INFERNO_ROOT_DRIVE_OPTS#*snapshot=on}" != "$INFERNO_ROOT_DRIVE_OPTS" ]; then
+    echo "error: snapshot=on in INFERNO_ROOT_DRIVE_OPTS without INFERNO_SNAPSHOT_DRIVES=1." >&2
+    echo "       Snapshotting some drives but not the SEP pflash ones desynchronises" >&2
+    echo "       the SEP and bricks the images; use INFERNO_SNAPSHOT_DRIVES=1 instead." >&2
+    exit 1
+fi
 
 # --- sanity checks ---------------------------------------------------------
 cd "$DATA_DIR"
@@ -121,21 +152,21 @@ CMD=( "$QEMU"
     -append "$APPEND"
     -smp "${INFERNO_SMP:-7}" -m "${INFERNO_RAM:-4G}"
     -serial mon:stdio
-    -drive file=sep_nvram,if=pflash,format=raw
-    -drive file=sep_ssc,if=pflash,format=raw
-    -drive "file=root,format=raw,if=none,id=root${INFERNO_ROOT_DRIVE_OPTS:-}"
+    -drive "file=sep_nvram,if=pflash,format=raw${SNAP}"
+    -drive "file=sep_ssc,if=pflash,format=raw${SNAP}"
+    -drive "file=root,format=raw,if=none,id=root${INFERNO_ROOT_DRIVE_OPTS:-}${SNAP}"
         -device nvme-ns,drive=root,bus=nvme-bus.0,nsid=1,nstype=1,logical_block_size=4096,physical_block_size=4096
-    -drive file=firmware,format=raw,if=none,id=firmware
+    -drive "file=firmware,format=raw,if=none,id=firmware${SNAP}"
         -device nvme-ns,drive=firmware,bus=nvme-bus.0,nsid=2,nstype=2,logical_block_size=4096,physical_block_size=4096
-    -drive file=syscfg,format=raw,if=none,id=syscfg
+    -drive "file=syscfg,format=raw,if=none,id=syscfg${SNAP}"
         -device nvme-ns,drive=syscfg,bus=nvme-bus.0,nsid=3,nstype=3,logical_block_size=4096,physical_block_size=4096
-    -drive file=ctrl_bits,format=raw,if=none,id=ctrl_bits
+    -drive "file=ctrl_bits,format=raw,if=none,id=ctrl_bits${SNAP}"
         -device nvme-ns,drive=ctrl_bits,bus=nvme-bus.0,nsid=4,nstype=4,logical_block_size=4096,physical_block_size=4096
-    -drive file=nvram,if=none,format=raw,id=nvram
+    -drive "file=nvram,if=none,format=raw,id=nvram${SNAP}"
         -device apple-nvram,drive=nvram,bus=nvme-bus.0,nsid=5,nstype=5,id=nvram,logical_block_size=4096,physical_block_size=4096
-    -drive file=effaceable,format=raw,if=none,id=effaceable
+    -drive "file=effaceable,format=raw,if=none,id=effaceable${SNAP}"
         -device nvme-ns,drive=effaceable,bus=nvme-bus.0,nsid=6,nstype=6,logical_block_size=4096,physical_block_size=4096
-    -drive file=panic_log,format=raw,if=none,id=panic_log
+    -drive "file=panic_log,format=raw,if=none,id=panic_log${SNAP}"
         -device nvme-ns,drive=panic_log,bus=nvme-bus.0,nsid=7,nstype=8,logical_block_size=4096,physical_block_size=4096
 )
 
