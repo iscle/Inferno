@@ -163,6 +163,7 @@ struct AppleDisplayPipeV4State {
     MemoryRegion up_regs;
     uint32_t width;
     uint32_t height;
+    uint32_t refresh_hz;
     MemoryRegion *vram_mr;
     uint64_t vram_off;
     uint64_t vram_size;
@@ -188,6 +189,7 @@ static const VMStateDescription vmstate_adp_v4 = {
         (const VMStateField[]){
             VMSTATE_UINT32(width, AppleDisplayPipeV4State),
             VMSTATE_UINT32(height, AppleDisplayPipeV4State),
+            VMSTATE_UINT32(refresh_hz, AppleDisplayPipeV4State),
             VMSTATE_UINT32(int_status, AppleDisplayPipeV4State),
             VMSTATE_UINT32(int_enable, AppleDisplayPipeV4State),
             VMSTATE_STRUCT_ARRAY(genpipe, AppleDisplayPipeV4State,
@@ -858,11 +860,32 @@ static void adp_v4_reset_hold(Object *obj, ResetType type)
 }
 
 /*
- * The panel refreshes at 60 Hz; the display controller's timing generator
- * raises OUTPUT_READY (the scanout / vertical-blank event) once per frame.
+ * The panel's timing generator raises OUTPUT_READY (the scanout / vertical-blank
+ * event) once per frame. A real panel refreshes at 60 Hz and the CPU that
+ * services each frame runs at full speed, so servicing vblank costs a real
+ * device almost nothing.
+ *
+ * Here the timer runs on QEMU_CLOCK_VIRTUAL, which without -icount is host wall
+ * time, while the emulated CPUs run one to two orders of magnitude slower than
+ * an A13. Asking the guest for 60 frames per *wall* second therefore asks it for
+ * ~60 frames per 1/30th of a guest-second of CPU budget -- a CPU/display
+ * performance ratio no real device has. Measured on an iOS 26.5 first boot, the
+ * two CoreAnimation IOMFB run-loop threads in backboardd burned 670 of the
+ * 2743 non-idle CPU-seconds (24%) doing nothing but servicing that interrupt,
+ * starving the rest of the boot.
+ *
+ * The rate is therefore a property. Keep the default at the panel's real 60 Hz
+ * so the modelled hardware stays faithful by default, and let a host that cares
+ * more about guest throughput than about frame pacing dial it down.
  */
-#define ADP_V4_REFRESH_HZ 60
-#define ADP_V4_VBLANK_PERIOD_NS (NANOSECONDS_PER_SECOND / ADP_V4_REFRESH_HZ)
+#define ADP_V4_REFRESH_HZ_DEFAULT 60
+
+static int64_t adp_v4_vblank_period_ns(AppleDisplayPipeV4State *adp)
+{
+    uint32_t hz = adp->refresh_hz ? adp->refresh_hz : ADP_V4_REFRESH_HZ_DEFAULT;
+
+    return NANOSECONDS_PER_SECOND / hz;
+}
 
 /*
  * Start or stop the vertical-blank timing generator so it runs exactly while
@@ -885,8 +908,8 @@ static void adp_v4_update_vblank(AppleDisplayPipeV4State *adp)
         qatomic_read(&adp->int_enable) & R_CONTROL_INT_OUTPUT_READY_MASK;
 
     if (enabled && !timer_pending(adp->vblank_timer)) {
-        timer_mod(adp->vblank_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ADP_V4_VBLANK_PERIOD_NS);
+        timer_mod(adp->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                        adp_v4_vblank_period_ns(adp));
     } else if (!enabled) {
         timer_del(adp->vblank_timer);
     }
@@ -901,8 +924,8 @@ static void adp_v4_vblank(void *opaque)
 
     /* Keep scanning out while the guest still wants vblank reporting. */
     if (qatomic_read(&adp->int_enable) & R_CONTROL_INT_OUTPUT_READY_MASK) {
-        timer_mod(adp->vblank_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ADP_V4_VBLANK_PERIOD_NS);
+        timer_mod(adp->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                        adp_v4_vblank_period_ns(adp));
     }
 }
 
@@ -918,6 +941,8 @@ static void adp_v4_realize(DeviceState *dev, Error **errp)
 static const Property adp_v4_props[] = {
     DEFINE_PROP_UINT32("width", AppleDisplayPipeV4State, width, 0),
     DEFINE_PROP_UINT32("height", AppleDisplayPipeV4State, height, 0),
+    DEFINE_PROP_UINT32("refresh-hz", AppleDisplayPipeV4State, refresh_hz,
+                       ADP_V4_REFRESH_HZ_DEFAULT),
 };
 
 static void adp_v4_class_init(ObjectClass *klass, const void *data)
