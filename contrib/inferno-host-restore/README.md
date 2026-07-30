@@ -171,6 +171,28 @@ truncate `root`, `nvram`, `sep_nvram`, `sep_ssc`, `effaceable`, `ctrl_bits`,
 `syscfg`** (it carries the device identity), then restore. The device then
 enumerates and the restore proceeds normally.
 
+## Known defect: dart-apcie2 faults on a first boot with Wi-Fi attached
+
+Reproducible on an iOS 14.0b5 first boot after an erase restore, twice in a row,
+and only when a netdev is attached to the emulated BCM4378 endpoint:
+
+```
+panic(cpu 0 caller ...): "dart-apcie2 (0x...): DART(DART) error:
+    SID 1 PTE invalid exception on read with DVA ..."
+panic(cpu 0 caller ...): "dart-apcie2 (0x...): DART(DART) error:
+    SID 1 TTBR invalid exception ..."
+```
+
+With `INFERNO_NETDEV=none` the same image boots with no panic and runs for at
+least 21 minutes of guest time. So the emulated PCIe IOMMU is being handed a
+stream ID whose page tables are not (or no longer) valid, on a path only the
+Wi-Fi endpoint's DMA exercises. A device that is already through Setup does not
+hit it -- it takes the first-boot Wi-Fi provisioning to provoke.
+
+Not diagnosed further. Filed here because it is an emulation bug in the IOMMU
+rather than a guest problem, and because it will bite anyone doing a fresh iOS 14
+restore.
+
 ## Debugging: the gdbstub is not usable on t8030
 
 `-s` works, but attaching stops the VM, and stopping the VM violates the AP<->SEP
@@ -185,6 +207,18 @@ inside UIKitCore instead. Momentary inspection is fine; breakpoints, stepping an
 anything else that keeps the VM stopped are not. Use PC sampling through the HMP
 monitor (`info registers -a` gives PC plus PSTATE, hence EL) or emulator-side
 counters instead.
+
+Two traps that have each cost measurement runs in this project:
+
+- **Detach VMs into their own session, not just `nohup ... & disown`.** `disown`
+  leaves the child in the caller's process group, so anything that kills that
+  group (a harness timeout, for instance) reaps the VM too -- silently, mid-run.
+  macOS has no `setsid(1)`; a two-line Python wrapper calling `os.setsid()`
+  before `Popen` does the job.
+- **If you add a counter that generated code writes to, its address must never
+  move.** A `GArray` of counters reallocates as it grows, leaving every
+  previously translated block writing into freed memory; the crash lands minutes
+  later with nothing pointing at the cause. Use a fixed slab.
 
 ## Remaining work
 
