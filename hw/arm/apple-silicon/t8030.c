@@ -2017,6 +2017,88 @@ static void t8030_create_smc(AppleT8030MachineState *t8030)
     sysbus_realize_and_unref(smc, &error_fatal);
 }
 
+/*
+ * The GPU's own MMIO is deliberately not modelled. This region exists only to
+ * name what the driver asks for: `accepts` logs the offset and size and then
+ * refuses the transaction, so the access still fails and the guest still takes
+ * its data abort. A read handler returning 0 would instead hand AGX fabricated
+ * chip-info and let it limp on measuring nothing, which is exactly what we do
+ * not want.
+ */
+static bool t8030_sgx_probe_accepts(void *opaque, hwaddr addr, unsigned size,
+                                    bool is_write, MemTxAttrs attrs)
+{
+    (void)opaque;
+    (void)attrs;
+
+    qemu_log_mask(LOG_UNIMP,
+                  "sgx: UNIMPLEMENTED GPU MMIO %s @ +0x" HWADDR_FMT_plx
+                  " size %u -- failing transaction\n",
+                  is_write ? "write" : "read", addr, size);
+
+    return false;
+}
+
+static uint64_t t8030_sgx_probe_read(void *opaque, hwaddr addr, unsigned size)
+{
+    (void)opaque;
+    (void)addr;
+    (void)size;
+
+    g_assert_not_reached();
+}
+
+static void t8030_sgx_probe_write(void *opaque, hwaddr addr, uint64_t data,
+                                  unsigned size)
+{
+    (void)opaque;
+    (void)addr;
+    (void)data;
+    (void)size;
+
+    g_assert_not_reached();
+}
+
+static const MemoryRegionOps t8030_sgx_probe_ops = {
+    .read = t8030_sgx_probe_read,
+    .write = t8030_sgx_probe_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.accepts = t8030_sgx_probe_accepts,
+};
+
+static void t8030_create_sgx_probe(AppleT8030MachineState *t8030)
+{
+    AppleDTNode *child;
+    AppleDTProp *prop;
+    uint64_t *reg;
+    uint64_t i;
+
+    child = apple_dt_get_node(t8030->device_tree, "arm-io");
+    assert_nonnull(child);
+    child = apple_dt_get_node(child, "sgx");
+    if (child == NULL) {
+        /* `gpu` is off, so the node was filtered out. Nothing to probe. */
+        return;
+    }
+
+    prop = apple_dt_get_prop(child, "reg");
+    assert_nonnull(prop);
+    reg = (uint64_t *)prop->data;
+
+    for (i = 0; i < prop->len / (sizeof(uint64_t) * 2); ++i) {
+        MemoryRegion *mr = g_new0(MemoryRegion, 1);
+        g_autofree char *name = g_strdup_printf("sgx.probe[%" PRIu64 "]", i);
+
+        memory_region_init_io(mr, OBJECT(t8030), &t8030_sgx_probe_ops, t8030,
+                              name, reg[i * 2 + 1]);
+        memory_region_add_subregion_overlap(
+            get_system_memory(), t8030->armio_base + reg[i * 2], mr, -1000);
+        info_report("sgx: probe region %" PRIu64 " @ 0x%" PRIX64
+                    " size 0x%" PRIX64,
+                    i, t8030->armio_base + reg[i * 2], reg[i * 2 + 1]);
+    }
+}
+
 static void t8030_create_gfx_asc(AppleT8030MachineState *t8030)
 {
     uint32_t i;
@@ -3190,6 +3272,7 @@ static void t8030_init(MachineState *machine)
     t8030_create_baseband(t8030);
 #endif
     t8030_create_gfx_asc(t8030);
+    t8030_create_sgx_probe(t8030);
     t8030_create_sio(t8030);
     t8030_create_spi0(t8030);
     t8030_create_spi(t8030, 1);
