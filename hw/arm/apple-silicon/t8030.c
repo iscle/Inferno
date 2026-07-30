@@ -632,6 +632,7 @@ static void t8030_gpu_handoff_setup(AppleT8030MachineState *t8030,
 {
     AppleDTNode *sgx;
     AppleDTNode *defaults;
+    AppleGFXASCState *gfx_asc;
     hwaddr base;
     uint64_t i;
 
@@ -660,10 +661,21 @@ static void t8030_gpu_handoff_setup(AppleT8030MachineState *t8030,
                                 GFX_PMAP_IO_RANGE_SIG);
     }
 
-    info_report("sgx: handoff carveout @ 0x%" HWADDR_PRIx " size 0x%X "
+    /*
+     * The coprocessor owns the far side of the handoff page, so it has to know
+     * where the carveout landed. It is created during machine init, before the
+     * allocation exists, hence the setter rather than a construction argument.
+     */
+    gfx_asc = APPLE_GFX_ASC(
+        object_resolve_path_component(OBJECT(t8030), "gfx-asc"));
+    assert_nonnull(gfx_asc);
+    apple_gfx_asc_set_handoff_base(gfx_asc,
+                                   base + GFX_HANDOFF_HANDOFF_OFF);
+
+    info_report("sgx: handoff carveout @ 0x%" HWADDR_PRIx " size 0x%" PRIX64 " "
                 "(TTBR1 0x%" HWADDR_PRIx ", TTBAT 0x%" HWADDR_PRIx
                 ", handoff 0x%" HWADDR_PRIx "), 3 `GUAT` pmap-io-ranges",
-                base, GFX_HANDOFF_SIZE, base + GFX_HANDOFF_TTBR1_OFF,
+                base, (uint64_t)GFX_HANDOFF_SIZE, base + GFX_HANDOFF_TTBR1_OFF,
                 base + GFX_HANDOFF_TTBAT_OFF, base + GFX_HANDOFF_HANDOFF_OFF);
 }
 

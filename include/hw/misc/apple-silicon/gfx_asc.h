@@ -43,9 +43,18 @@ struct AppleGFXASCState {
 
     /*< public >*/
     MemoryRegion ascv2_iomem;
+    /* Physical base of gfx-handoff-base, 0 until the machine publishes it. */
+    uint64_t handoff_base;
 };
 
 SysBusDevice *apple_gfx_asc_from_node(AppleDTNode *node,
                                       AppleA7IOPVersion version);
+
+/*
+ * Tell the coprocessor where the handoff page lives, so it can publish the
+ * microPPL magic there when it starts. The address is only known once the
+ * carveout has been allocated, which happens after the device is created.
+ */
+void apple_gfx_asc_set_handoff_base(AppleGFXASCState *s, uint64_t base);
 
 #endif /* HW_MISC_APPLE_SILICON_GFX_ASC_H */
