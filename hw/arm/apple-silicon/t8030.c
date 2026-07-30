@@ -2018,6 +2018,34 @@ static void t8030_create_smc(AppleT8030MachineState *t8030)
 }
 
 /*
+ * Scratch state for the GPU probe region. Not a GPU model -- just enough
+ * storage for the register blocks whose semantics have been derived, so the
+ * driver can advance and reveal the next thing it wants.
+ */
+typedef struct {
+    uint32_t mmu_cfg[10]; /* +0x8000 .. +0x8024, step 4 */
+} T8030SGXProbe;
+
+/*
+ * MMU configuration block, derived from AGXSecureMonitorG12::setupMMUConfig.
+ * The whole function is 1 read and 10 writes:
+ *
+ *   w8 = [+0x8000]; if (w8 != 0) return;      // already configured
+ *   [+0x8024] = phys(ttb) >> 14;              // TTB base, 16 KiB granule
+ *   [+0x800C] = [+0x8010] = 0x80D8;           // fixed config words
+ *   [+0x8004] = [+0x8008] = [+0x8014] =
+ *   [+0x8018] = [+0x801C] = [+0x8020] = 0;
+ *   [+0x8000] = 1;                            // enable
+ *
+ * So the only value the hardware has to supply is [+0x8000] reading 0 before
+ * setup, which the `cbnz` derives directly. Everything else the driver writes
+ * itself. Plain read/write storage is therefore the derived behaviour here,
+ * not a placeholder.
+ */
+#define SGX_MMU_CFG_BASE 0x8000
+#define SGX_MMU_CFG_LAST 0x8024
+
+/*
  * GPU chip-info registers, derived from AGXAcceleratorG12::readChipInfo in the
  * iOS 14 kernelcache. Everything outside this set is still refused, so the
  * frontier stays honest: only what has been derived is answered.
@@ -2100,6 +2128,11 @@ static bool t8030_sgx_probe_accepts(void *opaque, hwaddr addr, unsigned size,
         return true;
     }
 
+    if (size == 4 && addr >= SGX_MMU_CFG_BASE && addr <= SGX_MMU_CFG_LAST &&
+        (addr & 3) == 0) {
+        return true;
+    }
+
     qemu_log_mask(LOG_UNIMP,
                   "sgx: UNIMPLEMENTED GPU MMIO %s @ +0x" HWADDR_FMT_plx
                   " size %u -- failing transaction\n",
@@ -2113,8 +2146,16 @@ static uint64_t t8030_sgx_probe_read(void *opaque, hwaddr addr, unsigned size)
     uint32_t value = 0;
     bool derived = false;
 
-    (void)opaque;
     (void)size;
+
+    if (addr >= SGX_MMU_CFG_BASE && addr <= SGX_MMU_CFG_LAST) {
+        T8030SGXProbe *probe = opaque;
+        uint32_t v = probe->mmu_cfg[(addr - SGX_MMU_CFG_BASE) / 4];
+
+        info_report("sgx: mmu-cfg read  @ +0x%" HWADDR_PRIx " -> 0x%08X", addr,
+                    v);
+        return v;
+    }
 
     if (!t8030_sgx_chip_info(addr, &value, &derived)) {
         g_assert_not_reached();
@@ -2129,10 +2170,16 @@ static uint64_t t8030_sgx_probe_read(void *opaque, hwaddr addr, unsigned size)
 static void t8030_sgx_probe_write(void *opaque, hwaddr addr, uint64_t data,
                                   unsigned size)
 {
-    (void)opaque;
-    (void)addr;
-    (void)data;
     (void)size;
+
+    if (addr >= SGX_MMU_CFG_BASE && addr <= SGX_MMU_CFG_LAST) {
+        T8030SGXProbe *probe = opaque;
+
+        probe->mmu_cfg[(addr - SGX_MMU_CFG_BASE) / 4] = (uint32_t)data;
+        info_report("sgx: mmu-cfg write @ +0x%" HWADDR_PRIx " <- 0x%08X", addr,
+                    (uint32_t)data);
+        return;
+    }
 
     g_assert_not_reached();
 }
@@ -2146,6 +2193,7 @@ static const MemoryRegionOps t8030_sgx_probe_ops = {
 
 static void t8030_create_sgx_probe(AppleT8030MachineState *t8030)
 {
+    T8030SGXProbe *probe;
     AppleDTNode *child;
     AppleDTProp *prop;
     uint64_t *reg;
@@ -2163,11 +2211,13 @@ static void t8030_create_sgx_probe(AppleT8030MachineState *t8030)
     assert_nonnull(prop);
     reg = (uint64_t *)prop->data;
 
+    probe = g_new0(T8030SGXProbe, 1);
+
     for (i = 0; i < prop->len / (sizeof(uint64_t) * 2); ++i) {
         MemoryRegion *mr = g_new0(MemoryRegion, 1);
         g_autofree char *name = g_strdup_printf("sgx.probe[%" PRIu64 "]", i);
 
-        memory_region_init_io(mr, OBJECT(t8030), &t8030_sgx_probe_ops, t8030,
+        memory_region_init_io(mr, OBJECT(t8030), &t8030_sgx_probe_ops, probe,
                               name, reg[i * 2 + 1]);
         memory_region_add_subregion_overlap(
             get_system_memory(), t8030->armio_base + reg[i * 2], mr, -1000);
