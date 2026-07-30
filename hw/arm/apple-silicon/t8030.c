@@ -42,6 +42,7 @@
 #include "hw/display/apple_scaler.h"
 #include "hw/display/synopsys_mipi_dsim.h"
 #include "hw/dma/apple_sio.h"
+#include "hw/misc/apple-silicon/gfx_asc.h"
 #include "hw/gpio/apple_gpio.h"
 #include "hw/i2c/apple_i2c.h"
 #include "hw/intc/apple_aic.h"
@@ -144,6 +145,7 @@
 
 #define ANS_SIZE (0x3D24000)
 #define SIO_SIZE (0x114000)
+#define GFX_ASC_SIZE (0x200000)
 #define PANIC_SIZE (0x100000)
 
 #define AMCC_BASE (0x200000000)
@@ -566,6 +568,7 @@ static void t8030_memory_setup(AppleT8030MachineState *t8030)
                             info->dram_size, 16 * KiB);
 
     t8030_rtkit_mem_setup(t8030, ca, "sio", "iop-sio-nub", SIO_SIZE);
+    t8030_rtkit_mem_setup(t8030, ca, "gfx-asc", "iop-gfx-nub", GFX_ASC_SIZE);
     t8030_rtkit_mem_setup(t8030, ca, "ans", "iop-ans-nub", ANS_SIZE);
 
     if (t8030->sep_rom_filename) {
@@ -2013,6 +2016,45 @@ static void t8030_create_smc(AppleT8030MachineState *t8030)
     sysbus_realize_and_unref(smc, &error_fatal);
 }
 
+static void t8030_create_gfx_asc(AppleT8030MachineState *t8030)
+{
+    uint32_t i;
+    uint32_t *ints;
+    AppleDTProp *prop;
+    uint64_t *reg;
+    SysBusDevice *gfx_asc;
+    AppleDTNode *child = apple_dt_get_node(t8030->device_tree, "arm-io");
+    AppleDTNode *iop_nub;
+
+    assert_nonnull(child);
+    child = apple_dt_get_node(child, "gfx-asc");
+    assert_nonnull(child);
+    iop_nub = apple_dt_get_node(child, "iop-gfx-nub");
+    assert_nonnull(iop_nub);
+
+    gfx_asc = apple_gfx_asc_from_node(child, APPLE_A7IOP_V2);
+    object_property_add_child(OBJECT(t8030), "gfx-asc", OBJECT(gfx_asc));
+
+    prop = apple_dt_get_prop(child, "reg");
+    assert_nonnull(prop);
+    reg = (uint64_t *)prop->data;
+
+    for (i = 0; i < 2; ++i) {
+        sysbus_mmio_map(gfx_asc, i, t8030->armio_base + reg[i * 2]);
+    }
+
+    prop = apple_dt_get_prop(child, "interrupts");
+    assert_nonnull(prop);
+    ints = (uint32_t *)prop->data;
+
+    for (i = 0; i < prop->len / sizeof(uint32_t); ++i) {
+        sysbus_connect_irq(gfx_asc, i,
+                           qdev_get_gpio_in(DEVICE(t8030->aic), ints[i]));
+    }
+
+    sysbus_realize_and_unref(gfx_asc, &error_fatal);
+}
+
 static void t8030_create_sio(AppleT8030MachineState *t8030)
 {
     uint32_t i;
@@ -3146,6 +3188,7 @@ static void t8030_init(MachineState *machine)
     t8030_create_baseband_spmi(t8030, "spmi1", "baseband-spmi");
     t8030_create_baseband(t8030);
 #endif
+    t8030_create_gfx_asc(t8030);
     t8030_create_sio(t8030);
     t8030_create_spi0(t8030);
     t8030_create_spi(t8030, 1);

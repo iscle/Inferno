@@ -175,7 +175,6 @@ static const char *REM_NAMES[] = {
     "aop-smart-cover\0$",
     "rose\0$",
     "smc-aop\0$",
-    "gfx-asc\0$",
 #ifndef ENABLE_WLAN
     "amfm\0$",
 #endif
