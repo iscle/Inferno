@@ -43,17 +43,100 @@
 #include "util/mlib.h"
 
 /*
- * Every endpoint message is reported: the whole value of the first boot is the
- * transcript of what the firmware kext asks for.
+ * The endpoints AGX looks for.
+ *
+ * `AGXFirmwareKextRTBuddy::matchedGFXEndpointGated` switches on the endpoint
+ * number at [endpoint_service + 0x88] and keeps exactly two:
+ *
+ *   0x20 -> [this+0x90], wrapped in an RTBuddyEndpoint with a receive handler
+ *   0x21 -> [this+0x98], which is the object sendAsyncNoteToFirmware writes to
+ *
+ * anything else is dropped. 0x20 was already announced -- apple_rtkit_register_
+ * user_ep() takes an index *relative* to EP_USER_START (32), so the existing
+ * registration of 0 is absolute endpoint 0x20. 0x21 was not, so
+ * matchedGFXEndpoint only ever filled [this+0x90] and left [this+0x98] NULL --
+ * and [this+0x98] is precisely the object sendAsyncNoteToFirmware writes to.
+ * Every doorbell AGX rang was therefore dropped on the floor before it reached
+ * the mailbox, which is why no endpoint traffic was ever observed.
+ */
+#define GFX_EP_MESSAGE (0)    /* absolute 0x20 */
+#define GFX_EP_ASYNC_NOTE (1) /* absolute 0x21 */
+
+/*
+ * Doorbell encoding, derived from the four senders in AGXArmFirmware. Each
+ * builds a 64-bit note and hands it to
+ * AGXFirmwareKextRTBuddy::sendAsyncNoteToFirmware:
+ *
+ *   submitTAChannel   0x0083000000000000 | (chan << 2) | 0
+ *   submit3DChannel   0x0083000000000000 | (chan << 2) | 1
+ *   submitCLChannel   0x0083000000000000 | (chan << 2) | 2
+ *   kickFirmware      0x0083000000000010          = chan 4, kind 0
+ *   submitDeviceControl 0x0083000000000011        = chan 4, kind 1
+ *   stopFirmwareForRecoveryInspection
+ *                     0x0085000000000000 | device_recovery_count
+ *
+ * `chan` is the third argument masked to 3 bits (`ubfiz w8, w19, #2, #3`), so
+ * the selector is one byte: channel 0..7 in bits 4:2, kind in bits 1:0. TA is
+ * tiling/vertex, 3D is fragment/render, CL is compute.
+ */
+#define GFX_NOTE_TAG(_m) (((_m) >> 48) & 0xFF)
+#define GFX_NOTE_TAG_SUBMIT (0x83)
+#define GFX_NOTE_TAG_HALT (0x85)
+
+static const char *apple_gfx_asc_note_kind(uint64_t msg)
+{
+    switch (msg & 3) {
+    case 0:
+        return "TA (tiling/vertex)";
+    case 1:
+        return "3D (fragment)";
+    case 2:
+        return "CL (compute)";
+    default:
+        return "kind 3 (unknown)";
+    }
+}
+
+/*
+ * Every note is reported, decoded. This transcript is the instrument for the
+ * ring protocol: nothing here answers the firmware side of it yet, so the
+ * driver still times out, but it times out having told us what it submitted.
  */
 static void apple_gfx_asc_handle_endpoint(void *opaque, uint8_t ep,
                                           uint64_t msg)
 {
+    uint32_t sel;
+
     (void)opaque;
 
-    info_report("gfx-asc: UNIMPLEMENTED user endpoint message ep=0x%X "
-                "msg=0x%" PRIX64,
-                ep, msg);
+    /* Report the absolute endpoint, which is what the driver switches on. */
+    ep += 0x20;
+
+    switch (GFX_NOTE_TAG(msg)) {
+    case GFX_NOTE_TAG_SUBMIT:
+        sel = msg & 0xFF;
+        if (sel == 0x10) {
+            info_report("gfx-asc: ep 0x%X note 0x%" PRIX64 " = kickFirmware",
+                        ep, msg);
+        } else if (sel == 0x11) {
+            info_report("gfx-asc: ep 0x%X note 0x%" PRIX64
+                        " = device-control ring submit",
+                        ep, msg);
+        } else {
+            info_report("gfx-asc: ep 0x%X note 0x%" PRIX64
+                        " = submit channel %u, %s",
+                        ep, msg, (sel >> 2) & 7, apple_gfx_asc_note_kind(msg));
+        }
+        break;
+    case GFX_NOTE_TAG_HALT:
+        info_report("gfx-asc: ep 0x%X note 0x%" PRIX64
+                    " = halt for recovery, device_recoveries=%" PRIu64,
+                    ep, msg, msg & 0xFFFFFFFFFFFULL);
+        break;
+    default:
+        info_report("gfx-asc: ep 0x%X UNDECODED note 0x%" PRIX64, ep, msg);
+        break;
+    }
 }
 
 static void ascv2_core_reg_write(void *opaque, hwaddr addr, uint64_t data,
@@ -253,7 +336,10 @@ SysBusDevice *apple_gfx_asc_from_node(AppleDTNode *node,
     reg = (uint64_t *)prop->data;
 
     apple_rtkit_init(rtk, s, "GFX", reg[1], version, &apple_gfx_asc_rtkit_ops);
-    apple_rtkit_register_user_ep(rtk, 0, s, apple_gfx_asc_handle_endpoint);
+    apple_rtkit_register_user_ep(rtk, GFX_EP_MESSAGE, s,
+                                 apple_gfx_asc_handle_endpoint);
+    apple_rtkit_register_user_ep(rtk, GFX_EP_ASYNC_NOTE, s,
+                                 apple_gfx_asc_handle_endpoint);
 
     memory_region_init_io(&s->ascv2_iomem, OBJECT(dev), &ascv2_core_reg_ops, s,
                           TYPE_APPLE_GFX_ASC ".ascv2-core-reg", reg[3]);
