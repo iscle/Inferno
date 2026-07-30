@@ -2388,7 +2388,15 @@ static void t8030_create_gfx_asc(AppleT8030MachineState *t8030)
     iop_nub = apple_dt_get_node(child, "iop-gfx-nub");
     assert_nonnull(iop_nub);
 
-    gfx_asc = apple_gfx_asc_from_node(child, APPLE_A7IOP_V2);
+    /*
+     * V4, like every other t8030 ASC including `ans`, which carries the same
+     * `iop,ascwrap-v2` compatible. Derived, not assumed: with the V2 layout
+     * RTBuddy(GFX) polls +0x810C and gets "Unknown read" forever, and 0x810C is
+     * exactly AKF_STRIDE * 2 + AKF_MAILBOX_OFF + REG_AP_CTRL -- the AP mailbox
+     * control register in the V4 three-window layout. The V2 layout puts the AP
+     * mailbox at 0x4000 and has no third window at all.
+     */
+    gfx_asc = apple_gfx_asc_from_node(child, APPLE_A7IOP_V4);
     object_property_add_child(OBJECT(t8030), "gfx-asc", OBJECT(gfx_asc));
 
     prop = apple_dt_get_prop(child, "reg");
