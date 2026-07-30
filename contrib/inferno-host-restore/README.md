@@ -219,6 +219,16 @@ Two traps that have each cost measurement runs in this project:
   move.** A `GArray` of counters reallocates as it grows, leaving every
   previously translated block writing into freed memory; the crash lands minutes
   later with nothing pointing at the cause. Use a fixed slab.
+- **Dump instrumentation on `SIGUSR1`, not only from `atexit`.** A run that wedges
+  or has to be `SIGKILL`ed takes every counter with it. This is the
+  generalisable one: make the results harvestable at any moment, and a run that
+  ends badly is still a run you can read.
+- **Do not drive the monitor with `nc -U`.** `-monitor unix:...,server,nowait`
+  serves one client at a time, and an `nc` that exits without closing cleanly
+  leaves the chardev occupied: every later connection is accepted but never
+  serviced, so `quit` silently never arrives and the VM looks hung when it is
+  merely unreachable. Confirmed with `lsof -U` showing QEMU holding both the
+  listener and a stale accepted FD. Use a client that closes its socket.
 
 ## Remaining work
 
