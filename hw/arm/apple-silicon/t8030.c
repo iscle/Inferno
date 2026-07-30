@@ -2018,18 +2018,87 @@ static void t8030_create_smc(AppleT8030MachineState *t8030)
 }
 
 /*
- * The GPU's own MMIO is deliberately not modelled. This region exists only to
- * name what the driver asks for: `accepts` logs the offset and size and then
- * refuses the transaction, so the access still fails and the guest still takes
- * its data abort. A read handler returning 0 would instead hand AGX fabricated
- * chip-info and let it limp on measuring nothing, which is exactly what we do
- * not want.
+ * GPU chip-info registers, derived from AGXAcceleratorG12::readChipInfo in the
+ * iOS 14 kernelcache. Everything outside this set is still refused, so the
+ * frontier stays honest: only what has been derived is answered.
+ *
+ * 0x4000 is DERIVED, not chosen. readChipInfo validates three disjoint fields
+ * and takes an early return unless all three match:
+ *   bits 31:16 == 0x300   -> writes 9 to AGXGPUCoreConfig[0x00]
+ *   bits 15:12 == 1
+ *   bits 11:8  == 0
+ * so 0x03001000 is the single point satisfying them.
+ *
+ * 0x4008 is read into wzr -- read-and-discard, any value satisfies it.
+ *
+ * 0x4018/0x401C carry 4-bit factors that readChipInfo multiplies in pairs into
+ * AGXGPUCoreConfig[0x24/0x28/0x2C]. The A13's GPU is a publicly documented
+ * 4-core part, so each product must be 4; the driver constrains only the
+ * products, so the 4x1 factorisation below is a PLACEHOLDER choice among
+ * 4x1 / 1x4 / 2x2 and is logged as such.
+ *
+ * 0x4010/0x4014 supply 8-bit fields to AGXGPUCoreConfig[0x0C..0x20] with no
+ * validation anywhere in readChipInfo. Their consumers further up in
+ * AGXAcceleratorG12 have not been analysed yet, so these are UNKNOWN
+ * placeholders, logged on every read.
+ */
+#define SGX_CHIP_INFO_0x4000 0x03001000u /* derived */
+#define SGX_CHIP_INFO_0x4008 0x00000000u /* read-and-discard */
+#define SGX_CHIP_INFO_0x4010 0x00000101u /* PLACEHOLDER, unvalidated */
+#define SGX_CHIP_INFO_0x4014 0x00010101u /* PLACEHOLDER, unvalidated */
+#define SGX_CHIP_INFO_0x4018 0x04440000u /* factors: 4, product = 4 cores */
+#define SGX_CHIP_INFO_0x401C 0x00001111u /* factors: 1, product = 4 cores */
+
+static bool t8030_sgx_chip_info(hwaddr addr, uint32_t *value, bool *derived)
+{
+    switch (addr) {
+    case 0x4000:
+        *value = SGX_CHIP_INFO_0x4000;
+        *derived = true;
+        return true;
+    case 0x4008:
+        *value = SGX_CHIP_INFO_0x4008;
+        *derived = true;
+        return true;
+    case 0x4010:
+        *value = SGX_CHIP_INFO_0x4010;
+        *derived = false;
+        return true;
+    case 0x4014:
+        *value = SGX_CHIP_INFO_0x4014;
+        *derived = false;
+        return true;
+    case 0x4018:
+        *value = SGX_CHIP_INFO_0x4018;
+        *derived = false;
+        return true;
+    case 0x401C:
+        *value = SGX_CHIP_INFO_0x401C;
+        *derived = false;
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * The GPU is not modelled. Anything outside the derived chip-info set is
+ * logged and then refused via `accepts`, so the access fails and the guest
+ * takes its data abort rather than being handed an invented value.
  */
 static bool t8030_sgx_probe_accepts(void *opaque, hwaddr addr, unsigned size,
                                     bool is_write, MemTxAttrs attrs)
 {
+    uint32_t value;
+    bool derived;
+
     (void)opaque;
     (void)attrs;
+
+    if (!is_write && size == 4 &&
+        t8030_sgx_chip_info(addr, &value, &derived)) {
+        return true;
+    }
 
     qemu_log_mask(LOG_UNIMP,
                   "sgx: UNIMPLEMENTED GPU MMIO %s @ +0x" HWADDR_FMT_plx
@@ -2041,11 +2110,20 @@ static bool t8030_sgx_probe_accepts(void *opaque, hwaddr addr, unsigned size,
 
 static uint64_t t8030_sgx_probe_read(void *opaque, hwaddr addr, unsigned size)
 {
+    uint32_t value = 0;
+    bool derived = false;
+
     (void)opaque;
-    (void)addr;
     (void)size;
 
-    g_assert_not_reached();
+    if (!t8030_sgx_chip_info(addr, &value, &derived)) {
+        g_assert_not_reached();
+    }
+
+    info_report("sgx: chip-info read @ +0x%" HWADDR_PRIx " -> 0x%08X (%s)",
+                addr, value, derived ? "derived" : "PLACEHOLDER/UNKNOWN");
+
+    return value;
 }
 
 static void t8030_sgx_probe_write(void *opaque, hwaddr addr, uint64_t data,
