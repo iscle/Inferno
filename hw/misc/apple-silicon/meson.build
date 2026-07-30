@@ -12,6 +12,7 @@ system_ss.add(when: 'CONFIG_APPLE_SOC', if_true: files(
     'chestnut.c',
     'pmu-d2255.c',
     'aop.c',
+    'gfx_asc.c',
     'baseband.c',
     'apple-bcm-wlan.c',
     'buttons.c',
