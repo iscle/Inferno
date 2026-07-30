@@ -573,16 +573,74 @@ static void t8030_rtkit_mem_setup(AppleT8030MachineState *t8030,
 #define GFX_HANDOFF_HANDOFF_OFF (2 * GFX_HANDOFF_PAGE_SIZE)
 #define GFX_HANDOFF_SIZE (3 * GFX_HANDOFF_PAGE_SIZE)
 
+/*
+ * The three pages are not just handed to the driver, they are handed through
+ * it to PPL. `IOUnifiedAddressTranslator::init` packs them into a 32-byte
+ * options block { 0xBEE5000000010003, TTBAT, TTBR1, handoff } and calls
+ * `pmap_iommu_init(&uat_desc, ...)`; PPL's `uat_init` then calls
+ * `pmap_validate_iommu_regs(va, 0x47554154)` on each one, which panics unless
+ * the page is listed in the `pmap-io-ranges` array on the `/defaults` node.
+ *
+ * pmap_bootstrap parses that property as an array of
+ * { uint64 addr; uint64 len; uint32 wimg; uint32 signature; } and qsorts it, so
+ * appending is fine. The shipped t8030 device tree already carries 32 entries
+ * and every one of them uses wimg 0x4007, which is what the consumers require:
+ * bit 14 is the flag `pmap_enter_options_internal` tests to rewrite a
+ * kernel-RW PTE into PPL-RW (it clears AP and PXN/UXN and sets bit 53, giving
+ * the XPRR permission 1 that pmap_validate_iommu_regs demands), and the low
+ * byte is the cache attribute. The signature is a big-endian FourCC -- the
+ * shipped entries read 'DART', 'SMMU', 'NVMe', 'PCIe' -- and 0x47554154 is
+ * 'GUAT', the GPU UAT, taken from the constant uat_init passes.
+ */
+#define GFX_PMAP_IO_RANGE_SIG 0x47554154u /* 'GUAT' */
+#define GFX_PMAP_IO_RANGE_WIMG 0x00004007u /* PPL-RW | VM_WIMG_IO */
+
+typedef struct QEMU_PACKED {
+    uint64_t addr;
+    uint64_t len;
+    uint32_t wimg;
+    uint32_t signature;
+} PmapIORange;
+
+static void t8030_pmap_io_range_add(AppleDTNode *defaults, hwaddr base,
+                                    hwaddr size, uint32_t signature)
+{
+    g_autofree PmapIORange *ranges = NULL;
+    AppleDTProp *prop;
+    uint32_t old_len;
+
+    prop = apple_dt_get_prop(defaults, "pmap-io-ranges");
+    assert_nonnull(prop);
+    old_len = prop->len;
+    assert_cmpuint(old_len % sizeof(PmapIORange), ==, 0);
+
+    ranges = g_malloc0(old_len + sizeof(PmapIORange));
+    memcpy(ranges, prop->data, old_len);
+    ranges[old_len / sizeof(PmapIORange)] = (PmapIORange){
+        .addr = base,
+        .len = size,
+        .wimg = GFX_PMAP_IO_RANGE_WIMG,
+        .signature = signature,
+    };
+
+    apple_dt_set_prop(defaults, "pmap-io-ranges",
+                      old_len + sizeof(PmapIORange), ranges);
+}
+
 static void t8030_gpu_handoff_setup(AppleT8030MachineState *t8030,
                                     CarveoutAllocator *ca)
 {
     AppleDTNode *sgx;
+    AppleDTNode *defaults;
     hwaddr base;
+    uint64_t i;
 
     sgx = apple_dt_get_node(t8030->device_tree, "arm-io");
     assert_nonnull(sgx);
     sgx = apple_dt_get_node(sgx, "sgx");
     assert_nonnull(sgx);
+    defaults = apple_dt_get_node(t8030->device_tree, "defaults");
+    assert_nonnull(defaults);
 
     base = carveout_alloc_mem(ca, GFX_HANDOFF_SIZE);
 
@@ -597,9 +655,14 @@ static void t8030_gpu_handoff_setup(AppleT8030MachineState *t8030,
     apple_dt_set_prop_u64(sgx, "gfx-handoff-base",
                           base + GFX_HANDOFF_HANDOFF_OFF);
 
+    for (i = 0; i < GFX_HANDOFF_SIZE; i += GFX_HANDOFF_PAGE_SIZE) {
+        t8030_pmap_io_range_add(defaults, base + i, GFX_HANDOFF_PAGE_SIZE,
+                                GFX_PMAP_IO_RANGE_SIG);
+    }
+
     info_report("sgx: handoff carveout @ 0x%" HWADDR_PRIx " size 0x%X "
                 "(TTBR1 0x%" HWADDR_PRIx ", TTBAT 0x%" HWADDR_PRIx
-                ", handoff 0x%" HWADDR_PRIx ")",
+                ", handoff 0x%" HWADDR_PRIx "), 3 `GUAT` pmap-io-ranges",
                 base, GFX_HANDOFF_SIZE, base + GFX_HANDOFF_TTBR1_OFF,
                 base + GFX_HANDOFF_TTBAT_OFF, base + GFX_HANDOFF_HANDOFF_OFF);
 }
