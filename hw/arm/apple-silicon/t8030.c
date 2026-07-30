@@ -531,6 +531,79 @@ static void t8030_rtkit_mem_setup(AppleT8030MachineState *t8030,
     t8030_rtkit_seg_prop_setup(iop_nub, carveout_alloc_mem(ca, size), size);
 }
 
+/*
+ * The iBoot -> AGX handoff, derived from its three consumers in the iOS 14
+ * kernelcache. `IOUnifiedAddressTranslator::mapHardwareResources` fetches all
+ * three properties, metaclass-checks each for OSData and then exact-length
+ * checks it; any failure is a _panic, not a soft error:
+ *
+ *   gfx-shared-region-base   u64  cmp w0, #8   -> the TTBR1 L1 table
+ *   ttbat-phys-addr-base     u32  cmp w0, #4   -> the TTBAT, as a 16 KiB PFN
+ *   gfx-handoff-base         u64  cmp w0, #8   -> the CPU/GPU-firmware handoff
+ *
+ * The names against the regions come from the driver's own IOLog format
+ * strings ("IOUAT ... *** TTBR1: %#llx/%#lx", likewise TTBAT and Handoff), and
+ * `ttbat-phys-addr-base` is a page number because mapHardwareResources does
+ * `lsl x22, x24, #0xe` before handing it to withPhysicalAddress.
+ *
+ * Which node they are read from is DERIVED, and it is not the nub the other
+ * coprocessors use. mapHardwareResources calls vtable+0x370 on the IOService*
+ * at [this+0x18] and then getProperty (vtable+0x118) on the result;
+ * +0x370 resolves to IOService::getProvider and +0x118 to
+ * IORegistryEntry::getProperty in this kernelcache's IOService vtable.
+ * [this+0x18] is init(task*, IOService*)'s second argument, and the call chain
+ * AGXSecureGart::init -> AGXUATMux::registerTaskForService ->
+ * IOUnifiedAddressTranslator::registerTaskForService passes the AGXAccelerator
+ * itself. AGXAcceleratorG12P_B0 matches IOProviderClass AppleARMIODevice /
+ * IONameMatch gpu,t8030, so its provider is the `sgx` node -- the properties
+ * belong on `sgx`, not on `gfx-asc/iop-gfx-nub`.
+ *
+ * Each region is exactly one page. mapHardwareResources maps 0x4000 of each,
+ * and the two consumers that compute it -- AGXUnifiedAddressTranslator::
+ * allocateGart for the shared region and ::initHandoff for the handoff -- both
+ * use `1 << _PAGE_SHIFT_CONST`, which is 14 on t8030.
+ *
+ * The placement inside DRAM is ours: the driver constrains the size and the
+ * 16 KiB alignment but nothing about where. One carveout holds all three so
+ * the kernel keeps its hands off them.
+ */
+#define GFX_HANDOFF_PAGE_SIZE (16 * KiB)
+#define GFX_HANDOFF_TTBR1_OFF (0 * GFX_HANDOFF_PAGE_SIZE)
+#define GFX_HANDOFF_TTBAT_OFF (1 * GFX_HANDOFF_PAGE_SIZE)
+#define GFX_HANDOFF_HANDOFF_OFF (2 * GFX_HANDOFF_PAGE_SIZE)
+#define GFX_HANDOFF_SIZE (3 * GFX_HANDOFF_PAGE_SIZE)
+
+static void t8030_gpu_handoff_setup(AppleT8030MachineState *t8030,
+                                    CarveoutAllocator *ca)
+{
+    AppleDTNode *sgx;
+    hwaddr base;
+
+    sgx = apple_dt_get_node(t8030->device_tree, "arm-io");
+    assert_nonnull(sgx);
+    sgx = apple_dt_get_node(sgx, "sgx");
+    assert_nonnull(sgx);
+
+    base = carveout_alloc_mem(ca, GFX_HANDOFF_SIZE);
+
+    /* iBoot hands these over zeroed; initHandoff reads back before writing. */
+    address_space_set(&address_space_memory, base, 0, GFX_HANDOFF_SIZE,
+                      MEMTXATTRS_UNSPECIFIED);
+
+    apple_dt_set_prop_u64(sgx, "gfx-shared-region-base",
+                          base + GFX_HANDOFF_TTBR1_OFF);
+    apple_dt_set_prop_u32(sgx, "ttbat-phys-addr-base",
+                          (base + GFX_HANDOFF_TTBAT_OFF) >> 14);
+    apple_dt_set_prop_u64(sgx, "gfx-handoff-base",
+                          base + GFX_HANDOFF_HANDOFF_OFF);
+
+    info_report("sgx: handoff carveout @ 0x%" HWADDR_PRIx " size 0x%X "
+                "(TTBR1 0x%" HWADDR_PRIx ", TTBAT 0x%" HWADDR_PRIx
+                ", handoff 0x%" HWADDR_PRIx ")",
+                base, GFX_HANDOFF_SIZE, base + GFX_HANDOFF_TTBR1_OFF,
+                base + GFX_HANDOFF_TTBAT_OFF, base + GFX_HANDOFF_HANDOFF_OFF);
+}
+
 static void t8030_memory_setup(AppleT8030MachineState *t8030)
 {
     AppleDTNode *carveout_memory_map;
@@ -570,6 +643,15 @@ static void t8030_memory_setup(AppleT8030MachineState *t8030)
     t8030_rtkit_mem_setup(t8030, ca, "sio", "iop-sio-nub", SIO_SIZE);
     t8030_rtkit_mem_setup(t8030, ca, "gfx-asc", "iop-gfx-nub", GFX_ASC_SIZE);
     t8030_rtkit_mem_setup(t8030, ca, "ans", "iop-ans-nub", ANS_SIZE);
+
+    /*
+     * Only when the GPU is opted in: otherwise the `sgx` node is about to be
+     * filtered out anyway, and an unconditional carveout would move every
+     * other region and change the memory layout the reference guests boot on.
+     */
+    if (t8030->gpu) {
+        t8030_gpu_handoff_setup(t8030, ca);
+    }
 
     if (t8030->sep_rom_filename) {
         if (!g_file_get_contents(t8030->sep_rom_filename, &seprom, &fsize,
