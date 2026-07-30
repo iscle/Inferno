@@ -40,7 +40,23 @@
     } while (0)
 #endif
 
-static const char *GPU_COMP = "gpu,t8030\0$";
+/*
+ * Kept only when the `gpu` machine property is on.
+ *
+ * `gpu,t8030` is the `sgx` node itself.
+ *
+ * `iommu-mapper,gfx` is `/arm-io/mapper-gfx-asc`, which `gfx-asc` names as its
+ * `iommu-parent`. Every other coprocessor points at a plain `iommu-mapper`
+ * under a DART -- which KEEP_COMP already covers -- but the GPU's ASC is mapped
+ * by the GPU itself: `AGXArmFirmwareMapper`, in com.apple.AGXG12P, matches
+ * IONameMatch `iommu-mapper,gfx` on AppleARMIODevice. So it only exists when
+ * the AGX kext is loaded, i.e. when `sgx` is present, and the "iommu-mapper\0$"
+ * entry below deliberately does not match it (the 13th byte is ',' not NUL).
+ */
+static const char *GPU_COMP[] = {
+    "gpu,t8030\0$",
+    "iommu-mapper,gfx\0$",
+};
 
 static const char *KEEP_COMP[] = {
     "adbe0,s8000\0$",
@@ -287,14 +303,18 @@ static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent,
             }
         }
         /*
-         * The GPU node is opt-in: with it present a real AGX driver attaches
-         * and immediately faults on unmodelled GPU MMIO, so the default has to
-         * stay off for the reference guests to boot.
+         * The GPU nodes are opt-in: with them present a real AGX driver
+         * attaches and starts faulting on unmodelled GPU MMIO, so the default
+         * has to stay off for the reference guests to boot.
          */
-        if (!found && keep_gpu &&
-            memcmp(prop->data, GPU_COMP, MIN(prop->len, sstrlen(GPU_COMP))) ==
-                0) {
-            found = true;
+        if (!found && keep_gpu) {
+            for (i = 0; i < ARRAY_SIZE(GPU_COMP); i++) {
+                if (memcmp(prop->data, GPU_COMP[i],
+                           MIN(prop->len, sstrlen(GPU_COMP[i]))) == 0) {
+                    found = true;
+                    break;
+                }
+            }
         }
         if (!found) {
             assert_nonnull(parent);
