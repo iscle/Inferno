@@ -346,6 +346,8 @@ typedef struct {
     char *ticket_data;
     gsize ticket_length;
     const char *root_snapshot_name;
+    /* Keep the `sgx` GPU node in the device tree (machine property `gpu`). */
+    bool keep_gpu;
     bool non_cold_boot;
     bool had_autoboot;
     AppleBootMode boot_mode;

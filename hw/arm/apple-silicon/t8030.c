@@ -727,6 +727,7 @@ static void t8030_memory_setup(AppleT8030MachineState *t8030)
 
     apple_boot_allocate_segment_records(memory_map, hdr);
 
+    info->keep_gpu = t8030->gpu;
     apple_boot_populate_dt(t8030->device_tree, info, auto_boot);
 
     switch (hdr->file_type) {
@@ -3290,6 +3291,7 @@ static char *t8030_get_boot_mode(Object *obj, Error **errp)
 
 PROP_VISIT_GETTER_SETTER(uint64, ecid);
 PROP_GETTER_SETTER(bool, kaslr_off);
+PROP_GETTER_SETTER(bool, gpu);
 PROP_GETTER_SETTER(bool, force_dfu);
 PROP_GETTER_SETTER(int, usb_conn_type);
 PROP_STR_GETTER_SETTER(trustcache_filename);
@@ -3364,6 +3366,12 @@ static void t8030_class_init(ObjectClass *klass, const void *data)
     object_class_property_add_bool(klass, "kaslr-off", t8030_get_kaslr_off,
                                    t8030_set_kaslr_off);
     object_class_property_set_description(klass, "kaslr-off", "Disable KASLR");
+    object_class_property_add_bool(klass, "gpu", t8030_get_gpu, t8030_set_gpu);
+    object_class_property_set_description(
+        klass, "gpu",
+        "Keep the `sgx` GPU node in the device tree. Off by default: with it "
+        "present AGXAcceleratorG12 attaches and immediately faults on GPU MMIO "
+        "that is not modelled yet.");
     object_class_property_add_bool(klass, "force-dfu", t8030_get_force_dfu,
                                    t8030_set_force_dfu);
     object_class_property_set_description(klass, "force-dfu", "Force DFU");

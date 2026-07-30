@@ -40,6 +40,8 @@
     } while (0)
 #endif
 
+static const char *GPU_COMP = "gpu,t8030\0$";
+
 static const char *KEEP_COMP[] = {
     "adbe0,s8000\0$",
     // "aop-audio\0$",
@@ -265,7 +267,8 @@ static uint64_t sstrlen(const char *str)
     return srawmemchr(str, '$') - str;
 }
 
-static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent)
+static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent,
+                                       bool keep_gpu)
 {
     GList *iter = NULL;
     AppleDTNode *child = NULL;
@@ -282,6 +285,16 @@ static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent)
                 found = true;
                 break;
             }
+        }
+        /*
+         * The GPU node is opt-in: with it present a real AGX driver attaches
+         * and immediately faults on unmodelled GPU MMIO, so the default has to
+         * stay off for the reference guests to boot.
+         */
+        if (!found && keep_gpu &&
+            memcmp(prop->data, GPU_COMP, MIN(prop->len, sstrlen(GPU_COMP))) ==
+                0) {
+            found = true;
         }
         if (!found) {
             assert_nonnull(parent);
@@ -337,7 +350,7 @@ static void apple_boot_process_dt_node(AppleDTNode *node, AppleDTNode *parent)
 
         // iter might get invalidated
         iter = iter->next;
-        apple_boot_process_dt_node(child, node);
+        apple_boot_process_dt_node(child, node, keep_gpu);
     }
 }
 
@@ -637,7 +650,7 @@ void apple_boot_populate_dt(AppleDTNode *root, AppleBootInfo *info,
 
     apple_boot_init_mem_ranges(root);
 
-    apple_boot_process_dt_node(root, NULL);
+    apple_boot_process_dt_node(root, NULL, info->keep_gpu);
 
     // Prevent further additions.
     info->device_tree_size = ROUND_UP_16K(apple_dt_finalise(root));
