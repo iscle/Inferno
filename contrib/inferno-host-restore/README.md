@@ -127,6 +127,65 @@ the earlier broker-polling revision, tag `1e5e94b`) the full restore protocol
 through firmware personalization and RootTicket with zero transport errors —
 works over the host-direct path.
 
+## Device image handling: the SEP pairing spans four images
+
+The SEP's anti-replay state is not confined to one file. It is a pairing across
+
+- `sep_ssc`   -- the emulated secure-storage IC (metadata slots, four identical
+                 copies of each, all rewritten together),
+- `sep_nvram` -- the SEP's own NVRAM,
+- `effaceable` -- where the D-key locker lives,
+- the xART records inside `root` (`/private/xarts/*.gl`).
+
+**Advance any one of those without the others and the device is unrecoverable.**
+The usual way to do it by accident is to run with `snapshot=on` on the NAND
+drives while leaving the two `if=pflash` drives (`sep_nvram`, `sep_ssc`)
+writable: SEPOS rewrites the SEP-xART Locker into `sep_ssc`, the matching xART
+records on the discarded `root` and `effaceable` never persist, and the next boot
+dies in
+
+```
+panic(...): SEP Panic: :sks /sks : ...
+```
+
+immediately after `D-key effaceable locker does not exist, attempt to init it
+implicitly` -- where a healthy boot instead logs `Fetched SEP-xART Locker with
+CRC: ...` and carries on. `run-main-vm.sh` now refuses that combination; use
+`INFERNO_SNAPSHOT_DRIVES=1`, which snapshots all nine drives including both
+pflash devices, or snapshot nothing.
+
+If it has already happened, none of the obvious repairs work:
+
+| attempted state | result |
+|---|---|
+| the desynced `sep_ssc` as-is | `SEP Panic: :sks /sks` |
+| `sep_ssc` zeroed | `SEP Panic: :sars/sars` (anti-replay rollback) |
+| another device's working `sep_ssc` | `:sks /sks` -- it is bound to *that* device's media |
+| boot fully writable so SEPOS can repair | panics before it can write anything |
+
+**A re-restore does not fix it either** -- the restore ramdisk boots far enough to
+hit the same `sks` panic *before* USB enumeration, so `idevicerestore` never gets
+a device to talk to. What works is going back to a freshly created image set:
+truncate `root`, `nvram`, `sep_nvram`, `sep_ssc`, `effaceable`, `ctrl_bits`,
+`panic_log` and `firmware` to zeroes of their original sizes while **preserving
+`syscfg`** (it carries the device identity), then restore. The device then
+enumerates and the restore proceeds normally.
+
+## Debugging: the gdbstub is not usable on t8030
+
+`-s` works, but attaching stops the VM, and stopping the VM violates the AP<->SEP
+mailbox timeout. Reproduced two ways on an iOS 26.5 boot: attaching once gave
+
+```
+panic(...): AppleSEPManager panic for "AppleSEPKeyStore": sks request timeout
+```
+
+and attaching/detaching twice left the guest wedged spinning 100% of userspace
+inside UIKitCore instead. Momentary inspection is fine; breakpoints, stepping and
+anything else that keeps the VM stopped are not. Use PC sampling through the HMP
+monitor (`info registers -a` gives PC plus PSTATE, hence EL) or emulator-side
+counters instead.
+
 ## Remaining work
 
 1. **usbmuxd device activation over the parked path** — get the mux version
