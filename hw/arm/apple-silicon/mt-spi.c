@@ -171,6 +171,11 @@ struct AppleMTSPIState {
     /// lifted contact out of range one scan at a time, or NOT_TRACKING once
     /// there is nothing left to report.
     uint8_t end_stage;
+    /// Flags for the contact currently being tracked. A contact is or is not
+    /// an edge contact from the moment it appears - the firmware is describing
+    /// where the finger came from, not where it is now - so this is latched on
+    /// the contact's first frame and reported unchanged until it ends.
+    uint16_t path_flags;
     int32_t btn_state;
     int32_t prev_btn_state;
     uint32_t display_width;
@@ -211,6 +216,7 @@ static const VMStateDescription vmstate_apple_mt_spi = {
             VMSTATE_INT16(prev_y, AppleMTSPIState),
             VMSTATE_UINT64(prev_ts, AppleMTSPIState),
             VMSTATE_UINT8(end_stage, AppleMTSPIState),
+            VMSTATE_UINT16(path_flags, AppleMTSPIState),
             VMSTATE_INT32(btn_state, AppleMTSPIState),
             VMSTATE_INT32(prev_btn_state, AppleMTSPIState),
             VMSTATE_UINT32(display_width, AppleMTSPIState),
@@ -396,49 +402,60 @@ typedef struct {
 } QEMU_PACKED AppleMTSPIFrameHeader;
 
 /*
- * MT_EDGE_FLAGS_NOTE - why the bottom-edge Home / App Switcher gesture still
- * does not work, and what is left to find.
+ * MT_EDGE_FLAGS_NOTE - the per-contact flags word, and why the bottom-edge
+ * Home / App Switcher gesture needs it.
  *
- * The contact this struct describes carries no edge flags, and iOS needs them.
  * On iPhone X-class devices the digitizer firmware, not the OS, decides that a
- * contact arrived from off the glass; it says so per contact, and iOS copies
- * that straight through:
+ * contact arrived from off the glass. It says so per contact, and iOS copies
+ * that straight through - there is no comparison against the sensor bounds,
+ * the surface descriptor or any threshold anywhere on the path:
  *
- *   MultitouchHID.plugin's MTParserPath::computeEventMask() bit-permutes a
- *   per-contact flags word into the IOHIDEvent digitizer EventMask (field
- *   0x000B0007) - wire bit 0 -> 0x800 FromEdgeTip, bit 1 -> 0x2000
- *   SwipePending, bit 2 -> 0x40000 SwipeLocked and the gate for the
- *   SwipeUP/DOWN/LEFT/RIGHT bits 8..11. UIKit turns that mask into
- *   UITouch._edgeType, and -[_UISEEdgeTypeFailGestureFeature
+ *   MultitouchHID.plugin's MTParserPath::computeEventMask() bit-permutes the
+ *   flags word into the IOHIDEvent digitizer EventMask (field 0x000B0007) -
+ *   bit 0 -> 0x800 FromEdgeTip, bit 1 -> 0x2000 SwipePending, bit 2 ->
+ *   0x40000 SwipeLocked and the gate for the SwipeUP/DOWN/LEFT/RIGHT bits
+ *   8..11, bits 6/7 -> 0x4000/0x8000 EdgePressPending/Active. UIKit turns that
+ *   mask into UITouch._edgeType, and -[_UISEEdgeTypeFailGestureFeature
  *   _incorporateSample:] fails the recogniser outright when the first sample
  *   of a contact has _edgeType == 0. -[UIWindow
  *   _shouldDelayTouchForSystemGestures:] bails on the same condition, which is
- *   why the touch is handed to the foreground app and merely scrolls it.
+ *   why a bottom-edge swipe used to be handed to the foreground app and merely
+ *   scrolled it.
  *
- * The top-edge gesture is unaffected because SpringBoard builds that
- * recogniser with options=1, which omits the edge-type feature and runs on
- * geometry alone - hence Control Center works from inside an app while the
- * Home gesture never fires.
+ * The top-edge gesture never depended on this: SpringBoard builds Control
+ * Centre's recogniser with type 1, options 1, which omits the edge-type
+ * feature and runs on geometry alone. That asymmetry - Control Centre works,
+ * Home never fires - is the signature of a missing flags word rather than of a
+ * coordinate problem.
  *
- * What is NOT known is where the flags word sits in the report-0x44 path entry
- * that this controller emits; the wire-to-contact decoder inside the plugin was
- * not located. Measured, so nobody repeats it:
+ * Where the word sits on the wire was found in MultitouchSupport.framework,
+ * not in MultitouchHID.plugin: the plugin is handed contacts that are already
+ * decoded, and the framework is what reads the raw report the kernel forwards.
+ * Its report-0x44 path loop (iOS 14.0b5, 0x1acba5708) copies each wire record
+ * field by field into a 30-byte intermediate, and the intermediate is then
+ * converted to the 96-byte MTTouch (0x1acbaae38), where
+ * "ldrh w8, [x20, #0x1c]; str w8, [x19, #0x54]" places wire offset 0x1C at
+ * MTTouch + 0x54 - the long-undocumented "field14", which MTParserPath::update
+ * copies verbatim to pathState + 0x6c, which is exactly the word
+ * computeEventMask() permutes.
  *
- *   - The guest does honour frame.path_len: declaring 6 or 12 instead of 20
- *     breaks touch entirely, so the parser is reading this record by that
- *     length.
- *   - Extending path_len to 64 or 128 and setting every added byte from offset
- *     20 onwards changes nothing at all, and does not disturb touch. So the
- *     flags are not simply an extra field past the end of this struct, and
- *     lengthening the record is not the answer on its own.
- *   - Ruled out as causes by experiment: contact geometry (radii 200..660,
- *     orientation, radius scale), report cadence (20..240 Hz), velocity sign,
- *     timestamp units, in-range precursor stages, path/finger/hand ids, and
- *     the touch position itself - the gesture fails even when the contact is
- *     placed 1.5 points from the bottom edge of the panel.
+ * The catch, and the reason widening the record alone never worked: the
+ * framework reads each trailing field only when path_len is big enough for it,
+ * and the flags need the largest threshold of all -
+ *
+ *     offset 0x14 needs path_len >= 22   offset 0x1A needs path_len >= 28
+ *     offset 0x16 needs path_len >= 24   offset 0x1C needs path_len >= 30
+ *     offset 0x18 needs path_len >= 26
+ *
+ * so a 30-byte record is the only one that carries flags at all. Below 22 the
+ * framework computes the contact density itself from the radii, which is what
+ * used to happen and is why this struct now sends it explicitly.
  */
 
-/// One tracked contact.
+/// One tracked contact, exactly as the report-0x44 path loop in
+/// MultitouchSupport.framework reads it. Every field below is copied straight
+/// into the intermediate record at the same offset, so the layout is not
+/// negotiable and frame.path_len must stay sizeof(AppleMTSPIPath).
 typedef struct {
     uint8_t id;
     uint8_t stage;
@@ -450,14 +467,46 @@ typedef struct {
     /// Velocity, in surface units per second.
     int16_t vel_x;
     int16_t vel_y;
-    /// Contact ellipse. iOS derives the contact density from these, so a
-    /// plausible fingertip size keeps it out of its "implausible contact"
-    /// paths.
+    /// Contact ellipse. A plausible fingertip size keeps iOS out of its
+    /// "implausible contact" paths.
     uint16_t radius_major;
     uint16_t radius_minor;
     uint16_t orientation;
+    /// Total contact signal, reported in 1/256ths (iOS logs it as ZTot).
     uint16_t radius_scale;
+    /// Contact signal density, also in 1/256ths (iOS logs it as ZDen). Below
+    /// path_len 22 iOS derives this from the radii instead; see
+    /// apple_mt_spi_contact_density().
+    uint16_t density;
+    /// Read into the intermediate record but never used by the MTTouch
+    /// conversion. iOS's own fallback fills it with the density, so do the
+    /// same rather than leaving it at a value the part would never report.
+    uint16_t density_alt;
+    /// Second contact angle, and contact force in grams. Neither is modelled;
+    /// zero is what the shorter record iOS used to see left them at.
+    int16_t pitch;
+    uint16_t force;
+    /// Per-contact flags, MTTouch + 0x54. See MT_EDGE_FLAGS_NOTE above.
+    uint16_t flags;
 } QEMU_PACKED AppleMTSPIPath;
+
+/// Contact came from off the glass, i.e. the finger crossed the edge of the
+/// sensor rather than landing on it. This is bit 0 of the flags word, and the
+/// one iOS turns into UITouch._edgeType == 1 (_UIEdgeTypeFromEdgeTip), which
+/// is what the system-gesture recognisers refuse to begin without.
+#define MT_PATH_FLAG_FROM_EDGE (1U << 0)
+
+/*
+ * How close to the edge of the sensor a contact has to start before the
+ * controller calls it an edge contact. Real firmware decides this from the
+ * part of the contact ellipse that falls off the array; there is no such
+ * ellipse here, so use a fixed band a little wider than a fingertip radius.
+ * 4 mm is about 51 px on this panel, i.e. 25 pt, which is the same order as
+ * the region SpringBoard's own bottom-edge recogniser will begin in - wide
+ * enough that a deliberate edge swipe is always flagged, narrow enough that
+ * the dock is not.
+ */
+#define MT_EDGE_BAND (400) // 4.00 mm, in units of 0.01 mm
 
 /// Payload bytes that fit in one link-layer frame, after its header and the
 /// trailing CRC.
@@ -1679,6 +1728,53 @@ static uint32_t apple_mt_spi_transfer(SSIPeripheral *dev, uint32_t val)
     return ret;
 }
 
+/*
+ * The contact signal density iOS derives itself whenever the path record is
+ * too short to carry one, reproduced here because a 30-byte record - the only
+ * length that carries the flags word - is no longer too short. Verbatim from
+ * MultitouchSupport.framework 0x1acbaefa4:
+ *
+ *     density = scale * 400 / (max(min_radius, isqrt(major' * minor')) - trim)
+ *
+ * where major' and minor' are each clamped up to min_radius, and min_radius
+ * and trim come from a pair of device parameters this controller does not
+ * report and so leaves at zero.
+ */
+static uint16_t apple_mt_spi_contact_density(uint16_t scale, uint16_t major,
+                                             uint16_t minor)
+{
+    uint32_t product;
+    uint32_t root;
+    uint32_t next;
+
+    product = (uint32_t)major * minor;
+
+    if (product == 0) {
+        return 0;
+    }
+
+    // Integer square root by Newton's method, which converges from any
+    // starting point at or above the answer.
+    root = product;
+    next = (root + 1) / 2;
+
+    while (next < root) {
+        root = next;
+        next = (root + product / root) / 2;
+    }
+
+    return (uint16_t)MIN((uint32_t)scale * 400 / root, UINT16_MAX);
+}
+
+/// Whether a contact appearing at (@x, @y) is one the real controller would
+/// call an edge contact: it is close enough to the border of the sensor array
+/// that the finger must have crossed it rather than landed inside it.
+static bool apple_mt_spi_is_edge_contact(int16_t x, int16_t y)
+{
+    return x < MT_EDGE_BAND || x >= MT_SENSOR_SURFACE_WIDTH - MT_EDGE_BAND ||
+           y < MT_EDGE_BAND || y >= MT_SENSOR_SURFACE_HEIGHT - MT_EDGE_BAND;
+}
+
 static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
                                           uint8_t path_stage, int16_t x,
                                           int16_t y)
@@ -1700,6 +1796,8 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
         s->prev_ts = ts;
         s->prev_x = x;
         s->prev_y = y;
+        s->path_flags =
+            apple_mt_spi_is_edge_contact(x, y) ? MT_PATH_FLAG_FROM_EDGE : 0;
     }
 
     ts_delta_ms = (ts - s->prev_ts) / SCALE_MS;
@@ -1736,13 +1834,20 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
     path.vel_x = cpu_to_le16(MIN(ABS(x_delta) * 1000 / ts_delta_ms, INT16_MAX));
     path.vel_y = cpu_to_le16(MIN(ABS(y_delta) * 1000 / ts_delta_ms, INT16_MAX));
     // A fingertip is roughly 6.6 mm by 5.8 mm in the surface units of
-    // MT_SENSOR_SURFACE_WIDTH. iOS turns these into a contact density itself,
-    // as contactDensityByRadii = (scale * 400) / (sqrt(major * minor) - min),
-    // so there is nothing to compute here beyond a plausible ellipse.
+    // MT_SENSOR_SURFACE_WIDTH.
     path.radius_major = cpu_to_le16(660);
     path.radius_minor = cpu_to_le16(580);
     path.orientation = cpu_to_le16(19317);
     path.radius_scale = cpu_to_le16(100);
+    // The density iOS used to compute from the three fields above. A record
+    // this long is past the length at which it stops doing so, so report the
+    // same number the shorter record made it derive, and leave the fields it
+    // never saw at all - pitch and force - at the zero it defaulted them to.
+    path.density = cpu_to_le16(apple_mt_spi_contact_density(100, 660, 580));
+    path.density_alt = path.density;
+    path.pitch = cpu_to_le16(0);
+    path.force = cpu_to_le16(0);
+    path.flags = cpu_to_le16(s->path_flags);
 
     packet = apple_mt_spi_new_packet(LL_PACKET_LOSSLESS_OUTPUT,
                                      LL_INTERFACE_HID);
@@ -1818,9 +1923,9 @@ static void apple_mt_spi_schedule_touch_update(AppleMTSPIState *s,
  * or four samples with a 100 ms hole after the touch-down. Nothing the host
  * derives from the sample stream — motion, velocity, timing — could be right.
  *
- * For the record, this alone does not make the bottom-edge Home / App Switcher
- * gesture work. That has a separate cause, documented at MT_EDGE_FLAGS_NOTE
- * below; it was measured not to help.
+ * For the record, this alone did not make the bottom-edge Home / App Switcher
+ * gesture work. That had a separate cause, the per-contact flags word; see
+ * MT_EDGE_FLAGS_NOTE.
  */
 static void apple_mt_spi_scan(AppleMTSPIState *s)
 {
@@ -1960,6 +2065,7 @@ static void apple_mt_spi_reset_enter(Object *obj, ResetType type)
     s->x = 0;
     s->y = 0;
     s->prev_ts = 0;
+    s->path_flags = 0;
     s->frame = 0;
     s->stats = (AppleMTSPIStats){ 0 };
     s->power_stats_since = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -2016,7 +2122,10 @@ static void apple_mt_instance_init(Object *obj)
     QEMU_BUILD_BUG_ON(sizeof(AppleMTSPILLHeader) != 8);
     QEMU_BUILD_BUG_ON(sizeof(AppleMTSPIHIDHeader) != 8);
     QEMU_BUILD_BUG_ON(sizeof(AppleMTSPIFrameHeader) != 27);
-    QEMU_BUILD_BUG_ON(sizeof(AppleMTSPIPath) != 20);
+    // 30 bytes exactly: anything shorter and iOS stops reading the flags word
+    // at offset 0x1C, which is what the bottom-edge system gestures need. See
+    // MT_EDGE_FLAGS_NOTE.
+    QEMU_BUILD_BUG_ON(sizeof(AppleMTSPIPath) != 30);
     // HID report 0xD3 promises the host that no report exceeds this, and the
     // transport statistics are by far the longest one this controller sends.
     QEMU_BUILD_BUG_ON(MT_TRANSPORT_STATS_LEN > MT_MAX_PACKET_SIZE);
