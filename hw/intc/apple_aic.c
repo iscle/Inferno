@@ -193,9 +193,18 @@ static void apple_aic_set_irq(void *opaque, int irq, int level)
     QEMU_LOCK_GUARD(&s->mutex);
 
     trace_aic_set_irq(irq, level);
+    /*
+     * A message-signalled vector keeps its pending state when the line drops.
+     * There is no line: the source raises and releases it only to mark the
+     * arrival of one message, and the message stays pending until a CPU takes
+     * it in REG_AIC_IACK. Following the release here instead would throw the
+     * message away whenever it arrived while the vector was masked -- which is
+     * exactly the window a CPU is in while running the handler for the
+     * previous one.
+     */
     if (level) {
         set_bit32(irq, s->eir_state);
-    } else {
+    } else if (!test_bit32(irq, s->eir_message)) {
         clear_bit32(irq, s->eir_state);
     }
 }
@@ -414,6 +423,15 @@ static uint64_t apple_aic_read(void *opaque, hwaddr addr, unsigned size)
             if (test_bit32(i, s->eir_mask) == 0) {
                 if (s->eir_dest[i] & (1 << o->cpu_id)) {
                     set_bit32(i, s->eir_mask);
+                    /*
+                     * Taking a message consumes it: nothing else will ever
+                     * lower this vector, so the latch has to be released here
+                     * or the vector would fire again forever the moment the
+                     * handler unmasks it.
+                     */
+                    if (test_bit32(i, s->eir_message)) {
+                        clear_bit32(i, s->eir_state);
+                    }
                     return kAIC_INT_EXT | AIC_INT_EXTID(i);
                 }
             }
@@ -527,6 +545,7 @@ static void apple_aic_realize(DeviceState *dev, struct Error **errp)
     s->eir_mask = g_new0(uint32_t, s->numEIR);
     s->eir_dest = g_new0(uint32_t, s->numIRQ);
     s->eir_state = g_new0(uint32_t, s->numEIR);
+    s->eir_message = g_new0(uint32_t, s->numEIR);
 
     s->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, apple_aic_tick, dev);
     timer_mod_ns(s->timer, kAICWT);
@@ -538,6 +557,16 @@ static void apple_aic_unrealize(DeviceState *dev)
 {
     AppleAICState *s = APPLE_AIC(dev);
     timer_free(s->timer);
+}
+
+void apple_aic_set_message_vector(AppleAICState *s, uint32_t vector)
+{
+    QEMU_LOCK_GUARD(&s->mutex);
+
+    if (vector >= s->numIRQ) {
+        return;
+    }
+    set_bit32(vector, s->eir_message);
 }
 
 SysBusDevice *apple_aic_create(uint32_t numCPU, AppleDTNode *node,

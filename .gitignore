@@ -24,3 +24,6 @@ GTAGS
 *.gcov
 .cache/
 .DS_Store
+
+# Host-tool build artifacts (sources are tracked, binaries are not)
+contrib/inferno-host-restore/inferno-netd

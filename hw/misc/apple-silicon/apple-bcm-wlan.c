@@ -667,24 +667,6 @@ static const uint8_t apple_bcm_wlan_otp_cis[] = {
 #define BCM_FLOW_RING_ID_BASE 2
 
 /*
- * How long to keep re-asserting the interrupt after we put something on a D2H
- * ring, in case the message itself was lost.
- *
- * The window a message can be lost in is bounded: it is the time the host
- * holds the vector masked, which is its own interrupt handler. So the retries
- * are bounded too -- the first after 10 ms, then doubling, seven of them
- * spanning 1.27 s, which is inside the driver's 1.5 s command watchdog. After
- * that a ring the host still has not read is not a lost message, and hammering
- * it further only starves the CPU fielding the interrupts.
- *
- * A retry sequence is started by a NEW D2H item and by nothing else, so a
- * guest that has stopped draining -- an idle one, or one whose outbound queue
- * has stalled -- goes quiet instead of taking 100 interrupts a second forever.
- */
-#define BCM_IRQ_RETRY_MS 10
-#define BCM_IRQ_RETRY_MAX 7
-
-/*
  * One msgbuf ring, as described by its ring_mem_t descriptor plus the index
  * slot the host allocated for it.
  *
@@ -787,9 +769,6 @@ struct AppleBCMWLANDeviceState {
      * scan and cleared once the results have been delivered; `link_up` tracks
      * whether we have told the host it is associated.
      */
-    QEMUTimer *irq_retry_timer;
-    unsigned irq_retries_left;
-    unsigned irq_retry_delay_ms;
     QEMUTimer *escan_timer;
     QEMUTimer *join_timer;
     uint16_t escan_sync_id;
@@ -824,10 +803,33 @@ struct AppleBCMWLANState {
  * The endpoint sits behind the apcie DART, so host addresses handed to us over
  * msgbuf are IOVAs and must go through the port's own AddressSpace -- never
  * cpu_physical_memory_*().
+ *
+ * Bus mastering is the guest's permission for this endpoint to touch memory at
+ * all, and it takes that permission away before it pulls the mappings out from
+ * under us. Going through the port's AddressSpace rather than the PCI device's
+ * own bypasses the check QEMU would otherwise do for us, so it has to be made
+ * here -- without it a reset endpoint goes on issuing reads that fault the
+ * DART and panic the guest.
  */
+static bool apple_bcm_wlan_dma_allowed(AppleBCMWLANDeviceState *s)
+{
+    PCIDevice *dev = PCI_DEVICE(s);
+
+    if ((pci_get_word(dev->config + PCI_COMMAND) & PCI_COMMAND_MASTER) == 0) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: DMA attempted with bus mastering disabled\n",
+                      __func__);
+        return false;
+    }
+    return true;
+}
+
 static bool apple_bcm_wlan_dma_read(AppleBCMWLANDeviceState *s, uint64_t offset,
                                     uint64_t size, uint8_t *buf)
 {
+    if (!apple_bcm_wlan_dma_allowed(s)) {
+        return false;
+    }
     if (dma_memory_read(s->dma_as, offset, buf, size, MEMTXATTRS_UNSPECIFIED) !=
         MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: Failed to read from DMA.\n",
@@ -841,6 +843,9 @@ static bool apple_bcm_wlan_dma_write(AppleBCMWLANDeviceState *s,
                                      uint64_t offset, uint64_t size,
                                      uint8_t *buf)
 {
+    if (!apple_bcm_wlan_dma_allowed(s)) {
+        return false;
+    }
     if (dma_memory_write(s->dma_as, offset, buf, size,
                          MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: Failed to write to DMA.\n",
@@ -903,6 +908,7 @@ static void apple_bcm_wlan_device_config_write(PCIDevice *dev, uint32_t addr,
     }
 
     pci_default_write_config(dev, addr, val, len);
+    pcie_cap_flr_write_config(dev, addr, val, len);
 }
 
 /*
@@ -954,6 +960,7 @@ static uint64_t apple_bcm_wlan_window_base(AppleBCMWLANDeviceState *s,
  */
 static void apple_bcm_wlan_publish_shared_info(AppleBCMWLANDeviceState *s);
 static void apple_bcm_wlan_h2d_doorbell(AppleBCMWLANDeviceState *s);
+static void apple_bcm_wlan_firmware_stop(AppleBCMWLANDeviceState *s);
 
 static uint32_t apple_bcm_wlan_backplane_read(AppleBCMWLANDeviceState *s,
                                               uint64_t addr)
@@ -1164,6 +1171,16 @@ static void apple_bcm_wlan_backplane_write(AppleBCMWLANDeviceState *s,
             }
             return;
         case BCM_AI_RESETCTRL:
+            /*
+             * Bit 0 holds the core in reset. Asserting it on the wrapper the
+             * firmware runs on stops the firmware -- which is how the driver
+             * begins both a firmware download and a chip reset, and after the
+             * latter it goes on to take our DART mappings away.
+             */
+            if (index == BCM_BACKPLANE_ARM_WRAPPER_INDEX && (data & 1) != 0 &&
+                (s->wrapper_resetctrl[index] & 1) == 0) {
+                apple_bcm_wlan_firmware_stop(s);
+            }
             s->wrapper_resetctrl[index] = data;
             return;
         default:
@@ -1174,6 +1191,50 @@ static void apple_bcm_wlan_backplane_write(AppleBCMWLANDeviceState *s,
     qemu_log_mask(LOG_UNIMP,
                   "%s: UNIMP backplane WRITE @ 0x%" PRIx64 " value 0x%x\n",
                   __func__, addr, data);
+}
+
+/*
+ * The emulated firmware stops running.
+ *
+ * Everything the device does off its own bat -- reporting a scan, completing a
+ * join, walking a ring -- is the firmware doing it, and the firmware only runs
+ * while the chip's ARM core is out of reset. Hold that core down, or reset the
+ * device, and a real chip goes silent immediately: no more DMA, and none of
+ * the ring state it was keeping survives.
+ *
+ * Modelling that is not a nicety. The host tears down this endpoint's DART
+ * mappings as part of resetting it, so a device that kept its timers running
+ * would go on reading ring indices out of memory the host has already
+ * unmapped, and the first such read faults the DART and panics the guest --
+ * turning a recoverable chip reset into a dead machine.
+ */
+static void apple_bcm_wlan_firmware_stop(AppleBCMWLANDeviceState *s)
+{
+    timer_del(s->escan_timer);
+    timer_del(s->join_timer);
+    timer_del(s->virt_if_timer);
+
+    /*
+     * Forget the rings. They describe host memory that is about to stop being
+     * ours to touch, and `valid` is what every path checks before touching it.
+     */
+    s->rings_discovered = false;
+    memset(&s->h2d_ctrl, 0, sizeof(s->h2d_ctrl));
+    memset(&s->h2d_rxpost, 0, sizeof(s->h2d_rxpost));
+    memset(&s->d2h_ctrl, 0, sizeof(s->d2h_ctrl));
+    memset(&s->d2h_tx, 0, sizeof(s->d2h_tx));
+    memset(&s->d2h_rx, 0, sizeof(s->d2h_rx));
+    memset(s->flow_rings, 0, sizeof(s->flow_rings));
+
+    /* And the buffers the host lent us, which it is about to take back. */
+    s->ioctl_resp_head = s->ioctl_resp_count = 0;
+    s->event_head = s->event_count = 0;
+    s->rx_head = s->rx_count = 0;
+
+    s->link_up = false;
+    s->escan_sync_id = 0;
+    s->escan_reported = false;
+    s->virt_if_bsscfgidx = 0;
 }
 
 /*
@@ -1223,18 +1284,8 @@ static void apple_bcm_wlan_publish_shared_info(AppleBCMWLANDeviceState *s)
     memset(ram + BCM_RINGMEM_ADDR,
            0, BCM_RINGMEM_MAX_RINGS * BCM_RINGMEM_ENTRY_SIZE);
 
-    /* A fresh firmware means fresh rings. */
-    s->rings_discovered = false;
-    memset(&s->h2d_ctrl, 0, sizeof(s->h2d_ctrl));
-    memset(&s->h2d_rxpost, 0, sizeof(s->h2d_rxpost));
-    memset(&s->d2h_ctrl, 0, sizeof(s->d2h_ctrl));
-    memset(&s->d2h_tx, 0, sizeof(s->d2h_tx));
-    memset(&s->d2h_rx, 0, sizeof(s->d2h_rx));
-    memset(s->flow_rings, 0, sizeof(s->flow_rings));
-    s->ioctl_resp_head = s->ioctl_resp_count = 0;
-    s->event_head = s->event_count = 0;
-    s->rx_head = s->rx_count = 0;
-    s->link_up = false;
+    /* A fresh firmware means fresh rings, and nothing left over from the old. */
+    apple_bcm_wlan_firmware_stop(s);
 
     /* Last: hand the driver the pointer it is spinning on. */
     stl_le_p(ram + BCM_SHARED_INFO_PTR_ADDR, BCM_SHARED_INFO_ADDR);
@@ -1461,78 +1512,18 @@ static void apple_bcm_wlan_signal_d2h(AppleBCMWLANDeviceState *s)
                       __func__);
         return;
     }
-    msi_notify(pci_dev, 0);
-
     /*
-     * ... and make sure it was not missed.
+     * One message per item, and nothing to follow it up with.
      *
-     * An MSI raised while the host has the vector masked -- which it is for
-     * the whole of its own interrupt handler -- can be lost: the AIC's pending
-     * state is a level that gets dropped again shortly after it is raised, and
-     * if that happens before the host unmasks, the message is gone. The host
-     * has no doorbell to tell us it has drained a D2H ring, so instead nudge it
-     * again a bounded number of times while the ring still has items it has not
-     * read.
-     *
-     * Without this a single lost message stalls a synchronous ioctl until the
-     * driver's 1.5 s watchdog fires ("checkQueues: Outbound Queue Stall"),
-     * which resets the chip and tears the association down.
+     * The host has no doorbell to tell us it has drained a D2H ring, so there
+     * is no way for us to notice a notification that went missing -- which is
+     * why this used to re-assert the interrupt on a timer for as long as a
+     * second, and why a ring the host was merely slow to read took a hundred
+     * spurious interrupts a second. None of that belongs in the device: an MSI
+     * is a message, it cannot be lost between here and the interrupt
+     * controller, and a real chip raises exactly one per item it posts.
      */
-    s->irq_retries_left = BCM_IRQ_RETRY_MAX;
-    s->irq_retry_delay_ms = BCM_IRQ_RETRY_MS;
-    timer_mod(s->irq_retry_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + s->irq_retry_delay_ms);
-}
-
-/* Has the host consumed everything we put on this ring? */
-static bool apple_bcm_wlan_d2h_ring_pending(AppleBCMWLANDeviceState *s,
-                                            AppleBCMWLANRing *ring)
-{
-    uint32_t read_index;
-
-    if (!ring->valid) {
-        return false;
-    }
-    if (!apple_bcm_wlan_read_index(s, s->d2h_r_idx_addr, ring->id,
-                                   &read_index)) {
-        return false;
-    }
-    return read_index != ring->index;
-}
-
-static void apple_bcm_wlan_irq_retry_timer(void *opaque)
-{
-    AppleBCMWLANDeviceState *s = opaque;
-    PCIDevice *pci_dev = PCI_DEVICE(s);
-
-    if (!apple_bcm_wlan_d2h_ring_pending(s, &s->d2h_ctrl) &&
-        !apple_bcm_wlan_d2h_ring_pending(s, &s->d2h_tx) &&
-        !apple_bcm_wlan_d2h_ring_pending(s, &s->d2h_rx)) {
-        /* Drained: the message got through, there is nothing to make up for. */
-        s->irq_retries_left = 0;
-        return;
-    }
-
-    if (s->irq_retries_left == 0) {
-        /*
-         * The host has had more than a second to look and has not. That is not
-         * a lost message any more, it is a host that has stopped reading, and
-         * nudging it further only starves the CPU fielding the interrupts. Say
-         * so once and stop; the next item we post starts a fresh sequence.
-         */
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "%s: host has not drained a D2H ring after %d nudges\n",
-                      __func__, BCM_IRQ_RETRY_MAX);
-        return;
-    }
-    s->irq_retries_left--;
-
-    if (msi_enabled(pci_dev)) {
-        msi_notify(pci_dev, 0);
-    }
-    s->irq_retry_delay_ms *= 2;
-    timer_mod(s->irq_retry_timer,
-              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + s->irq_retry_delay_ms);
+    msi_notify(pci_dev, 0);
 }
 
 /*
@@ -3368,7 +3359,13 @@ SysBusDevice *apple_bcm_wlan_create(AppleDTNode *node, AppleDTNode *mac_node,
     sbd = SYS_BUS_DEVICE(dev);
 
     s->pci_bus = pci_bus;
-    pci_dev = pci_new(-1, TYPE_APPLE_BCM_WLAN_DEVICE);
+    /*
+     * Function 0 of a multi-function device: the BCM4378 is a combo part and
+     * its Bluetooth half is function 1 of this same device (see
+     * apple_bcm_bt_create). The multi-function bit has to be set here or iOS'
+     * PCI configurator never probes function 1 at all.
+     */
+    pci_dev = pci_new_multifunction(PCI_DEVFN(0, 0), TYPE_APPLE_BCM_WLAN_DEVICE);
     s->device = APPLE_BCM_WLAN_DEVICE(pci_dev);
     s->device->root = s;
     s->device->port = port;
@@ -3438,6 +3435,13 @@ static void apple_bcm_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
      */
     pcie_endpoint_cap_init(dev, 0xD0);
     pcie_cap_deverr_init(dev);
+    /*
+     * The driver resets the chip with a function level reset -- AppleBCMWLAN's
+     * flr() logs "pre-FLR ssResetStatus" on the way in -- so the capability has
+     * to be advertised and the write acted on, or the reset does nothing and we
+     * carry state across it that a real part would have dropped.
+     */
+    pcie_cap_flr_init(dev);
 
     /* Single MSI vector, mirroring the baseband endpoint. */
     msi_init(dev, 0x50, 1, true, false, &error_fatal);
@@ -3492,8 +3496,6 @@ static void apple_bcm_wlan_device_pci_realize(PCIDevice *dev, Error **errp)
      * ioctl that asked for them has been completed, so they are posted from a
      * timer rather than from inside the doorbell write.
      */
-    s->irq_retry_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
-                                      apple_bcm_wlan_irq_retry_timer, s);
     s->escan_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL,
                                   apple_bcm_wlan_escan_timer, s);
     s->join_timer =
@@ -3542,30 +3544,11 @@ static void apple_bcm_wlan_device_qdev_reset_hold(Object *obj, ResetType type)
     memset(s->wrapper_ioctrl, 0, sizeof(s->wrapper_ioctrl));
     memset(s->wrapper_resetctrl, 0, sizeof(s->wrapper_resetctrl));
 
-    s->rings_discovered = false;
+    apple_bcm_wlan_firmware_stop(s);
     s->h2d_w_idx_addr = 0;
     s->h2d_r_idx_addr = 0;
     s->d2h_w_idx_addr = 0;
     s->d2h_r_idx_addr = 0;
-    memset(&s->h2d_ctrl, 0, sizeof(s->h2d_ctrl));
-    memset(&s->h2d_rxpost, 0, sizeof(s->h2d_rxpost));
-    memset(&s->d2h_ctrl, 0, sizeof(s->d2h_ctrl));
-    memset(&s->d2h_tx, 0, sizeof(s->d2h_tx));
-    memset(&s->d2h_rx, 0, sizeof(s->d2h_rx));
-    memset(s->flow_rings, 0, sizeof(s->flow_rings));
-    s->ioctl_resp_head = s->ioctl_resp_count = 0;
-    s->event_head = s->event_count = 0;
-    s->rx_head = s->rx_count = 0;
-    s->link_up = false;
-    s->escan_sync_id = 0;
-    s->escan_reported = false;
-    s->virt_if_bsscfgidx = 0;
-    timer_del(s->irq_retry_timer);
-    s->irq_retries_left = 0;
-    s->irq_retry_delay_ms = BCM_IRQ_RETRY_MS;
-    timer_del(s->escan_timer);
-    timer_del(s->join_timer);
-    timer_del(s->virt_if_timer);
 
     /* Unprogrammed fuses read as 0; the CIS sits at kBCOM4378ChipUserOTP. */
     QEMU_BUILD_BUG_ON(BCM_OTP_CIS_OFFSET + sizeof(apple_bcm_wlan_otp_cis) >
@@ -3579,7 +3562,6 @@ static void apple_bcm_wlan_device_pci_uninit(PCIDevice *dev)
 {
     AppleBCMWLANDeviceState *s = APPLE_BCM_WLAN_DEVICE(dev);
 
-    timer_free(s->irq_retry_timer);
     timer_free(s->escan_timer);
     timer_free(s->join_timer);
     timer_free(s->virt_if_timer);

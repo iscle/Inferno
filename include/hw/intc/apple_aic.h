@@ -55,10 +55,26 @@ struct AppleAICState {
     uint32_t *eir_dest;
     AppleAICCPU *cpus;
     uint32_t *eir_state;
+    /*
+     * Which vectors are driven by a message rather than by a wire. Static
+     * wiring, set up once by the machine, so it is not migrated.
+     */
+    uint32_t *eir_message;
 };
 
 
 SysBusDevice *apple_aic_create(uint32_t numCPU, AppleDTNode *node,
                                AppleDTNode *timebase_node);
+
+/*
+ * Mark a vector as message-signalled.
+ *
+ * A wired interrupt is a level the AIC samples: its source holds the line up
+ * until the condition is cleared, so the pending state can simply follow the
+ * line. A message has no line to hold -- it is delivered once and is gone --
+ * so the controller has to latch it, and the latch is only released when a CPU
+ * takes the vector. PCIe MSIs are the only such source on this SoC.
+ */
+void apple_aic_set_message_vector(AppleAICState *s, uint32_t vector);
 
 #endif /* HW_INTC_APPLE_AIC_H */
