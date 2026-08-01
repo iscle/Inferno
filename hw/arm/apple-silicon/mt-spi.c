@@ -160,9 +160,17 @@ struct AppleMTSPIState {
     QEMUTimer *end_timer;
     int16_t x;
     int16_t y;
+    /// Position and virtual-clock time of the last touch frame that was
+    /// actually emitted, which is what the next frame's velocity is measured
+    /// against. Not the last host pointer event: several of those can land
+    /// between two scans, and the sensor only ever sees the one it sampled.
     int16_t prev_x;
     int16_t prev_y;
     uint64_t prev_ts;
+    /// The path stage the end-of-contact timer will report next, walking the
+    /// lifted contact out of range one scan at a time, or NOT_TRACKING once
+    /// there is nothing left to report.
+    uint8_t end_stage;
     int32_t btn_state;
     int32_t prev_btn_state;
     uint32_t display_width;
@@ -202,6 +210,7 @@ static const VMStateDescription vmstate_apple_mt_spi = {
             VMSTATE_INT16(prev_x, AppleMTSPIState),
             VMSTATE_INT16(prev_y, AppleMTSPIState),
             VMSTATE_UINT64(prev_ts, AppleMTSPIState),
+            VMSTATE_UINT8(end_stage, AppleMTSPIState),
             VMSTATE_INT32(btn_state, AppleMTSPIState),
             VMSTATE_INT32(prev_btn_state, AppleMTSPIState),
             VMSTATE_UINT32(display_width, AppleMTSPIState),
@@ -326,6 +335,13 @@ static const VMStateDescription vmstate_apple_mt_spi = {
 #define MT_SENSOR_SURFACE_WIDTH (6458) // 828 px * 7.8
 #define MT_SENSOR_SURFACE_HEIGHT (13977) // 1792 px * 7.8
 
+/*
+ * How often the panel is scanned, and so how often a touch frame is produced
+ * for every contact that exists. The iPhone 11's digitizer reports at the
+ * display's 60 Hz.
+ */
+#define MT_SCAN_INTERVAL_NS (NANOSECONDS_PER_SECOND / 60)
+
 #define PATH_STAGE_NOT_TRACKING (0)
 #define PATH_STAGE_START_IN_RANGE (1)
 #define PATH_STAGE_HOVER_IN_RANGE (2)
@@ -378,6 +394,49 @@ typedef struct {
     uint8_t path_len;
     uint8_t reserved3[10];
 } QEMU_PACKED AppleMTSPIFrameHeader;
+
+/*
+ * MT_EDGE_FLAGS_NOTE - why the bottom-edge Home / App Switcher gesture still
+ * does not work, and what is left to find.
+ *
+ * The contact this struct describes carries no edge flags, and iOS needs them.
+ * On iPhone X-class devices the digitizer firmware, not the OS, decides that a
+ * contact arrived from off the glass; it says so per contact, and iOS copies
+ * that straight through:
+ *
+ *   MultitouchHID.plugin's MTParserPath::computeEventMask() bit-permutes a
+ *   per-contact flags word into the IOHIDEvent digitizer EventMask (field
+ *   0x000B0007) - wire bit 0 -> 0x800 FromEdgeTip, bit 1 -> 0x2000
+ *   SwipePending, bit 2 -> 0x40000 SwipeLocked and the gate for the
+ *   SwipeUP/DOWN/LEFT/RIGHT bits 8..11. UIKit turns that mask into
+ *   UITouch._edgeType, and -[_UISEEdgeTypeFailGestureFeature
+ *   _incorporateSample:] fails the recogniser outright when the first sample
+ *   of a contact has _edgeType == 0. -[UIWindow
+ *   _shouldDelayTouchForSystemGestures:] bails on the same condition, which is
+ *   why the touch is handed to the foreground app and merely scrolls it.
+ *
+ * The top-edge gesture is unaffected because SpringBoard builds that
+ * recogniser with options=1, which omits the edge-type feature and runs on
+ * geometry alone - hence Control Center works from inside an app while the
+ * Home gesture never fires.
+ *
+ * What is NOT known is where the flags word sits in the report-0x44 path entry
+ * that this controller emits; the wire-to-contact decoder inside the plugin was
+ * not located. Measured, so nobody repeats it:
+ *
+ *   - The guest does honour frame.path_len: declaring 6 or 12 instead of 20
+ *     breaks touch entirely, so the parser is reading this record by that
+ *     length.
+ *   - Extending path_len to 64 or 128 and setting every added byte from offset
+ *     20 onwards changes nothing at all, and does not disturb touch. So the
+ *     flags are not simply an extra field past the end of this struct, and
+ *     lengthening the record is not the answer on its own.
+ *   - Ruled out as causes by experiment: contact geometry (radii 200..660,
+ *     orientation, radius scale), report cadence (20..240 Hz), velocity sign,
+ *     timestamp units, in-range precursor stages, path/finger/hand ids, and
+ *     the touch position itself - the gesture fails even when the contact is
+ *     placed 1.5 points from the bottom edge of the panel.
+ */
 
 /// One tracked contact.
 typedef struct {
@@ -1621,7 +1680,8 @@ static uint32_t apple_mt_spi_transfer(SSIPeripheral *dev, uint32_t val)
 }
 
 static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
-                                          uint8_t path_stage)
+                                          uint8_t path_stage, int16_t x,
+                                          int16_t y)
 {
     AppleMTSPILLPacket *packet;
     AppleMTSPIFrameHeader frame;
@@ -1630,12 +1690,27 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
     int32_t x_delta;
     int32_t y_delta;
 
+    /*
+     * A contact has no velocity on the scan that first sees it: there is no
+     * earlier sample of it to difference against. Seeding the previous sample
+     * with this one keeps the first frame of a path at zero rather than
+     * reporting the distance from wherever the last, unrelated contact ended.
+     */
+    if (path_stage == PATH_STAGE_MAKE_TOUCH) {
+        s->prev_ts = ts;
+        s->prev_x = x;
+        s->prev_y = y;
+    }
+
     ts_delta_ms = (ts - s->prev_ts) / SCALE_MS;
     ts_delta_ms = MAX(ts_delta_ms, 1); // Prevent div-by-zero
-    s->prev_ts = ts;
 
-    x_delta = s->x - s->prev_x;
-    y_delta = s->y - s->prev_y;
+    x_delta = x - s->prev_x;
+    y_delta = y - s->prev_y;
+
+    s->prev_ts = ts;
+    s->prev_x = x;
+    s->prev_y = y;
 
     memset(&frame, 0, sizeof(frame));
     frame.frame_number = s->frame;
@@ -1650,8 +1725,8 @@ static void apple_mt_spi_send_path_update(AppleMTSPIState *s, uint64_t ts,
     path.stage = path_stage;
     path.finger_id = 1;
     path.hand_id = 1;
-    path.x = cpu_to_le16(s->x);
-    path.y = cpu_to_le16(s->y);
+    path.x = cpu_to_le16(x);
+    path.y = cpu_to_le16(y);
     // Surface units per second. The previous form divided by a nanosecond
     // delta before scaling, so it truncated to zero for every plausible
     // movement; dividing by the millisecond delta is what was meant. Both
@@ -1688,6 +1763,15 @@ typedef struct {
     AppleMTSPIState *s;
     uint64_t ts;
     uint8_t path_stage;
+    /*
+     * The position as of the scan this update stands for, not as of whenever
+     * the bottom half happens to run. The two are not the same: host pointer
+     * events keep arriving while the update sits in the queue, and a frame
+     * that claimed the later position would place the start of a swipe
+     * somewhere along its middle.
+     */
+    int16_t x;
+    int16_t y;
 } AppleMTSPITouchUpdate;
 
 static AppleMTSPITouchUpdate *apple_mt_spi_new_touch_update(AppleMTSPIState *s,
@@ -1697,6 +1781,8 @@ static AppleMTSPITouchUpdate *apple_mt_spi_new_touch_update(AppleMTSPIState *s,
     update->s = s;
     update->ts = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     update->path_stage = path_stage;
+    update->x = s->x;
+    update->y = s->y;
     return update;
 }
 
@@ -1706,7 +1792,8 @@ static void apple_mt_spi_send_touch_update_bh(void *opaque)
 
     QEMU_LOCK_GUARD(&update->s->lock);
 
-    apple_mt_spi_send_path_update(update->s, update->ts, update->path_stage);
+    apple_mt_spi_send_path_update(update->s, update->ts, update->path_stage,
+                                  update->x, update->y);
 
     g_free(opaque);
 }
@@ -1719,76 +1806,121 @@ static void apple_mt_spi_schedule_touch_update(AppleMTSPIState *s,
                             apple_mt_spi_new_touch_update(s, path_stage));
 }
 
+/*
+ * A scan of the panel, which is what produces one touch frame. The controller
+ * reports the state of every tracked contact on every scan for as long as the
+ * contact exists — a stationary finger is reported just as often as a moving
+ * one — because "no frame" is not a statement a scanning digitizer can make.
+ *
+ * Reporting only when the position changed, which is what this used to do at
+ * 20 Hz, is not a harmless optimisation: a press followed by a pause then
+ * looks identical to no press at all, and a fast swipe was described by three
+ * or four samples with a 100 ms hole after the touch-down. Nothing the host
+ * derives from the sample stream — motion, velocity, timing — could be right.
+ *
+ * For the record, this alone does not make the bottom-edge Home / App Switcher
+ * gesture work. That has a separate cause, documented at MT_EDGE_FLAGS_NOTE
+ * below; it was measured not to help.
+ */
+static void apple_mt_spi_scan(AppleMTSPIState *s)
+{
+    timer_mod(s->timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MT_SCAN_INTERVAL_NS);
+}
+
 static void apple_mt_spi_timer_tick(void *opaque)
 {
     AppleMTSPIState *s = opaque;
 
     QEMU_LOCK_GUARD(&s->lock);
 
-    if (s->prev_x != s->x || s->prev_y != s->y) {
-        apple_mt_spi_schedule_touch_update(s, PATH_STAGE_TOUCHING);
+    if ((s->btn_state & MOUSE_EVENT_LBUTTON) == 0) {
+        return;
     }
 
-    if (s->btn_state & MOUSE_EVENT_LBUTTON) {
-        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                                NANOSECONDS_PER_SECOND / 20);
-    }
+    apple_mt_spi_schedule_touch_update(s, PATH_STAGE_TOUCHING);
+    apple_mt_spi_scan(s);
 }
 
+/*
+ * A lifted finger does not vanish from the sensor: it passes out of contact
+ * but stays in range for a scan or two before the controller stops tracking
+ * it. Walking BREAK_TOUCH -> LINGER_IN_RANGE -> OUT_OF_RANGE one scan apart is
+ * what the stage enumeration describes, and it gives the host the same
+ * end-of-path it would see from the real part.
+ */
 static void apple_mt_spi_end_timer_tick(void *opaque)
 {
     AppleMTSPIState *s = opaque;
 
     QEMU_LOCK_GUARD(&s->lock);
 
-    apple_mt_spi_schedule_touch_update(s, PATH_STAGE_OUT_OF_RANGE);
+    if (s->end_stage == PATH_STAGE_LINGER_IN_RANGE) {
+        apple_mt_spi_schedule_touch_update(s, PATH_STAGE_LINGER_IN_RANGE);
+        s->end_stage = PATH_STAGE_OUT_OF_RANGE;
+        timer_mod(s->end_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MT_SCAN_INTERVAL_NS);
+        return;
+    }
 
-    s->prev_ts = 0;
-    s->prev_x = 0;
-    s->prev_y = 0;
+    apple_mt_spi_schedule_touch_update(s, PATH_STAGE_OUT_OF_RANGE);
+    s->end_stage = PATH_STAGE_NOT_TRACKING;
 }
 
 static void apple_mt_spi_mouse_event(void *opaque, int dx, int dy, int dz,
                                      int buttons_state)
 {
     AppleMTSPIState *s = opaque;
+    int32_t x;
+    int32_t y;
+    int32_t y_offset;
 
     QEMU_LOCK_GUARD(&s->lock);
 
-    s->prev_x = s->x;
-    s->prev_y = s->y;
-    s->x = qemu_input_scale_axis(dx, INPUT_EVENT_ABS_MIN, INPUT_EVENT_ABS_MAX,
-                                 0, MT_SENSOR_SURFACE_WIDTH);
-    s->y =
-        qemu_input_scale_axis(INPUT_EVENT_ABS_MAX - dy, INPUT_EVENT_ABS_MIN,
-                              INPUT_EVENT_ABS_MAX, 0, MT_SENSOR_SURFACE_HEIGHT);
+    x = qemu_input_scale_axis(dx, INPUT_EVENT_ABS_MIN, INPUT_EVENT_ABS_MAX, 0,
+                              MT_SENSOR_SURFACE_WIDTH);
+    y = qemu_input_scale_axis(INPUT_EVENT_ABS_MAX - dy, INPUT_EVENT_ABS_MIN,
+                              INPUT_EVENT_ABS_MAX, 0,
+                              MT_SENSOR_SURFACE_HEIGHT);
     // Hardcoded calibration on y-axis.
     // Tested accuracy for display_height 1792 is +/- 1 pixel.
     // it might not be perfect, also there might be some calibration needed for
     // "x".
-    // s->y -= qemu_input_scale_axis(16, 0, 1792, 0,
-    // MT_SENSOR_SURFACE_HEIGHT);
-    // fprintf(stderr, "%s: display_height: %u ; display_width: %u\n", __func__,
-    //         s->display_height, s->display_width);
-    s->y -= qemu_input_scale_axis(16, 0, s->display_height, 0,
-                                  MT_SENSOR_SURFACE_HEIGHT);
+    y_offset = qemu_input_scale_axis(16, 0, s->display_height, 0,
+                                     MT_SENSOR_SURFACE_HEIGHT);
+    y -= y_offset;
+
+    /*
+     * The sensor surface is the whole of the coordinate space the controller
+     * can describe, so a contact outside it is not something the real part can
+     * report — it would have to be off the edge of the glass. The y-axis
+     * calibration above subtracts a fixed offset, which by itself sends the
+     * bottom-most rows of the display negative, and the path entry's x and y
+     * are signed 16-bit fields that carry that straight to the host. Clamp
+     * both axes, and mind that this cannot be an assert_*(): NDEBUG compiles
+     * those out of this build entirely.
+     */
+    s->x = MIN(MAX(x, 0), MT_SENSOR_SURFACE_WIDTH - 1);
+    s->y = MIN(MAX(y, 0), MT_SENSOR_SURFACE_HEIGHT - 1);
+
     s->prev_btn_state = s->btn_state;
     s->btn_state = buttons_state;
 
     if ((s->prev_btn_state & MOUSE_EVENT_LBUTTON) == 0 &&
         (s->btn_state & MOUSE_EVENT_LBUTTON) != 0) {
-        apple_mt_spi_schedule_touch_update(s, PATH_STAGE_MAKE_TOUCH);
-
         timer_del(s->end_timer);
-        timer_mod(s->timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                                NANOSECONDS_PER_SECOND / 10);
+        s->end_stage = PATH_STAGE_NOT_TRACKING;
+
+        apple_mt_spi_schedule_touch_update(s, PATH_STAGE_MAKE_TOUCH);
+        apple_mt_spi_scan(s);
     } else if ((s->prev_btn_state & MOUSE_EVENT_LBUTTON) != 0 &&
                (s->btn_state & MOUSE_EVENT_LBUTTON) == 0) {
-        apple_mt_spi_schedule_touch_update(s, PATH_STAGE_BREAK_TOUCH);
-
         timer_del(s->timer);
-        timer_mod(s->end_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                                    NANOSECONDS_PER_SECOND / 10);
+
+        apple_mt_spi_schedule_touch_update(s, PATH_STAGE_BREAK_TOUCH);
+        s->end_stage = PATH_STAGE_LINGER_IN_RANGE;
+        timer_mod(s->end_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + MT_SCAN_INTERVAL_NS);
     }
 }
 static void apple_mt_spi_realize(SSIPeripheral *dev, Error **errp)
