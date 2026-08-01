@@ -132,6 +132,8 @@ MACHINE+=",kaslr-off=true"
 # Guest-measured deadlines -- watchdogs, driver timeouts, the datamigrator's
 # per-plugin budget -- then scale with how fast this emulator actually runs.
 [ -n "${INFERNO_TIME_DILATION:-}" ] && MACHINE+=",time-dilation=$INFERNO_TIME_DILATION"
+# Keep the `sgx` GPU node in the device tree so a real AGX driver attaches.
+[ -n "${INFERNO_GPU:-}" ] && MACHINE+=",gpu=$INFERNO_GPU"
 case "$USB_CONN_TYPE" in
     unix)
         # default path is used when addr is omitted; pass it explicitly for clarity

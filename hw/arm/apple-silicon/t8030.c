@@ -570,11 +570,52 @@ static void t8030_rtkit_mem_setup(AppleT8030MachineState *t8030,
  * 16 KiB alignment but nothing about where. One carveout holds all three so
  * the kernel keeps its hands off them.
  */
+/*
+ * iOS 26.5 (xnu-12377) rewrote this contract, and a 14-only device tree panics
+ * it before the accelerator ever starts:
+ *
+ *   panic: IOUAT ERROR: Failed to retrieve 'gfx-shared-region-size' DT prop
+ *          @IOUnifiedAddressTranslator.cpp:368
+ *
+ * Its mapHardwareResources (@0xfffffff00a520f40 in the 26.5 kernelcache) first
+ * fetches `gfx-shared-region-size` as a u64, then maps four regions through one
+ * helper (@0xfffffff00a52141c) called as (this, label, property, size):
+ *
+ *   "ASC carveout region"    gfx-shared-region-base      <the size property>
+ *   "TTBR1 shared L2 table"  gfx-shared-l2-region-base   0x4000
+ *   "TTBAT"                  gpu-region-base             0x4000
+ *   "GPU handoff region"     gfx-handoff-base            0x4000
+ *
+ * The labels are the driver's own IOLog strings, sitting next to the property
+ * names in __TEXT. The helper pins the encoding exactly: it length-checks every
+ * property at 8 bytes, so all four bases are u64 *physical addresses* -- the
+ * 14-era u32 page number is gone, and `ttbat-phys-addr-base` is renamed
+ * `gpu-region-base` -- then rejects a base with any of bits 13:0 set
+ * ("Expected %s base address to be page-aligned") and a size that is zero or
+ * not a multiple of 0x4000 ("Expected %s size to be a non-zero multiple of the
+ * page size"), before IOMemoryDescriptor::withPhysicalAddress(base, size, 3).
+ *
+ * So iOS 26 needs one region iOS 14 never asked for, the shared L2 table, and
+ * both spellings of the TTBAT base. Publishing all of them keeps one device
+ * tree working for both: each driver fetches only the names it knows, and an
+ * unread property costs nothing.
+ *
+ * NAMED UNKNOWN -- `gfx-shared-region-size`. The driver constrains it only to a
+ * non-zero multiple of 0x4000; it does not tell us the intended value. 0x4000
+ * is what the region demonstrably *is*: on iOS 14 the same property is the
+ * TTBR1 L1 table and AGXUnifiedAddressTranslator::allocateGart sizes it as
+ * `1 << _PAGE_SHIFT_CONST` (14 here), and mapHardwareResources mapped a literal
+ * 0x4000 of it. The 26.5 label "ASC carveout region" hints it may instead want
+ * the whole GFX_ASC_SIZE carveout; that is a guess, so it is not made here.
+ * If the accelerator faults past mapHardwareResources on a region that looks
+ * short, this is the first thing to revisit.
+ */
 #define GFX_HANDOFF_PAGE_SIZE (16 * KiB)
 #define GFX_HANDOFF_TTBR1_OFF (0 * GFX_HANDOFF_PAGE_SIZE)
 #define GFX_HANDOFF_TTBAT_OFF (1 * GFX_HANDOFF_PAGE_SIZE)
 #define GFX_HANDOFF_HANDOFF_OFF (2 * GFX_HANDOFF_PAGE_SIZE)
-#define GFX_HANDOFF_SIZE (3 * GFX_HANDOFF_PAGE_SIZE)
+#define GFX_HANDOFF_SHARED_L2_OFF (3 * GFX_HANDOFF_PAGE_SIZE)
+#define GFX_HANDOFF_SIZE (4 * GFX_HANDOFF_PAGE_SIZE)
 
 /*
  * The three pages are not just handed to the driver, they are handed through
@@ -658,6 +699,13 @@ static void t8030_gpu_handoff_setup(AppleT8030MachineState *t8030,
                           (base + GFX_HANDOFF_TTBAT_OFF) >> 14);
     apple_dt_set_prop_u64(sgx, "gfx-handoff-base",
                           base + GFX_HANDOFF_HANDOFF_OFF);
+    /* iOS 16+ spellings; see the comment above GFX_HANDOFF_PAGE_SIZE. */
+    apple_dt_set_prop_u64(sgx, "gfx-shared-region-size",
+                          GFX_HANDOFF_PAGE_SIZE);
+    apple_dt_set_prop_u64(sgx, "gfx-shared-l2-region-base",
+                          base + GFX_HANDOFF_SHARED_L2_OFF);
+    apple_dt_set_prop_u64(sgx, "gpu-region-base",
+                          base + GFX_HANDOFF_TTBAT_OFF);
 
     for (i = 0; i < GFX_HANDOFF_SIZE; i += GFX_HANDOFF_PAGE_SIZE) {
         t8030_pmap_io_range_add(defaults, base + i, GFX_HANDOFF_PAGE_SIZE,
