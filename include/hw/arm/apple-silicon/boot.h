@@ -20,6 +20,18 @@
 #ifndef HW_ARM_APPLE_SILICON_BOOT_H
 #define HW_ARM_APPLE_SILICON_BOOT_H
 
+/*
+ * NOTE for restores: with a baseband present the device asks the restore to
+ * update it, and idevicerestore then has to personalise the baseband firmware
+ * through Apple's TSS server -- a separate request from the main one, not
+ * covered by the locally forged APTicket passed with -T, and TSS will not
+ * personalise a forged ECID:
+ *   Updating baseband (19) / Sending Baseband TSS request...
+ *   Unable to fetch Baseband TSS / Unable to send baseband data
+ *   Unknown operation (79) / Unable to restore device
+ * Undefine this while restoring; the known-good 26.5 restore predates
+ * `t8030: enable the baseband` and never saw that step.
+ */
 #define ENABLE_BASEBAND
 #define ENABLE_WLAN
 /*
@@ -51,6 +63,19 @@
  *
  */
 // #define ENABLE_BT
+/*
+ * Data protection. Undefining this is a *diagnostic* configuration: boot.c
+ * strips `content-protect` and `encryptable` from the device tree, so APFS leaves the Data and User volumes in the clear and the
+ * host can read /var/mobile/Library/Logs and /var/db/diagnostics out of the raw
+ * NAND image offline. That is the only way to see guest userspace os_log and
+ * crash reports: logd claims the firehose as soon as it starts, after which
+ * nothing userspace logs reaches the serial console.
+ *
+ * Only meaningful for an image restored by a build with the same setting -- an
+ * already-encrypted volume stays encrypted, so it needs its own restore. From
+ * iOS 26 it also needs the `allow an unencrypted data volume` kernel patch,
+ * which is compiled only when this is undefined.
+ */
 #define ENABLE_DATA_ENCRYPTION
 
 #include "qemu/osdep.h"

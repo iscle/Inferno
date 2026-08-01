@@ -278,6 +278,63 @@ static void ck_kp_apfs_patches(CKPatcherRange *range)
     ck_patcher_find_callback(range, "bypass root hash authentication",
                              root_hash_pattern, NULL, sizeof(root_hash_pattern),
                              sizeof(uint32_t), ck_kp_root_hash_callback);
+
+#ifndef ENABLE_DATA_ENCRYPTION
+    /*
+     * Without data protection the Data volume is created in the clear, and from
+     * iOS 26 APFS refuses to mount it:
+     *
+     *   handle_mount:890: disk2s2 vol-uuid: ... (unencrypted; flags: 0x1; ...)
+     *   panic(...): "unencrypted data volume is not allowed" @apfs_vfsops.c:2372
+     *
+     * That check is what makes the whole ENABLE_DATA_ENCRYPTION=off
+     * configuration -- which strips `content-protect` and `encryptable` from the
+     * device tree in boot.c -- unusable on 26, and the restore dies at the point
+     * where restored_external mounts the freshly created Data volume.
+     *
+     * The test is a role check followed by a single flag test:
+     *
+     *   ldr  x8, [x19, #0xC0]        ; volume superblock
+     *   ldrh w9, [x8, #0x3C4]        ; role
+     *   cmp  w9, #0x40               ; APFS_VOL_ROLE_DATA
+     *   b.ne <return>
+     *   ldrb w8, [x8, #0x108]        ; encryption flag
+     *   tbnz w8, #0, <panic>
+     *
+     * NOP the tbnz, so an unencrypted Data volume falls through to the same
+     * return the non-Data path already takes. Only the branch is touched; the
+     * role and flag loads keep their side effects.
+     *
+     * Deliberately compiled only when data protection is off: with encryption
+     * on, the condition is never true and the check should stay.
+     */
+    static const uint8_t unenc_data_pattern[] = {
+        0x00, 0x60, 0x40, 0xF9, // ldr x?, [x?, #0xC0]
+        0x00, 0x88, 0x47, 0x79, // ldrh w?, [x?, #0x3C4]
+        0x1F, 0x00, 0x01, 0x71, // cmp w?, #0x40
+        0x01, 0x00, 0x00, 0x54, // b.ne ?
+        0x00, 0x20, 0x44, 0x39, // ldrb w?, [x?, #0x108]
+        0x00, 0x00, 0x00, 0x37, // tbnz w?, #0, ?
+    };
+    /*
+     * Byte 0 of each instruction holds Rt and the low bits of Rn, and byte 1
+     * holds the low six bits of imm12 above the high two of Rn -- so registers
+     * are masked out with 0x00/0xFC and only the offsets and opcodes are
+     * matched. The one register that is pinned is the `cmp`'s destination
+     * (0x1F = wzr), which is what makes it a compare rather than a subtract.
+     */
+    static const uint8_t unenc_data_mask[] = {
+        0x00, 0xFC, 0xFF, 0xFF, 0x00, 0xFC, 0xFF, 0xFF, 0x1F, 0xFC, 0xFF, 0xFF,
+        0x1F, 0x00, 0x00, 0xFF, 0x00, 0xFC, 0xFF, 0xFF, 0x00, 0x00, 0xF8, 0xFF,
+    };
+    QEMU_BUILD_BUG_ON(sizeof(unenc_data_pattern) != sizeof(unenc_data_mask));
+    static const uint8_t unenc_data_repl[] = { NOP_BYTES };
+    ck_patcher_find_replace(range, "allow an unencrypted data volume",
+                            unenc_data_pattern, unenc_data_mask,
+                            sizeof(unenc_data_pattern), sizeof(uint32_t),
+                            unenc_data_repl, NULL, 0x14,
+                            sizeof(unenc_data_repl));
+#endif
 }
 
 static bool ck_kp_tc_callback(void *ctx, uint8_t *buffer)
