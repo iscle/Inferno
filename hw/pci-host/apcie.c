@@ -1336,6 +1336,11 @@ static void apple_pcie_port_config_write(void *opaque, hwaddr addr,
         int sid_1 = (data >> 16) & 0xf;
         int rid = (data >> 0) & UINT16_MAX;
         port->port_rid_sid_map[sid_0] = data;
+        /*
+         * Endpoints cache the stream they resolved out of this table; bumping
+         * the generation is what tells them to look again.
+         */
+        port->rid_sid_generation++;
         DPRINTF("%s: Port %u: sid_rid_map: sid_and_rid_nonzero: %u sid_0: %u"
                 " sid_1: %u rid: 0x%x\n",
                 __func__, port->bus_nr, sid_and_rid_nonzero, sid_0, sid_1, rid);
@@ -1733,6 +1738,8 @@ static ApplePCIEPort *apple_pcie_create_port(AppleDTNode *node, uint32_t bus_nr,
         assert_nonnull(object_property_add_const_link(OBJECT(port), "dma-mr",
                                                         OBJECT(dma_mr)));
         port->dma_mr = MEMORY_REGION(dma_mr);
+        /* Kept so a function's own stream can be resolved later on demand. */
+        port->dart = dart;
 
 #if 1
         qdev_init_gpio_out_named(DEVICE(port),
@@ -2134,7 +2141,73 @@ static AddressSpace *apple_pcie_host_set_iommu(PCIBus *bus, void *opaque,
 {
     ApplePCIEPort *port = opaque;
 
+    /*
+     * QEMU asks for this once, when the function is registered, which is long
+     * before the guest programs the requester-id-to-stream-id table -- so the
+     * per-function stream cannot be resolved here. Endpoints that DMA call
+     * apple_pcie_port_dma_as() instead; this stays the default stream.
+     */
     return &port->dma_as;
+}
+
+AddressSpace *apple_pcie_port_dma_as(ApplePCIEPort *port, PCIDevice *dev,
+                                     ApplePCIEDMAStream *cache)
+{
+    uint16_t rid;
+    uint32_t i;
+
+    if (port == NULL || dev == NULL) {
+        return NULL;
+    }
+    if (cache->resolved && cache->generation == port->rid_sid_generation) {
+        return cache->as;
+    }
+
+    cache->resolved = true;
+    cache->generation = port->rid_sid_generation;
+    cache->as = &port->dma_as;
+    cache->sid = UINT32_MAX;
+
+    rid = ((uint16_t)pci_bus_num(pci_get_bus(dev)) << 8) | dev->devfn;
+
+    for (i = 0; i < ARRAY_SIZE(port->port_rid_sid_map); i++) {
+        uint32_t entry = port->port_rid_sid_map[i];
+        uint32_t sid;
+        IOMMUMemoryRegion *mr;
+
+        /* Bit 31 is what the guest sets once the entry means anything. */
+        if ((entry & BIT(31)) == 0 || (entry & 0xFFFF) != rid) {
+            continue;
+        }
+
+        sid = (entry >> 16) & 0xF;
+        if (sid >= APCIE_MAX_STREAMS) {
+            break;
+        }
+
+        if (port->sid_as[sid] == NULL) {
+            if (port->dart == NULL) {
+                break;
+            }
+            mr = apple_dart_iommu_mr(port->dart, sid);
+            if (mr == NULL) {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "%s: port %u: requester id 0x%04x steered at "
+                              "DART stream %u, which does not exist\n",
+                              __func__, port->bus_nr, rid, sid);
+                break;
+            }
+            port->sid_as[sid] = g_new0(AddressSpace, 1);
+            address_space_init(port->sid_as[sid], MEMORY_REGION(mr),
+                               "apcie.dma-as");
+        }
+
+        cache->as = port->sid_as[sid];
+        cache->sid = sid;
+        break;
+    }
+
+    return cache->as;
 }
 
 static const PCIIOMMUOps apple_pcie_iommu_ops = {

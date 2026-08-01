@@ -334,9 +334,7 @@ struct AppleBCMBTDeviceState {
      * function's requester id was mapped to is looked up in the port's
      * requester-id-to-stream-id table rather than assumed.
      */
-    AddressSpace bt_dma_as;
-    bool bt_dma_as_valid;
-    uint32_t bt_sid;
+    ApplePCIEDMAStream dma_stream;
 
     /* BAR0 shadow state. */
     uint32_t sleep_control;
@@ -426,7 +424,10 @@ static void bt_st32(uint8_t *p, uint32_t v)
 
 static AddressSpace *bt_dma_as(AppleBCMBTDeviceState *s)
 {
-    return s->bt_dma_as_valid ? &s->bt_dma_as : s->dma_as;
+    AddressSpace *as =
+        apple_pcie_port_dma_as(s->port, PCI_DEVICE(s), &s->dma_stream);
+
+    return as != NULL ? as : s->dma_as;
 }
 
 static bool bt_dma_allowed(AppleBCMBTDeviceState *s)
@@ -510,66 +511,6 @@ static void bt_write_index(AppleBCMBTDeviceState *s, uint64_t base,
     }
     bt_st16(raw, value);
     bt_dma_write(s, base + index * 2u, raw, sizeof(raw));
-}
-
-/*
- * Resolve the DART stream this function's requester id has been mapped to.
- *
- * The apcie port keeps the requester-id-to-stream-id table the guest programs
- * at its 0x828 window. Wi-Fi and Bluetooth are different requester ids (device
- * 0 functions 0 and 1) with different mappers in the device tree, so they end
- * up on different streams and must not share an address space.
- */
-static void bt_resolve_dma_as(AppleBCMBTDeviceState *s)
-{
-    PCIDevice *pci_dev = PCI_DEVICE(s);
-    uint16_t rid;
-    AppleDARTState *dart;
-    IOMMUMemoryRegion *mr;
-    unsigned i;
-
-    if (s->bt_dma_as_valid || s->port == NULL) {
-        return;
-    }
-
-    rid = ((uint16_t)pci_bus_num(pci_get_bus(pci_dev)) << 8) | pci_dev->devfn;
-
-    for (i = 0; i < ARRAY_SIZE(s->port->port_rid_sid_map); i++) {
-        uint32_t entry = s->port->port_rid_sid_map[i];
-
-        if ((entry & BIT(31)) == 0) {
-            continue;
-        }
-        if ((entry & 0xFFFF) != rid) {
-            continue;
-        }
-
-        BT_DPRINTF("requester id 0x%04x is mapped to stream %u (0x%08x)\n", rid,
-                   i, entry);
-
-        if (i == 1) {
-            /* The stream the port's shared address space already uses. */
-            return;
-        }
-
-        dart = APPLE_DART(object_property_get_link(OBJECT(qdev_get_machine()),
-                                                   "dart-apcie2", NULL));
-        if (dart == NULL) {
-            return;
-        }
-        mr = apple_dart_iommu_mr(dart, i);
-        if (mr == NULL) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "apple-bcm-bt: no DART stream %u\n", i);
-            return;
-        }
-        address_space_init(&s->bt_dma_as, MEMORY_REGION(mr), "apple-bcm-bt.dma");
-        s->bt_dma_as_valid = true;
-        s->bt_sid = i;
-        return;
-    }
-
-    BT_DPRINTF("requester id 0x%04x has no stream mapping yet\n", rid);
 }
 
 static void bt_raise_msi(AppleBCMBTDeviceState *s)
@@ -1361,7 +1302,6 @@ static bool bt_load_context(AppleBCMBTDeviceState *s)
                       "address\n");
         return false;
     }
-    bt_resolve_dma_as(s);
     if (!bt_dma_read(s, addr, ctx, sizeof(ctx))) {
         return false;
     }

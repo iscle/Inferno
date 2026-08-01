@@ -710,6 +710,14 @@ struct AppleBCMWLANDeviceState {
     ApplePCIEPort *port;
     MemoryRegion *dma_mr;
     AddressSpace *dma_as;
+    /*
+     * Which DART stream this function's DMA goes through. It is not the port's
+     * default stream: iOS steers each function at a stream of its own, and
+     * enabling the combo part's Bluetooth function moves Wi-Fi off stream 1.
+     * Resolved from the port's requester-id table on first use, and again
+     * whenever the guest reprograms it.
+     */
+    ApplePCIEDMAStream dma_stream;
 
     /*
      * ChipCommon shadow registers. The remaining ChipCommon space is left
@@ -824,14 +832,22 @@ static bool apple_bcm_wlan_dma_allowed(AppleBCMWLANDeviceState *s)
     return true;
 }
 
+static AddressSpace *apple_bcm_wlan_dma_as(AppleBCMWLANDeviceState *s)
+{
+    AddressSpace *as =
+        apple_pcie_port_dma_as(s->port, PCI_DEVICE(s), &s->dma_stream);
+
+    return as != NULL ? as : s->dma_as;
+}
+
 static bool apple_bcm_wlan_dma_read(AppleBCMWLANDeviceState *s, uint64_t offset,
                                     uint64_t size, uint8_t *buf)
 {
     if (!apple_bcm_wlan_dma_allowed(s)) {
         return false;
     }
-    if (dma_memory_read(s->dma_as, offset, buf, size, MEMTXATTRS_UNSPECIFIED) !=
-        MEMTX_OK) {
+    if (dma_memory_read(apple_bcm_wlan_dma_as(s), offset, buf, size,
+                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: Failed to read from DMA.\n",
                       __func__);
         return false;
@@ -846,7 +862,7 @@ static bool apple_bcm_wlan_dma_write(AppleBCMWLANDeviceState *s,
     if (!apple_bcm_wlan_dma_allowed(s)) {
         return false;
     }
-    if (dma_memory_write(s->dma_as, offset, buf, size,
+    if (dma_memory_write(apple_bcm_wlan_dma_as(s), offset, buf, size,
                          MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: Failed to write to DMA.\n",
                       __func__);

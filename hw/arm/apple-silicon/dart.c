@@ -349,9 +349,19 @@ static void apple_dart_mapper_reg_write(void *opaque, hwaddr addr,
         }
         break;
     case R_DART_TTBR(0, 0)...(R_DART_TTBR(DART_MAX_STREAMS, DART_MAX_TTBR) - 1):
+        i = (addr >> 2) - R_DART_TTBR(0, 0);
+        /*
+         * The case range above is wider than the register file: A_DART_TTBR
+         * spaces the streams DART_MAX_STREAMS words apart rather than
+         * DART_MAX_TTBR, so it reaches well past the last real TTBR. Bound the
+         * index for real -- assert() is compiled out here, and an unbounded
+         * index is a guest-driven write past the end of the register struct.
+         */
+        if (i >= DART_MAX_STREAMS * DART_MAX_TTBR) {
+            break;
+        }
         WITH_QEMU_LOCK_GUARD(&mapper->common.mutex)
         {
-            i = (addr >> 2) - R_DART_TTBR(0, 0);
             ((uint32_t *)mapper->regs.ttbr)[i] = val;
         }
         break;
@@ -397,6 +407,9 @@ static uint64_t apple_dart_mapper_reg_read(void *opaque, hwaddr addr,
         return mapper->regs.sid_config[i];
     case R_DART_TTBR(0, 0)...(R_DART_TTBR(DART_MAX_STREAMS, DART_MAX_TTBR) - 1):
         i = (addr >> 2) - R_DART_TTBR(0, 0);
+        if (i >= DART_MAX_STREAMS * DART_MAX_TTBR) {
+            return 0;
+        }
         return ((uint32_t *)mapper->regs.ttbr)[i];
     default:
         return 0;

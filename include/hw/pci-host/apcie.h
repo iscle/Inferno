@@ -21,6 +21,7 @@
 #ifndef APCIE_H
 #define APCIE_H
 
+#include "hw/arm/apple-silicon/dart.h"
 #include "hw/arm/apple-silicon/dt.h"
 #include "hw/pci/pcie_host.h"
 #include "hw/pci/pcie_port.h"
@@ -52,6 +53,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(ApplePCIEState, APPLE_PCIE)
 
 #define APCIE_PORT_GPIO_CLKREQ_OUT "apcie-port-gpio-clkreq-out"
 #define APCIE_PORT_GPIO_PERST "apcie-port-gpio-perst"
+
+/* DART streams a port can steer a function at; matches the DART's own limit. */
+#define APCIE_MAX_STREAMS 16
 
 struct ApplePCIERootBus {
     PCIBus parent;
@@ -123,6 +127,27 @@ struct ApplePCIEPort {
     MemoryRegion *dma_mr;
     AddressSpace dma_as;
 
+    /*
+     * Per-function DMA streams.
+     *
+     * `dma_as` above is the port's default stream, fixed at creation. That is
+     * not what the hardware does: iOS assigns each *function* behind the port
+     * its own DART stream by programming the port's requester-id-to-stream-id
+     * table at 0x828, and which stream a function gets depends on what else is
+     * present -- with the BCM4378's Bluetooth function enabled, Bluetooth takes
+     * stream 1 and Wi-Fi is pushed to stream 2. An endpoint that assumes the
+     * default stream therefore reads through another function's translations
+     * and faults the DART.
+     *
+     * So endpoints resolve their stream from that table instead, through
+     * apple_pcie_port_dma_as(). The address spaces are built on demand and
+     * cached here; `rid_sid_generation` counts writes to the table so a cached
+     * lookup can be invalidated when the guest reassigns streams.
+     */
+    AppleDARTState *dart;
+    AddressSpace *sid_as[APCIE_MAX_STREAMS];
+    uint32_t rid_sid_generation;
+
     MemoryRegion port_cfg;
     MemoryRegion port_phy_glue;
     MemoryRegion port_phy_ip;
@@ -172,6 +197,25 @@ struct ApplePCIEState {
     uint32_t chip_id;
     uint32_t msi_vector_offset;
 };
+
+/*
+ * A cached per-function stream lookup. Zero-initialise it and hand the same one
+ * to every apple_pcie_port_dma_as() call for that function.
+ */
+typedef struct ApplePCIEDMAStream {
+    AddressSpace *as;
+    uint32_t generation;
+    uint32_t sid;
+    bool resolved;
+} ApplePCIEDMAStream;
+
+/*
+ * The address space PCI function `dev` reaches memory through, according to the
+ * port's requester-id-to-stream-id table. Falls back to the port's default
+ * stream while the guest has not assigned this function one.
+ */
+AddressSpace *apple_pcie_port_dma_as(ApplePCIEPort *port, PCIDevice *dev,
+                                     ApplePCIEDMAStream *cache);
 
 void port_devices_set_power(ApplePCIEPort *port, bool power);
 void apple_pcie_port_temp_lower_msi_irq(ApplePCIEPort *port,
