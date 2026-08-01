@@ -22,7 +22,18 @@
 
 #define ENABLE_BASEBAND
 #define ENABLE_WLAN
-#define ENABLE_BT
+/*
+ * ENABLE_BT is DISABLED by default: the model is incomplete (bluetoothd never
+ * stays up -- the driver stops after RTI state 2 and never rings the control
+ * doorbell) and it panics all three supported iOS versions on long runs:
+ *   iOS 26 -- ACIPCOLYBTControl.cpp:239 assertion failed
+ *   iOS 18 -- intermittent DebuggerXCallEnter after apple-bcm-bt RTI churn
+ *   iOS 14 -- dart-apcie2 SID 1 (mapper-apcie2-bt) PTE invalid on read
+ * It also burns real CPU: 126 RTI respawn cycles in one iOS 26 boot, each
+ * re-uploading 373 KB of firmware, competing with whatever is being measured.
+ * Re-enable once the RTI stall and the stale-mapping DMA are fixed.
+ */
+// #define ENABLE_BT
 #define ENABLE_DATA_ENCRYPTION
 
 #include "qemu/osdep.h"
