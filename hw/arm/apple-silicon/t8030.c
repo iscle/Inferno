@@ -68,7 +68,9 @@
 #include "hw/ssi/ssi.h"
 #include "hw/usb/apple_typec.h"
 #include "hw/watchdog/apple_wdt.h"
+#include "exec/icount.h"
 #include "system/block-backend.h"
+#include "system/cpu-timers.h"
 #include "qemu/error-report.h"
 #include "qemu/guest-random.h"
 #include "qemu/log.h"
@@ -3379,6 +3381,27 @@ static void t8030_init(MachineState *machine)
 
     t8030 = APPLE_T8030(machine);
 
+    if (t8030->time_dilation == 0) {
+        error_setg(&error_fatal, "time-dilation must be at least 1");
+        return;
+    }
+    if (t8030->time_dilation != 1) {
+        if (icount_enabled()) {
+            /*
+             * icount replaces the virtual clock wholesale via the accelerator's
+             * get_virtual_clock hook, so the dilation applied in cpu-timers.c
+             * would simply be bypassed. Refuse rather than silently ignore it.
+             */
+            error_setg(&error_fatal,
+                       "time-dilation cannot be combined with -icount; both "
+                       "decouple guest time from host time");
+            return;
+        }
+        cpu_timers_set_time_dilation(t8030->time_dilation);
+        info_report("Guest time runs at 1/%" PRIu64 " of host wall time",
+                    t8030->time_dilation);
+    }
+
     if ((t8030->sep_fw_filename == NULL) != (t8030->sep_rom_filename == NULL)) {
         error_setg(&error_fatal,
                    "You need to specify both the SEPROM and the decrypted "
@@ -3717,6 +3740,7 @@ static char *t8030_get_boot_mode(Object *obj, Error **errp)
 }
 
 PROP_VISIT_GETTER_SETTER(uint64, ecid);
+PROP_VISIT_GETTER_SETTER(uint64, time_dilation);
 PROP_GETTER_SETTER(bool, kaslr_off);
 PROP_GETTER_SETTER(bool, gpu);
 PROP_GETTER_SETTER(bool, force_dfu);
@@ -3793,6 +3817,17 @@ static void t8030_class_init(ObjectClass *klass, const void *data)
     object_class_property_add_bool(klass, "kaslr-off", t8030_get_kaslr_off,
                                    t8030_set_kaslr_off);
     object_class_property_set_description(klass, "kaslr-off", "Disable KASLR");
+    oprop = object_class_property_add(klass, "time-dilation", "uint64",
+                                      t8030_get_time_dilation,
+                                      t8030_set_time_dilation, NULL, NULL);
+    object_property_set_default_uint(oprop, 1);
+    object_class_property_set_description(
+        klass, "time-dilation",
+        "Divide guest time by this factor. Every guest-visible clock -- the "
+        "CPU counter and all device timers -- then advances that much slower "
+        "than host wall time, so deadlines the guest measures in its own time "
+        "(watchdogs, driver timeouts) scale with how fast this emulator "
+        "actually runs. 1 (the default) keeps guest time on host wall time.");
     object_class_property_add_bool(klass, "gpu", t8030_get_gpu, t8030_set_gpu);
     object_class_property_set_description(
         klass, "gpu",

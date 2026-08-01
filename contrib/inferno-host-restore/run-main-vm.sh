@@ -128,6 +128,10 @@ MACHINE+=",ticket=$TICKET"
 MACHINE+=",sep-fw=$SEP_FW"
 MACHINE+=",sep-rom=$SEP_ROM"
 MACHINE+=",kaslr-off=true"
+# Divide guest time by this factor (see the t8030 "time-dilation" property).
+# Guest-measured deadlines -- watchdogs, driver timeouts, the datamigrator's
+# per-plugin budget -- then scale with how fast this emulator actually runs.
+[ -n "${INFERNO_TIME_DILATION:-}" ] && MACHINE+=",time-dilation=$INFERNO_TIME_DILATION"
 case "$USB_CONN_TYPE" in
     unix)
         # default path is used when addr is omitted; pass it explicitly for clarity

@@ -38,6 +38,15 @@ int64_t cpu_get_clock(void);
 
 void qemu_timer_notify_cb(void *opaque, QEMUClockType type);
 
+/*
+ * Time dilation: divide the VIRTUAL clock (and therefore every guest-visible
+ * counter and device timer) by @factor, so guest time advances that much
+ * slower than host wall time. Must be called before the VM starts running.
+ * A factor of 1 (the default) leaves the virtual clock on host wall time.
+ */
+void cpu_timers_set_time_dilation(int64_t factor);
+int64_t cpu_timers_get_time_dilation(void);
+
 /* get/set VIRTUAL clock and VM elapsed ticks via the cpus accel interface */
 int64_t cpus_get_virtual_clock(void);
 void cpus_set_virtual_clock(int64_t new_time);

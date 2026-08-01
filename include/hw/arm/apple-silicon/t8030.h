@@ -71,6 +71,7 @@ typedef struct {
     MemoryRegion amcc;
     uint8_t amcc_reg[0x100000];
     bool kaslr_off;
+    uint64_t time_dilation;
     bool gpu;
     bool force_dfu;
     uint32_t board_id;

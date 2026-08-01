@@ -40,6 +40,55 @@
 
 /* clock and ticks */
 
+/*
+ * Time dilation.
+ *
+ * Without -icount the virtual clock is host wall time, so the guest believes it
+ * is running on hardware as fast as the host's wall clock implies. On a target
+ * that emulates a whole SoC in TCG that is roughly two orders of magnitude off,
+ * and any guest deadline expressed in guest time -- a watchdog, a driver
+ * timeout, a userspace "this operation hung" check -- is measured against a
+ * clock the emulated CPU has no hope of keeping up with.
+ *
+ * Dividing the virtual clock by a constant makes every guest-visible clock,
+ * CPU counter and device timer alike, advance that much slower than host wall
+ * time. The guest's view stays internally consistent -- it simply runs on a
+ * slower time base, which is an honest description of what the emulator is --
+ * and unlike -icount it does not force single-threaded TCG.
+ *
+ * Only the virtual clock is scaled; QEMU_CLOCK_REALTIME keeps tracking host
+ * time so host-side housekeeping is unaffected.
+ */
+static int64_t time_dilation = 1;
+
+void cpu_timers_set_time_dilation(int64_t factor)
+{
+    assert(factor >= 1);
+    /*
+     * Must be set before the virtual clock starts running, i.e. before
+     * vm_start() calls cpu_enable_ticks(); otherwise cpu_clock_offset was
+     * computed against an undilated reading and the clock would jump.
+     */
+    assert(!timers_state.cpu_ticks_enabled);
+    time_dilation = factor;
+}
+
+int64_t cpu_timers_get_time_dilation(void)
+{
+    return time_dilation;
+}
+
+/* Host monotonic time, scaled into the guest's dilated time base. */
+static inline int64_t get_dilated_clock(void)
+{
+    int64_t now = get_clock();
+
+    if (likely(time_dilation == 1)) {
+        return now;
+    }
+    return now / time_dilation;
+}
+
 static int64_t cpu_get_ticks_locked(void)
 {
     int64_t ticks = timers_state.cpu_ticks_offset;
@@ -77,7 +126,7 @@ int64_t cpu_get_clock_locked(void)
 
     time = timers_state.cpu_clock_offset;
     if (timers_state.cpu_ticks_enabled) {
-        time += get_clock();
+        time += get_dilated_clock();
     }
 
     return time;
@@ -110,7 +159,7 @@ void cpu_enable_ticks(void)
                        &timers_state.vm_clock_lock);
     if (!timers_state.cpu_ticks_enabled) {
         timers_state.cpu_ticks_offset -= cpu_get_host_ticks();
-        timers_state.cpu_clock_offset -= get_clock();
+        timers_state.cpu_clock_offset -= get_dilated_clock();
         timers_state.cpu_ticks_enabled = 1;
     }
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
