@@ -127,6 +127,168 @@ the earlier broker-polling revision, tag `1e5e94b`) the full restore protocol
 through firmware personalization and RootTicket with zero transport errors —
 works over the host-direct path.
 
+## Filesystem patches have to be applied *inside* the seal on iOS 16+
+
+The manual's [Filesystem Patches](https://chefkiss.dev/guides/inferno/fs-patches/)
+step — patch the dyld shared cache, and add `Disabled=true` to five
+`LaunchDaemons` entries in `/System/Library/xpc/launchd.plist` — is written as
+something you do to the restored image *after* the restore, by attaching `root`
+and mounting the System volume.
+
+That works on iOS 14, whose system volume is neither sealed nor snapshot-rooted.
+From iOS 16/17 it does not: `restored` seals the system volume and creates a
+`com.apple.os.update-<hash>` snapshot, and the kernel roots from *that snapshot*
+(it refuses to root from the live filesystem of a sealed volume on a RELEASE
+build — `run-main-vm.sh` has to be given `INFERNO_ROOT_SNAPSHOT` for this
+reason). A host edit made afterwards lands on the live volume, which the running
+guest never reads. Measured directly on 18.6.2: setting `Disabled=true` on
+`com.apple.bluetoothd` post-restore still let it respawn 97 times.
+
+Two halves, two different answers:
+
+- **The dyld shared cache** is fine post-restore, because on cryptex-era iOS it
+  is not on the sealed volume at all — it lives inside the OS cryptex,
+  `Preboot:/cryptex1/current/os.dmg`, which is unsealed.
+- **The launch service cache** is on the sealed volume, so it has to be patched
+  before `seal_system_volume` runs.
+
+### The hook
+
+`patches/idevicerestore-fs-patch-hook.patch` adds `INFERNO_FS_PATCH_CMD`, which
+idevicerestore runs at the `SystemImageRootHash` data request that `restored`
+raises **from inside** the `seal_system_volume` checkpoint. That instant is the
+one the whole mechanism turns on:
+
+```
+Checkpoint started   id: 0x68B (seal_system_volume)
+  -> SystemImageCanonicalMetadata request   (host sends the .mtree)
+     ... 8 minutes of canonical-metadata work over the volume ...
+  -> SystemImageRootHash request            <-- the hook fires here
+     Unmounting filesystems
+     Sealing System Volume
+Checkpoint completed id: 0x68B (seal_system_volume) result=0
+```
+
+It is after the canonical-metadata pass (so the patch cannot be flagged by it),
+it is before any sealing has happened, and `restored` is blocked waiting for the
+host's reply, so nothing is racing with the edit. The gate is expressed with
+*names*, not the numeric checkpoint id, because restored's ids move between
+releases:
+
+```
+INFERNO_FS_PATCH_CMD=<cmd>           run "<cmd> <checkpoint>" at that point
+INFERNO_FS_PATCH_CHECKPOINT=<name>   default seal_system_volume; empty disables
+                                     the gate
+INFERNO_FS_PATCH_DATATYPE=<type>     default SystemImageRootHash
+```
+
+`SystemImageRootHash` is also requested earlier, from `install_kernel_cache`;
+the checkpoint gate is what tells the two apart. On a build that never seals —
+iOS 14 — neither the checkpoint nor the data request ever appears, the hook never
+fires, and the existing post-restore flow is untouched.
+
+### The patcher
+
+`inferno-preseal-fs-patch.py` is the command the hook runs. It deliberately does
+**not** mount anything: at that moment the RAM disk has the container open and
+the system volume mounted, and a second APFS driver writing into the same
+container would either be reverted by the guest's next checkpoint or corrupt it.
+
+Instead it treats the NAND image as bytes:
+
+1. scan the image's allocated regions (via `SEEK_DATA`/`SEEK_HOLE`) for
+   4096-aligned blocks starting with `bplist00` — APFS file data always begins on
+   a block boundary;
+2. recover each candidate's length from its binary-plist trailer, which is
+   confirmed arithmetically (`offsetTableOffset + numObjects * offsetIntSize`
+   must land exactly on the trailer), then parse it and keep the ones that are a
+   launch service cache;
+3. re-serialise with the five services disabled and pad the result back to
+   *exactly* the original byte count, so **no APFS metadata changes at all** —
+   no allocation, no inode update, no checkpoint. The guest's cached metadata
+   stays valid, and the seal, computed afterwards from the on-disk content,
+   covers the patched bytes.
+
+The padding is inserted between the last object and the offset table and the
+trailer's `offsetTableOffset` corrected, so every object offset is unchanged and
+the result is an ordinary valid binary plist. It is re-parsed, cross-checked
+against CoreFoundation via `plutil` (the parser launchd actually uses), written,
+and read back before the hook returns. There is room: Apple's 2,045,714-byte
+cache re-serialises to 1,066,374 bytes with the five `Disabled` keys added.
+
+Because none of this needs an APFS driver, a loop device or root, it behaves the
+same on macOS and Linux.
+
+### Measured result: the hook lands, the byte-level edit does not survive SSV
+
+Everything above works, and the seal is still happy afterwards. On 18.6.2:
+
+```
+16:26:04 fs-patch hook: SystemImageRootHash seen outside checkpoint
+         seal_system_volume (active: 'install_root_hash'), not firing
+16:27:34 Checkpoint started   id: 0x68B (seal_system_volume)
+16:35:55 == running filesystem-patch hook before seal_system_volume
+16:36:03 == filesystem-patch hook done                      (7.7 s)
+16:36:04 Sealing System Volume (77)
+16:38:37 Checkpoint completed id: 0x68B (seal_system_volume) result=0
+16:38:39 Checkpoint completed id: 0x669 (create_system_snapshot) result=0
+```
+
+with, in the guest:
+
+```
+restored_external: AppleImage4 [DEBUG] trust evaluation succeeded for payload: msys
+```
+
+and the restored image reports `Sealed: Yes` (an unpatched restore that has been
+edited afterwards reports `Sealed: Broken`), with the patched cache still on disk
+at the same offset and the same 2,045,714 bytes.
+
+**But the guest cannot read it.** Mounting the restored System volume on macOS,
+every untouched file reads fine and only the patched one fails:
+
+```
+System/Library/xpc/launchd.plist                  FAIL [Errno 94] Bad message
+System/Library/CoreServices/SystemVersion.plist   OK 573
+usr/lib/dyld                                      OK 1264816
+System/Library/LaunchDaemons/com.apple.locationd.plist  OK 1552
+```
+
+and the guest kernel says the same thing, then dies:
+
+```
+apfs_announce_hash_mismatch:147: disk1s1 Data hash mismatch for 16384 bytes at
+  offset 0 ... expected 8dda2fa1..., got 1b92868d...
+apfs_vnop_read:11565: disk1s1 ### ... retval 94 filesize 2045714 offset 0 ###
+panic(cpu 5 ...): launchd_cache_loader[28] exited -- ...
+  description: Failed to create SecStaticCodeRef
+```
+
+So `seal_system_volume` does **not** compute the per-extent data hashes. Those
+come from Apple's ASR image and are written verbatim by `asr`; sealing only
+builds the root over hashes that already exist. `filesize 2045714` in the
+mismatch identifies the file exactly. A byte-level edit — at *any* point after
+`asr`, whether before or after sealing — therefore leaves a file whose recorded
+hash no longer matches, and APFS refuses to read it on both macOS and iOS.
+
+What does update the hash is a write that goes *through* an APFS driver: writing
+the same patched plist onto the restored volume via a read-write mount and
+reading it back succeeds. That is not usable from the hook, because at that
+moment the RAM disk still has the container open (and the only windows in which
+it does not are the `asr` write itself and the sealing pass). So the remaining
+routes are:
+
+- patch through a read-write mount *after* the restore and then re-create the
+  `com.apple.os.update-<hash>` snapshot so the guest roots from patched content
+  (`fs_snapshot_create`, needs root — there is no CLI for a named APFS snapshot);
+- or let the guest root from the live filesystem, which needs the
+  `"Rooting from the live fs of a sealed volume is not allowed on a RELEASE
+  build"` check in `apfs_vfsops.c` to be patched out kernel-side.
+
+The hook itself is independent of which of those wins: `INFERNO_FS_PATCH_CMD` is
+just "run this at the last mutable moment", so a different patcher can be dropped
+in without touching C.
+
 ## Device image handling: the SEP pairing spans four images
 
 The SEP's anti-replay state is not confined to one file. It is a pairing across
@@ -252,6 +414,16 @@ contrib/inferno-host-restore/
 ├── build-host-tools.sh       fetch + build the stack against the shim
 ├── run-main-vm.sh            launch the t8030 main VM (USB on the socket)
 ├── inferno-restore.sh        orchestrate inferno-usbd + usbmuxd + VM + restore
+├── inferno-ramdisk-patcher.py  patch libimage4 inside the restore RAM disk
+├── inferno-preseal-fs-patch.py the manual's launch-service patch, applied to
+│                               the NAND image from inside seal_system_volume
+├── ios18-n104.env            18.6.2 / n104ap asset names and knobs
+├── ios26-n104.env            26.5 / n104ap asset names and knobs
+├── patches/
+│   ├── idevicerestore-cryptex1-local-ticket.patch
+│   ├── idevicerestore-emulated-hardware-model.patch   N104DEV -> N104AP
+│   ├── idevicerestore-fs-patch-hook.patch             INFERNO_FS_PATCH_CMD
+│   └── usbmuxd-graceful-drain-close.patch
 └── libusb-shim/
     ├── tcp_usb_proto.h       mirror of hw/usb/tcp-usb.h (wire protocol)
     ├── broker_proto.h        inferno-usbd <-> shim IPC

@@ -1,0 +1,24 @@
+--- a/src/restore.c
++++ b/src/restore.c
+@@ -299,10 +299,21 @@
+ 		plist_free(node);
+ 		return NULL;
+ 	}
+ 
+ 	plist_get_string_val(node, &model);
++	logger(LL_INFO, "INFO: model is %s\n", model);
++	/*
++	 * Inferno's t8030 reports its hardware model as "N104DEV", which is not a
++	 * model libirecovery knows, so device identification fails outright with
++	 * "Unable to discover device type" and no restore is possible. The board is
++	 * an n104ap in every other respect; rewrite the suffix in place (the
++	 * replacement is shorter, so this never grows the string).
++	 */
++	if (strstr(model, "DEV")) {
++		strncpy(strstr(model, "DEV"), "AP\0", 3);
++	}
+ 	irecv_devices_get_device_by_hardware_model(model, &irecv_device);
+ 	free(model);
+ 
+ 	return irecv_device;
+ }

@@ -1,10 +1,9 @@
 --- a/src/restore.c
 +++ b/src/restore.c
-@@ -3661,6 +3661,121 @@
- 	tss_request_add_cryptex_tags(request, parameters, NULL);
+@@ -3658,6 +3662,173 @@ static plist_t restore_get_cryptex1_firmware_data(struct idevicerestore_client_t
  
  	plist_free(parameters);
-+
+ 
 +	/*
 +	 * Cryptex1 personalisation against an emulated device.
 +	 *
@@ -43,13 +42,65 @@
 +		}
 +	}
 +	/*
++	 * INFERNO_CRYPTEX_TICKET_CMD=<cmd>: build the ticket right here, from the
++	 * request the device has just generated.
++	 *
++	 * The digests a Cryptex1 ticket has to certify are computed by the *device*
++	 * and only appear in its DeviceGeneratedRequest, so INFERNO_CRYPTEX_TICKET
++	 * on its own still costs one whole restore to capture them and a second to
++	 * use them -- three hours on this hardware. Running the generator at the
++	 * point the request exists collapses that back to a single restore.
++	 *
++	 * The command is invoked as
++	 *     <cmd> <base-ticket.der> <arguments.plist> <out-ticket.der>
++	 * which is exactly add_cryptex_objects.py's own argument order, so
++	 *     INFERNO_CRYPTEX_TICKET_CMD="contrib/.../add_cryptex_objects.py"
++	 *     INFERNO_CRYPTEX_TICKET=root_ticket.der
++	 * needs no wrapper script. The generated ticket is a local artefact.
++	 */
++	char gen_ticket[1024] = "";
++	{
++		const char *tcmd = getenv("INFERNO_CRYPTEX_TICKET_CMD");
++		const char *base = getenv("INFERNO_CRYPTEX_TICKET");
++		if (tcmd && base) {
++			char argp[1024], outp[1024], cmd[4096];
++			const char *tmpdir = getenv("TMPDIR");
++			if (!tmpdir || !*tmpdir) tmpdir = "/tmp";
++			snprintf(argp, sizeof(argp), "%s/inferno-cryptex-%s-args.plist",
++			         tmpdir, s_updater_name);
++			snprintf(outp, sizeof(outp), "%s/inferno-cryptex-%s-ticket.der",
++			         tmpdir, s_updater_name);
++			if (plist_write_to_file(arguments, argp, PLIST_FORMAT_XML, 0) != PLIST_ERR_SUCCESS) {
++				logger(LL_ERROR, "INFERNO_CRYPTEX_TICKET_CMD: cannot write %s\n", argp);
++				plist_free(request);
++				return NULL;
++			}
++			snprintf(cmd, sizeof(cmd), "'%s' '%s' '%s' '%s'", tcmd, base, argp, outp);
++			logger(LL_INFO, "running cryptex ticket generator: %s\n", cmd);
++			int rc = system(cmd);
++			if (rc != 0) {
++				logger(LL_ERROR, "cryptex ticket generator failed (%d)\n", rc);
++				plist_free(request);
++				return NULL;
++			}
++			/*
++			 * Hand the freshly built ticket to the block below. Deliberately
++			 * NOT via setenv: this function runs once per updater, and
++			 * overwriting INFERNO_CRYPTEX_TICKET would make the next call use
++			 * an already-populated ticket as its base and add the six objects
++			 * twice.
++			 */
++			snprintf(gen_ticket, sizeof(gen_ticket), "%s", outp);
++		}
++	}
++	/*
 +	 * INFERNO_CRYPTEX_TICKET=<file>: synthesise the response in-process from the
 +	 * device's own request. Echoing the device-generated nonces back is the part
 +	 * most likely to decide it, and doing it here avoids a ~90 minute round trip
 +	 * through a full ASR write just to author a response file.
 +	 */
 +	{
-+		const char *tfile = getenv("INFERNO_CRYPTEX_TICKET");
++		const char *tfile = gen_ticket[0] ? gen_ticket : getenv("INFERNO_CRYPTEX_TICKET");
 +		if (tfile) {
 +			FILE *tf = fopen(tfile, "rb");
 +			if (!tf) {
@@ -119,10 +170,11 @@
 +			goto have_response;
 +		}
 +	}
- 
++
  	logger(LL_INFO, "Sending %s TSS request...\n", s_updater_name);
  	response = tss_request_send(request, client->tss_url);
-@@ -3670,6 +3785,8 @@
+ 	plist_free(request);
+@@ -3666,6 +3837,8 @@ static plist_t restore_get_cryptex1_firmware_data(struct idevicerestore_client_t
  		return NULL;
  	}
  
@@ -131,7 +183,7 @@
  	if (plist_dict_get_item(response, response_ticket)) {
  		logger(LL_INFO, "Received %s\n", response_ticket);
  	} else {
-@@ -5429,6 +5546,7 @@
+@@ -5425,6 +5598,7 @@ int restore_device(struct idevicerestore_client_t* client, plist_t build_identit
  	plist_dict_set_item(opts, "SupportedDataTypes", restore_supported_data_types());
  	plist_dict_set_item(opts, "SupportedMessageTypes", restore_supported_message_types());
  

@@ -1,0 +1,94 @@
+diff --git a/src/device.c b/src/device.c
+index ce73718..4b3d1e8 100644
+--- a/src/device.c
++++ b/src/device.c
+@@ -70,9 +70,16 @@ enum mux_conn_state {
+ 	CONN_CONNECTED,		// SYN/SYNACK/ACK -> active
+ 	CONN_REFUSED,		// RST received during SYN
+ 	CONN_DYING,			// RST received
++	CONN_CLOSING,		// client detached; lingering until the device acks all our
++						// outbound data (or a timeout), so we don't RST-drop in-flight
++						// data the device's app (e.g. ASR) is still reading
+ 	CONN_DEAD			// being freed; used to prevent infinite recursion between client<->device freeing
+ };
+ 
++// How long to let a connection linger draining unacked outbound data before we
++// give up and RST it anyway.
++#define CONN_DRAIN_TIMEOUT 5000
++
+ struct mux_header
+ {
+ 	uint32_t protocol;
+@@ -111,6 +118,7 @@ struct mux_connection
+ 	uint32_t ob_capacity;
+ 	short events;
+ 	uint64_t last_ack_time;
++	uint64_t close_deadline;	// CONN_CLOSING: mstime64 after which we finalize regardless
+ };
+ 
+ struct mux_device
+@@ -306,6 +314,45 @@ static void connection_teardown(struct mux_connection *conn)
+ 	if(conn->state == CONN_DEAD)
+ 		return;
+ 	usbmuxd_log(LL_DEBUG, "connection_teardown dev %d sport %d dport %d", conn->dev->id, conn->sport, conn->dport);
++
++	/*
++	 * Graceful drain. If the client is going away while the device still hasn't
++	 * acked all the data we sent it, sending a RST now discards that in-flight
++	 * data — and an app on the device that is still reading it (notably ASR
++	 * during a restore, streaming the multi-GB filesystem) then blocks forever,
++	 * stalling the restore right after "100%". Instead, detach the client but
++	 * keep the mux connection in CONN_CLOSING and let it linger; device_check_
++	 * timeouts() finalizes it once the device has acked everything (rx_ack ==
++	 * tx_seq) or CONN_DRAIN_TIMEOUT elapses. Only for a fully-established
++	 * connection with a live device and genuinely-unacked outbound data.
++	 */
++	if(conn->state == CONN_CONNECTED && conn->dev->state == MUXDEV_ACTIVE &&
++	   conn->client && conn->tx_seq != conn->rx_ack) {
++		if((conn->events & POLLOUT) && conn->ib_size > 0) {
++			// best-effort: hand any remaining device->client data to the client
++			size = client_write(conn->client, conn->ib_buf, conn->ib_size);
++			if(size > 0) {
++				if(size == (int)conn->ib_size) {
++					conn->ib_size = 0;
++				} else {
++					conn->ib_size -= size;
++					memmove(conn->ib_buf, conn->ib_buf + size, conn->ib_size);
++				}
++			}
++		}
++		client_close(conn->client);
++		conn->client = NULL;
++		conn->events = 0;
++		conn->state = CONN_CLOSING;
++		conn->close_deadline = mstime64() + CONN_DRAIN_TIMEOUT;
++		usbmuxd_log(LL_INFO, "%s: lingering dev %d %d->%d to drain %u unacked bytes (tx_seq=%u rx_ack=%u)",
++			__func__, conn->dev->id, conn->sport, conn->dport, conn->tx_seq - conn->rx_ack, conn->tx_seq, conn->rx_ack);
++		return;
++	}
++	usbmuxd_log(LL_INFO, "connection_teardown dev %d %d->%d state=%d tx_seq=%u rx_ack=%u (unacked=%d) rx_seq=%u tx_ack=%u",
++		conn->dev->id, conn->sport, conn->dport, conn->state, conn->tx_seq, conn->rx_ack,
++		(int)(conn->tx_seq - conn->rx_ack), conn->rx_seq, conn->tx_ack);
++
+ 	if(conn->dev->state != MUXDEV_DEAD && conn->state != CONN_DYING && conn->state != CONN_REFUSED) {
+ 		res = send_tcp(conn, TH_RST, NULL, 0);
+ 		if(res < 0)
+@@ -991,6 +1038,18 @@ void device_check_timeouts(void)
+ 					usbmuxd_log(LL_DEBUG, "Sending ACK due to expired timeout (%" PRIu64 " -> %" PRIu64 ")", conn->last_ack_time, ct);
+ 					send_tcp_ack(conn);
+ 				}
++				// Finalize a lingering (client-detached) connection once the
++				// device has acked all our outbound data, or the drain deadline
++				// passes. Safe to teardown mid-FOREACH: the collection is
++				// index-based and NULL-skipping.
++				if(conn->state == CONN_CLOSING &&
++						(conn->rx_ack == conn->tx_seq || ct >= conn->close_deadline)) {
++					usbmuxd_log(LL_INFO, "Finalizing lingering conn dev %d %d->%d (%s) tx_seq=%u rx_ack=%u",
++						dev->id, conn->sport, conn->dport,
++						(conn->rx_ack == conn->tx_seq) ? "drained" : "TIMEOUT",
++						conn->tx_seq, conn->rx_ack);
++					connection_teardown(conn);
++				}
+ 			} ENDFOREACH
+ 		}
+ 	} ENDFOREACH

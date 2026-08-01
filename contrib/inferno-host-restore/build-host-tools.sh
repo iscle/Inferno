@@ -80,13 +80,26 @@ for entry in "${REPOS[@]}"; do
     # Cryptex1 personalisation for an emulated device: Apple's TSS will not
     # personalise a forged ECID, so let a locally built ticket be supplied.
     # See patches/idevicerestore-cryptex1-local-ticket.patch for the reasoning.
+    #
+    # idevicerestore-emulated-hardware-model.patch is not optional: the emulated
+    # t8030 reports HardwareModel "N104DEV", which libirecovery does not know, so
+    # without it every restore stops at "Unable to discover device type".
+    #
+    # idevicerestore-fs-patch-hook.patch adds INFERNO_FS_PATCH_CMD, which runs the
+    # manual's filesystem patches from inside seal_system_volume — the only point
+    # at which they still end up inside the seal on iOS 16+. See
+    # inferno-preseal-fs-patch.py.
     if [ "$name" = "idevicerestore" ]; then
-        cx="$HERE/patches/idevicerestore-cryptex1-local-ticket.patch"
-        if [ -f "$cx" ] && patch -p1 -N --dry-run < "$cx" >/dev/null 2>&1; then
-            patch -p1 -N < "$cx" >/dev/null && echo "    applied cryptex1 local-ticket patch"
-        else
-            echo "    (cryptex1 local-ticket patch already applied or N/A)"
-        fi
+        for pf in idevicerestore-cryptex1-local-ticket \
+                  idevicerestore-emulated-hardware-model \
+                  idevicerestore-fs-patch-hook; do
+            cx="$HERE/patches/$pf.patch"
+            if [ -f "$cx" ] && patch -p1 -N --dry-run < "$cx" >/dev/null 2>&1; then
+                patch -p1 -N < "$cx" >/dev/null && echo "    applied $pf patch"
+            else
+                echo "    ($pf patch already applied or N/A)"
+            fi
+        done
     fi
 
     ./autogen.sh --prefix="$PREFIX" $(extra_flags "$name") \

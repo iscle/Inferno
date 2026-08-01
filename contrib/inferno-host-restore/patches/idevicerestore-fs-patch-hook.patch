@@ -1,0 +1,120 @@
+--- a/src/restore.c
++++ b/src/restore.c
+@@ -4959,20 +4970,97 @@
+ 	plist_free(dict);
+ 
+ 	return 0;
+ }
+ 
++/*
++ * Inferno: filesystem patches that have to land *inside* the seal.
++ *
++ * The manual's "Filesystem Patches" step (disable five launch services in
++ * /System/Library/xpc/launchd.plist, patch the dyld shared cache) is documented
++ * as something you do to the restored image afterwards. From iOS 16/17 that is
++ * too late for anything on the system volume: restored seals it and creates the
++ * com.apple.os.update-<hash> snapshot the kernel roots from, so a post-restore
++ * host edit lands on a live filesystem the guest never reads.
++ *
++ * The last moment the host is handed control while the system volume is still
++ * mutable is the SystemImageRootHash data request that restored raises from
++ * *inside* the seal_system_volume checkpoint: by then the canonical-metadata
++ * (mtree) pass over the volume has finished, and restored is blocked waiting for
++ * our reply, with sealing still to come. Run the patch command there and the
++ * seal is computed over the patched content, so the snapshot contains it.
++ *
++ *   INFERNO_FS_PATCH_CMD=<cmd>          run <cmd> <checkpoint-name> at that point
++ *   INFERNO_FS_PATCH_DATATYPE=<type>    which data request triggers it
++ *                                       (default SystemImageRootHash)
++ *   INFERNO_FS_PATCH_CHECKPOINT=<name>  which checkpoint must be in progress
++ *                                       (default seal_system_volume; empty
++ *                                       disables the gate)
++ *
++ * Both names rather than the numeric checkpoint id, because restored's ids move
++ * between releases while the names have not. On a build that never seals -- iOS
++ * 14, say -- neither the checkpoint nor the data request ever appears, the hook
++ * never fires, and the existing post-restore flow is untouched.
++ */
++static const char* inferno_fs_patch_checkpoint(void)
++{
++	const char* v = getenv("INFERNO_FS_PATCH_CHECKPOINT");
++	return v ? v : "seal_system_volume";
++}
++
++static const char* inferno_fs_patch_datatype(void)
++{
++	const char* v = getenv("INFERNO_FS_PATCH_DATATYPE");
++	return v ? v : "SystemImageRootHash";
++}
++
++/* Name of the checkpoint currently in progress, "" when none. */
++static char inferno_active_checkpoint[128] = "";
++
++static void inferno_run_fs_patch_hook(const char* type)
++{
++	const char* cmd = getenv("INFERNO_FS_PATCH_CMD");
++	const char* gate = inferno_fs_patch_checkpoint();
++	char line[4096];
++	int rc;
++
++	if (!cmd || !*cmd) {
++		return;
++	}
++	if (strcmp(type, inferno_fs_patch_datatype()) != 0) {
++		return;
++	}
++	if (*gate && strcmp(inferno_active_checkpoint, gate) != 0) {
++		logger(LL_DEBUG, "fs-patch hook: %s seen outside checkpoint %s "
++		       "(active: '%s'), not firing\n", type, gate,
++		       inferno_active_checkpoint);
++		return;
++	}
++
++	logger(LL_INFO, "== running filesystem-patch hook before %s: %s %s\n",
++	       *gate ? gate : type, cmd, *gate ? gate : type);
++	snprintf(line, sizeof(line), "'%s' '%s'", cmd, *gate ? gate : type);
++	rc = system(line);
++	if (rc != 0) {
++		logger(LL_ERROR, "== filesystem-patch hook FAILED (%d). The restore "
++		       "continues, but the seal will not contain the patches.\n", rc);
++	} else {
++		logger(LL_INFO, "== filesystem-patch hook done\n");
++	}
++}
++
+ int restore_handle_data_request_msg(struct idevicerestore_client_t* client, plist_t message)
+ {
+ 	plist_t node = NULL;
+ 
+ 	// checks and see what kind of data restored is requests and pass
+ 	// the request to its own handler
+ 	node = plist_dict_get_item(message, "DataType");
+ 	if (node && PLIST_STRING == plist_get_node_type(node)) {
+ 		const char *type = plist_get_string_ptr(node, NULL);
+ logger(LL_DEBUG, "%s: type = %s\n", __func__, type);
++		inferno_run_fs_patch_hook(type);
+ 		// this request is sent when restored is ready to receive the filesystem
+ 		if (!strcmp(type, "SystemImageData")) {
+ 			if (restore_send_filesystem(client, message) < 0) {
+ 				logger(LL_ERROR, "Unable to send filesystem\n");
+ 				return -2;
+@@ -5877,12 +5965,19 @@
+ 				plist_get_bool_val(node, &ckpt_complete);
+ 			}
+ 
+ 			if (ckpt_complete) {
+ 				logger(LL_VERBOSE, "Checkpoint completed id: 0x%" PRIX64 " (%s) result=%" PRIi64 "\n", ckpt_id, ckpt_name, ckpt_res);
++				if (strcmp(inferno_active_checkpoint, ckpt_name) == 0) {
++					inferno_active_checkpoint[0] = '\0';
++				}
+ 			} else {
+ 				logger(LL_VERBOSE, "Checkpoint started   id: 0x%" PRIX64 " (%s)\n", ckpt_id, ckpt_name);
++				/* Inferno: remember it, so the filesystem-patch hook can tell a
++				 * SystemImageRootHash raised from inside seal_system_volume
++				 * apart from the one install_kernel_cache raises earlier. */
++				snprintf(inferno_active_checkpoint, sizeof(inferno_active_checkpoint), "%s", ckpt_name);
+ 			}
+ 			node = plist_dict_get_item(message, "CHECKPOINT_WARNING");
+ 			if (node) {
+ 				logger(LL_VERBOSE, "Checkpoint WARNING id: 0x%" PRIX64 " result=%" PRIi64 ": %s\n", ckpt_id, ckpt_res, plist_get_string_ptr(node, NULL));
+ 			}
