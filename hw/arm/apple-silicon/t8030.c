@@ -48,6 +48,7 @@
 #include "hw/intc/apple_aic.h"
 #include "hw/misc/apple-silicon/aes.h"
 #include "hw/misc/apple-silicon/aop.h"
+#include "hw/misc/apple-silicon/apple-bcm-bt.h"
 #include "hw/misc/apple-silicon/apple-bcm-wlan.h"
 #include "hw/misc/apple-silicon/baseband.h"
 #include "hw/misc/apple-silicon/buttons.h"
@@ -1724,6 +1725,43 @@ static void t8030_create_wlan(AppleT8030MachineState *t8030)
     sysbus_realize_and_unref(wlan, &error_fatal);
 }
 
+static void t8030_create_bt(AppleT8030MachineState *t8030)
+{
+    SysBusDevice *bt;
+    AppleDTNode *child;
+    ApplePCIEPort *port;
+    PCIBus *sec_bus;
+
+    /*
+     * The Bluetooth half of the same BCM4378 combo part: function 1 of the
+     * device Wi-Fi is function 0 of, behind apcie pci-bridge2, with its own
+     * DART stream ("mapper-apcie2-bt" rather than "mapper-apcie2-wlan").
+     *
+     * iOS' stack on top of it is AppleConvergedPCI (matching the PCI ids) ->
+     * AppleConvergedIPCOLYBTControl (whose provider is the AppleBluetoothModule
+     * attached to the /arm-io/bluetooth platform node). bluetoothd opens the
+     * latter, and exits if it is missing -- which is why nothing but a modelled
+     * endpoint stops it respawning.
+     */
+    child = apple_dt_get_node(t8030->device_tree,
+                              "arm-io/apcie/pci-bridge2/bluetooth-pcie");
+    if (child == NULL) {
+        warn_report("No bluetooth-pcie device tree node; skipping Bluetooth");
+        return;
+    }
+
+    port = APPLE_PCIE_PORT(
+        object_property_get_link(OBJECT(t8030), "pcie.bridge2", &error_fatal));
+    sec_bus = pci_bridge_get_sec_bus(PCI_BRIDGE(PCI_DEVICE(port)));
+
+    bt = apple_bcm_bt_create(
+        child, apple_dt_get_node(t8030->device_tree, "arm-io/bluetooth"),
+        sec_bus, port);
+    assert_nonnull(bt);
+    object_property_add_child(OBJECT(t8030), "bluetooth", OBJECT(bt));
+    sysbus_realize_and_unref(bt, &error_fatal);
+}
+
 static void t8030_create_gpio(AppleT8030MachineState *t8030, const char *name)
 {
     DeviceState *gpio = NULL;
@@ -2607,6 +2645,16 @@ static void t8030_create_pcie(AppleT8030MachineState *t8030)
         sysbus_connect_irq(
             pcie, interrupts_count + i,
             qdev_get_gpio_in(DEVICE(t8030->aic), msi_vector_offset + i));
+        /*
+         * These vectors carry PCIe MSIs, which are messages and not wires: the
+         * port raises and releases the line to mark the arrival of one, and
+         * nothing holds it up afterwards. Tell the AIC, so it latches them
+         * until a CPU takes them instead of dropping any that arrive while the
+         * vector is masked -- i.e. while a CPU is inside the handler for the
+         * previous one, which for a busy endpoint is most of the time.
+         */
+        apple_aic_set_message_vector(APPLE_AIC(t8030->aic),
+                                     msi_vector_offset + i);
     }
 
     sysbus_realize_and_unref(pcie, &error_fatal);
@@ -3603,6 +3651,9 @@ static void t8030_init(MachineState *machine)
     // NIC copies it from there.
 #ifdef ENABLE_WLAN
     t8030_create_wlan(t8030);
+#endif
+#ifdef ENABLE_BT
+    t8030_create_bt(t8030);
 #endif
 
     t8030_create_tempsensor(t8030, "tempsensor0", false);

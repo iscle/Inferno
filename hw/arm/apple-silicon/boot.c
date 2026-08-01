@@ -111,7 +111,19 @@ static const char *KEEP_COMP[] = {
 #endif
     // "biosensor,pearl\0$", // not implemented
     "buttons\0$",
+#ifdef ENABLE_BT
+    /*
+     * The /arm-io/bluetooth platform node. AppleBluetoothModule matches it
+     * (IONameMatch "bluetooth" on an AppleARMIODevice) and is in turn the
+     * provider AppleConvergedIPCOLYBTControl matches on, so without this node
+     * the PCIe endpoint alone gets nobody: bluetoothd's
+     * "PCIe could not find AppleConvergedIPCOLYBTControl service" is fatal to
+     * it and launchd respawns it about once a second.
+     */
+    "bluetooth,n88\0$",
+#else
     // "bluetooth,n88\0$",
+#endif
     "dart,s8000\0dart,s5l8960x\0$",
     "dart,t8020\0$",
     "disp0,t8030\0$",
@@ -207,14 +219,42 @@ static const char *REM_NAMES[] = {
     "pmp\0$",
     "stockholm\0$",
     "stockholm-spmi\0$",
+#ifndef ENABLE_BT
+    /*
+     * Keep the apcie/pci-bridge2/bluetooth-pcie endpoint node when Bluetooth is
+     * modelled: without it iOS enumerates function 1 of the combo part but has
+     * no matching device tree child, so the nub is never named
+     * "bluetooth-pcie", AppleConvergedPCI's provider never appears, and
+     * AppleConvergedIPCOLYBTControl never publishes -- which is exactly what
+     * makes bluetoothd exit and respawn ("PCIe could not find
+     * AppleConvergedIPCOLYBTControl service").
+     */
     "bluetooth-pcie\0$",
+#endif
 #ifndef ENABLE_WLAN
     "wlan\0$",
 #endif
+    /*
+     * /filesystems/fstab/baseband-vol (and its fstab-ephemeral-diag-data twin)
+     * describes the "Baseband-Data" APFS volume, role 0x80, mounted at
+     * /private/var/wireless/baseband_data. A restore only creates it on a
+     * device that has a baseband, and idevicerestore never creates one here, so
+     * the emulated container holds six volumes (System, Data, xART, Hardware,
+     * Preboot, Update) and nothing with role 0x80.
+     *
+     * The entry therefore has to go whether or not the baseband itself is
+     * emulated: mount(8)'s mount-phase-2 walks the fstab in vol.fs_mntorder and
+     * stops at the first entry it cannot resolve. baseband-vol is order 4, so
+     * keeping it means Update (5) and Hardware (6) are never mounted --
+     *   DT_get_fstab_entries:9164: failed to get volume for role: 128
+     * then the /private/var/hardware/FactoryData bind mount fails with ENOENT,
+     * mount exits 66, and launchd panics the boot with
+     *   "userspace panic: boot task failure: mount-phase-2".
+     */
+    "baseband-vol\0$",
 #ifndef ENABLE_BASEBAND
     "baseband\0$",
     "baseband-spmi\0$",
-    "baseband-vol\0$",
     "baseband-pcie\0$",
     "audio-baseband-voice\0$",
 #endif

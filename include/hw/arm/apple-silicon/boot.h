@@ -20,8 +20,9 @@
 #ifndef HW_ARM_APPLE_SILICON_BOOT_H
 #define HW_ARM_APPLE_SILICON_BOOT_H
 
-// #define ENABLE_BASEBAND
+#define ENABLE_BASEBAND
 #define ENABLE_WLAN
+#define ENABLE_BT
 #define ENABLE_DATA_ENCRYPTION
 
 #include "qemu/osdep.h"

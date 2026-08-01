@@ -69,6 +69,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBasebandState, APPLE_BASEBAND)
 #define APPLE_BASEBAND_DEVICE_BAR2_SIZE (0x2000)
 
 /*
+ * Upper bound on the firmware image the guest can hand to the image doorbell.
+ * The size comes straight from a BAR1 register write, so it is unbounded
+ * guest input; the real images are a few MiB, and 64 MiB leaves plenty of
+ * headroom while keeping a bogus value from reaching g_malloc(), which aborts
+ * rather than failing.
+ */
+#define APPLE_BASEBAND_MAX_IMAGE_SIZE (64 * MiB)
+
+/*
 
 possible definitions:
 CR: Completion Ring
@@ -404,6 +413,21 @@ apple_baseband_device_update_image_doorbell(AppleBasebandDeviceState *s)
         s->image_ptr = NULL;
     }
     if (s->image_addr != 0 && s->image_size != 0) {
+        /*
+         * image_size is whatever the guest last wrote to BAR1+0x88, so it can
+         * be anything up to 4 GiB. g_malloc() aborts rather than returning
+         * NULL, so an out-of-range size has to be rejected here or a bad
+         * (or hostile) driver takes the whole emulator down with it.
+         * The real transfers are firmware images of a few MiB.
+         */
+        if (s->image_size > APPLE_BASEBAND_MAX_IMAGE_SIZE) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: image size 0x%x exceeds the 0x%x cap; ignoring "
+                          "the doorbell.\n",
+                          __func__, s->image_size,
+                          APPLE_BASEBAND_MAX_IMAGE_SIZE);
+            return;
+        }
         s->image_ptr = g_malloc(s->image_size);
         if (!apple_baseband_dma_read_ptr(s, s->image_addr, s->image_size,
                                          s->image_ptr)) {
@@ -542,8 +566,8 @@ static void apple_baseband_device_bar1_write(void *opaque, hwaddr addr,
         s->window_base_addr |= ((data & UINT32_MAX) << 0);
         break;
     case 0x9c: // ICEBBRTIDevice::updateWindowBase ; DART window base high
-        s->window_base_addr &= (0xffffffffull << 32);
-        s->window_base_addr |= ((data & UINT32_MAX) << 0);
+        s->window_base_addr &= (UINT32_MAX << 0);
+        s->window_base_addr |= ((data & UINT32_MAX) << 32);
         break;
     case 0xa0: // ICEBBRTIDevice::updateWindowLimit ; DART window limit low
         s->window_limit_addr &= (0xffffffffull << 32);
@@ -551,8 +575,8 @@ static void apple_baseband_device_bar1_write(void *opaque, hwaddr addr,
         break;
     case 0xa4: // ICEBBRTIDevice::updateWindowLimit ; DART window limit high ;
                // fixed zero
-        s->window_limit_addr &= (0xffffffffull << 32);
-        s->window_limit_addr |= ((data & UINT32_MAX) << 0);
+        s->window_limit_addr &= (UINT32_MAX << 0);
+        s->window_limit_addr |= ((data & UINT32_MAX) << 32);
         break;
     default:
         break;
@@ -710,8 +734,8 @@ static SMCResult smc_key_gP07_read(SMCKey *key, SMCKeyData *data,
             data0[0]);
 
     DPRINTF("%s: key->info.size: 0x%08x ; length: 0x%08x\n", __func__,
-            key->info.size, length);
-    DPRINTF("%s: value: 0x%08x ; length: 0x%08x\n", __func__, value, length);
+            key->info.size, in_length);
+    DPRINTF("%s: value: 0x%08x ; length: 0x%08x\n", __func__, value, in_length);
 
     switch (value) {
     default:
@@ -741,7 +765,7 @@ static SMCResult smc_key_gP07_write(SMCKey *key, SMCKeyData *data,
     // Do not use data->data here, as it only contains the data last written to
     // by the read function (smc_key_gP09_read)
 
-    DPRINTF("%s: value: 0x%08x ; length: 0x%08x\n", __func__, value, length);
+    DPRINTF("%s: value: 0x%08x ; length: 0x%08x\n", __func__, value, in_length);
 
     switch (value) {
     // function-bb_on: 0x00800000 write?
@@ -786,8 +810,8 @@ static SMCResult smc_key_gP09_read(SMCKey *key, SMCKeyData *data,
             data0[0]);
 
     DPRINTF("%s: key->info.size: 0x%08x ; length: 0x%08x\n", __func__,
-            key->info.size, length);
-    DPRINTF("%s: value: 0x%08x ; length: 0x%08x\n", __func__, value, length);
+            key->info.size, in_length);
+    DPRINTF("%s: value: 0x%08x ; length: 0x%08x\n", __func__, value, in_length);
 
     switch (value) {
     // function-pmu_exton: 0x02000000 read?
@@ -833,7 +857,7 @@ static SMCResult smc_key_gP09_write(SMCKey *key, SMCKeyData *data,
     // Do not use data->data here, as it only contains the data last written to
     // by the read function (smc_key_gP09_read)
 
-    DPRINTF("%s: value: 0x%08x ; length: 0x%08x\n", __func__, value, length);
+    DPRINTF("%s: value: 0x%08x ; length: 0x%08x\n", __func__, value, in_length);
 
     switch (value) {
     case 0x04000000: {
