@@ -23,27 +23,32 @@
 #define ENABLE_BASEBAND
 #define ENABLE_WLAN
 /*
- * ENABLE_BT is DISABLED by default: the model is incomplete.
+ * ENABLE_BT is DISABLED by default: Bluetooth still does not come up.
  *
- * The dart-apcie2 panic it used to cause is fixed -- that was Wi-Fi DMAing
- * through Bluetooth's DART stream, see apple_pcie_port_dma_as() -- and the
- * driver now gets through firmware download, RTI bring-up, the "Converged IPC"
- * context handover and the creation of the control, completion and HCI rings.
+ * The device side now looks complete. The driver gets through firmware
+ * download, RTI bring-up, the "Converged IPC" context handover, and the
+ * creation of the control, completion and HCI rings; every IOKit object
+ * appears (AppleBluetoothModule -> AppleConvergedIPCOLYBTControl ->
+ * AppleConvergedIPCRTIDevice -> four AppleConvergedIPCRTIInterfaces), and both
+ * HCI pipes open and are acknowledged exactly once, with no retries.
  *
- * It stops there. Both HCI pipes open and are acknowledged, and then nothing
- * ever uses them: neither of their doorbells is rung, so no HCI command is ever
- * sent, and about two seconds later the whole BCM4378 is externally reset,
- * which takes Wi-Fi down with it ("watchdog@BCMWLAN Bus external reset
- * request"). That cycle repeats every few seconds -- ~50 Wi-Fi resets in a
- * 3 minute iOS 14 boot against zero with Bluetooth off. iOS 14 still reaches
- * the home screen through it, but nothing should have to.
+ * What does not happen is any use of them: neither HCI doorbell is ever rung,
+ * so no HCI command is ever sent, and about two seconds later something asks
+ * AppleBluetoothModule to power-cycle the part. That takes Wi-Fi down with it
+ * ("watchdog@BCMWLAN Bus external reset request") and the whole bring-up
+ * repeats -- ~38 times in a 3 minute iOS 14 boot, against zero Wi-Fi resets
+ * with Bluetooth off. Settings shows "Bluetooth: Unavailable".
+ *
+ * Nothing in ACIPCRTIDevice times bring-up out, and the power cycle goes
+ * through AppleBluetoothModule's "PowerCycleModule" platform function, which
+ * only accepts the request from whatever registered as "BT Controller" -- so
+ * the deadline being missed belongs to bluetoothd, above the kernel driver,
+ * and the next step is to find what it is waiting for.
  *
  * iOS 26 additionally fails earlier and differently: ACIPCOLYBTControl.cpp:239
  * is `assert(createDevice(create, RTI) != NULL)` in linkUp, i.e. the RTI device
  * object itself never comes up there.
  *
- * Re-enable once the driver gets past ring creation and stops resetting the
- * part.
  */
 // #define ENABLE_BT
 #define ENABLE_DATA_ENCRYPTION

@@ -94,7 +94,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMBTState, APPLE_BCM_BT)
 #define BT_BAR0_FW_DOORBELL 0x140
 #define BT_BAR0_RTI_CONTROL 0x144
 #define BT_BAR0_SLEEP_CONTROL 0x150
+/*
+ * Sleep control values, named by the Linux driver. The part is awake out of
+ * reset; QUIESCE is how the host parks it before taking the link down.
+ */
+#define BT_SLEEP_CONTROL_UNQUIESCE 0
+#define BT_SLEEP_CONTROL_AWAKE 2
+#define BT_SLEEP_CONTROL_QUIESCE 3
+/*
+ * 0x154 is the other half of that handshake. Apple's driver *writes* 1 to it at
+ * the start of every bring-up attempt and never reads it back, which only makes
+ * sense as a wake request; Linux never touches it at all. It is modelled as
+ * write-1-to-wake with the current sleep state on the read side. That reading is
+ * an inference from the access pattern, not from disassembly.
+ */
 #define BT_BAR0_SLEEP_STATUS 0x154
+#define BT_BAR0_SLEEP_WAKE_REQUEST 1
 /*
  * Linux rings every doorbell through one register with the index packed into
  * the written word. Apple's driver instead writes the new head straight into a
@@ -105,12 +120,56 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMBTState, APPLE_BCM_BT)
 #define BT_BAR0_DOORBELL 0x174
 #define BT_BAR0_DOORBELL_ARRAY 0x6620
 #define BT_BAR0_DOORBELL_ARRAY_COUNT 32
+/*
+ * The two host windows: the aperture through which the part is allowed to reach
+ * host memory. There are two register sets, 0x10 apart, and a commit register.
+ * The host programs base/size into one set and then writes the matching enable
+ * bit to 0x610 -- iOS 14 uses window 0 for its first, tiny window and window 1
+ * for the firmware image and later the RTI window, and brackets every
+ * reprogramming with 0x610 = 0x100 then 0x610 = 0x200.
+ *
+ * The window is an access filter on a real part. Nothing here enforces it: the
+ * DART downstream of us is the real protection, and refusing a DMA the guest's
+ * own IOMMU allows would only invent failures. The registers are decoded so the
+ * values are visible and the writes are not reported as unimplemented.
+ */
+#define BT_BAR0_HOST_WINDOW0_LO 0x580
+#define BT_BAR0_HOST_WINDOW0_HI 0x584
+#define BT_BAR0_HOST_WINDOW0_SIZE 0x588
 #define BT_BAR0_HOST_WINDOW_LO 0x590
 #define BT_BAR0_HOST_WINDOW_HI 0x594
 #define BT_BAR0_HOST_WINDOW_SIZE 0x598
+#define BT_BAR0_WINDOW_COMMIT 0x610
+#define BT_WINDOW_COMMIT_WINDOW0 BIT(8)
+#define BT_WINDOW_COMMIT_WINDOW1 BIT(9)
+/*
+ * A second AXI2AHB-style bridge status, in BAR0 window 5, read immediately
+ * before the one at 0x1908 on every health check. Same semantics: 0xFFFFFFFF is
+ * a dead chip and either of the low two bits set is a bridge error, so zero is
+ * the healthy answer.
+ */
+#define BT_BAR0_APB_BRIDGE_STATUS 0x5908
 /* The OTP mirror, at core2-window1 (0x18011000) + 0x120. */
 #define BT_BAR0_OTP_OFFSET 0x4120
 #define BT_BAR0_OTP_SIZE 0xE0
+/*
+ * OTP contents. iOS never reads this window (AppleConvergedIPCOLYBTControl's
+ * `read_otp` is false for iOS) but macOS does, and both Linux's hci_bcm4377 and
+ * Apple's publishOTPData parse the same type/length/value stream: a byte of
+ * type, a byte of length, `length` bytes of value, terminated by a zero type.
+ * Type 0x15 is the "system vendor" record, whose value is a 4-byte header
+ * followed by two NUL-terminated strings -- the chip parameters and the board
+ * parameters, which Linux turns into a firmware file name.
+ *
+ * The framing below is from those two parsers and is right. The two strings are
+ * NOT: what a real iPhone 11 module has burned into them is not known here, so
+ * they name the part this model claims to be and nothing more. A parser will
+ * find a well-formed record rather than an immediately-terminated one; anything
+ * that needs the true module identity will still not get it.
+ */
+#define BT_OTP_TYPE_END 0x00
+#define BT_OTP_TYPE_SYS_VENDOR 0x15
+#define BT_OTP_SYS_VENDOR_HDR 0x00000008
 
 /*
  * ChipCommon lives in BAR0 window 3. Only two registers are needed.
@@ -173,6 +232,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMBTState, APPLE_BCM_BT)
  */
 #define BT_BAR2_CONTEXT_ADDR_HI 0x200450
 #define BT_RTI_CAP_BASE BIT(1)
+/*
+ * Bit 3 is the other half of the host's mask (setupConfiguration masks the
+ * device's capabilities with 0xA). Advertising it makes setupMemory hand the
+ * part its MSI address and data over MMIO instead of leaving it to read them
+ * out of its own PCIe MSI capability.
+ *
+ * It is deliberately NOT advertised. This model raises interrupts through
+ * QEMU's msi_notify(), which uses the capability the guest programmed, so the
+ * MMIO copy would be write-only state that could silently disagree with the one
+ * actually used. The three registers are decoded regardless, so advertising the
+ * bit is a one-line change if a driver ever needs it.
+ */
+#define BT_RTI_CAP_MSI_CONFIG BIT(3)
 #define BT_RTI_CAP_ISO BIT(4)
 #define BT_RTI_CAP_THREAD BIT(5)
 #define BT_RTI_CAPABILITIES BT_RTI_CAP_BASE
@@ -181,6 +253,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMBTState, APPLE_BCM_BT)
 #define BT_BAR2_FW_LO 0x200478
 #define BT_BAR2_FW_HI 0x20047C
 #define BT_BAR2_FW_SIZE 0x200480
+/*
+ * The exit code, and the response to a coredump image request.
+ *
+ * ACIPCBTIDevice::getExitCode (@0xfffffff008b92b3c) reads it after a boot stage
+ * change and treats only 0xFFFFFFFF as a failure -- that is what an unreadable
+ * register looks like, and it makes the driver give up with reason
+ * BT_DEAD_MMIO_READ_FAIL. ACIPCRTIDevice::coredumpCompletion reads it together
+ * with the image size at BT_BAR2_FW_SIZE and only fetches an image when it
+ * reads exactly 1.
+ */
+#define BT_BAR2_EXIT_CODE 0x200488
+#define BT_EXIT_CODE_NORMAL 0
+#define BT_EXIT_CODE_IMAGE_READY 1
 #define BT_BAR2_CONTEXT_ADDR_LO 0x20048C
 /*
  * Apple's driver puts the high half of the context address here rather than in
@@ -191,6 +276,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMBTState, APPLE_BCM_BT)
 #define BT_BAR2_RTI_WINDOW_LO 0x200494
 #define BT_BAR2_RTI_WINDOW_HI 0x200498
 #define BT_BAR2_RTI_WINDOW_SIZE 0x20049C
+/*
+ * Where the part is told to send its MSIs, written by setupMemory only when
+ * BT_RTI_CAP_MSI_CONFIG is advertised. See that capability: it is not, so these
+ * are never written -- they are decoded so that a driver which does write them
+ * is not met with "unimplemented", and so the values would be visible.
+ */
+#define BT_BAR2_MSI_ADDR_LO 0x2004F8
+#define BT_BAR2_MSI_ADDR_HI 0x2004FC
+#define BT_BAR2_MSI_DATA 0x200500
 
 /*
  * The "device info" block in host memory, which the context points at.
@@ -218,9 +312,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMBTState, APPLE_BCM_BT)
 #define BT_DEVINFO_SLEEP_NOTIFICATION 0x08
 #define BT_DEVINFO_IMAGE_SIZE 0x0C
 
-/* Bootstage / RTI values the host waits for. */
+/*
+ * Boot stages, as ACIPCRTIDevice::processExecutionStageChange and
+ * ACIPCOLYBTControl::bootStageChangeFunction (@0xfffffff008b61ad4) read them.
+ * Only three values are usable: 0 is the cold ROM stage, 2 is "firmware
+ * running" and is where a healthy part stays, and 3 says the firmware has
+ * trapped and a coredump is available -- msiInterrupt short-circuits to
+ * coredumpCompletion() for as long as the host believes the part is in it.
+ * Publishing 1 is ignored, and anything from 4 up panics the guest at
+ * AppleConvergedIPCRTIDevice.cpp:1417, so this model must never produce one.
+ */
 #define BT_BOOTSTAGE_COLD 0
 #define BT_BOOTSTAGE_READY 2
+#define BT_BOOTSTAGE_CRASHED 3
 #define BT_RTI_STATE_OFF 0
 #define BT_RTI_STATE_STARTED 1
 #define BT_RTI_STATE_RUNNING 2
@@ -285,6 +389,23 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMBTState, APPLE_BCM_BT)
 #define BT_EVT_CMD_COMPLETE 0x0E
 #define BT_EVT_CMD_STATUS 0x0F
 #define BT_EVT_HARDWARE_ERROR 0x10
+
+/*
+ * The reasons ACIPCRTIDevice::enterDead() reports, indexed by numeric code (the
+ * driver's own name table is at 0xfffffff007bb2550 in the iOS 18.6.2
+ * kernelcache). This model never sends them -- the driver derives them from
+ * what it sees -- but every one of them is something this model can provoke, so
+ * naming them here lets our own log say what the guest's log is about to say.
+ */
+#define BT_DEAD_UNEXPECTED_CHANNEL 0x0A
+#define BT_DEAD_PIPE_OPEN_FAILED 0x12
+#define BT_DEAD_ILLEGAL_STATE_TRANSITION 0x15
+#define BT_DEAD_UNKNOWN_STATE 0x17
+#define BT_DEAD_DEVICE_TRAP 0x2D
+#define BT_DEAD_QUIESCE_FAILURE 0x34
+#define BT_DEAD_MMIO_WRITE_FAIL 0x3C
+#define BT_DEAD_MMIO_READ_FAIL 0x3D
+#define BT_DEAD_DAR_TRAP 0x44
 
 #define BT_STATUS_SUCCESS 0x00
 #define BT_STATUS_UNKNOWN_COMMAND 0x01
@@ -375,14 +496,34 @@ struct AppleBCMBTDeviceState {
     uint32_t host_window_lo;
     uint32_t host_window_hi;
     uint32_t host_window_size;
+    uint32_t host_window0_lo;
+    uint32_t host_window0_hi;
+    uint32_t host_window0_size;
+    uint32_t window_commit;
     uint8_t otp[BT_BAR0_OTP_SIZE];
 
     /* BAR2 shadow state. */
     uint32_t bootstage;
     uint32_t rti_status;
-    /* Mirrored into the host's device info block; see BT_DEVINFO_SIZE. */
+    /*
+     * Mirrored into the host's device info block; see BT_DEVINFO_SIZE.
+     *
+     * A real part sets this when it changes sleep state on its own and the host
+     * answers in processSleepNotification(). What the individual values mean is
+     * not known here, so this model never invents one: it stays zero, which is
+     * what the host itself seeds the word with, and the host is therefore never
+     * told about a transition that did not happen.
+     */
     uint32_t sleep_notification;
+    /* Bytes of coredump waiting to be collected; see bt_firmware_trap(). */
+    uint32_t coredump_size;
     uint32_t fw_lo, fw_hi, fw_size;
+    /*
+     * What getExitCode() and coredumpCompletion() read; see BT_BAR2_EXIT_CODE.
+     */
+    uint32_t exit_code;
+    /* Where the part would send its MSIs if it were told over MMIO. */
+    uint32_t msi_addr_lo, msi_addr_hi, msi_data;
     uint32_t ctx_lo, ctx_hi;
     uint32_t rti_window_lo, rti_window_hi, rti_window_size;
 
@@ -450,6 +591,32 @@ static void bt_st32(uint8_t *p, uint32_t v)
     p[1] = (v >> 8) & 0xFF;
     p[2] = (v >> 16) & 0xFF;
     p[3] = (v >> 24) & 0xFF;
+}
+
+static const char *bt_dead_reason_name(unsigned code)
+{
+    switch (code) {
+    case BT_DEAD_UNEXPECTED_CHANNEL:
+        return "transfer completion on an unexpected channel";
+    case BT_DEAD_PIPE_OPEN_FAILED:
+        return "pipe open failed";
+    case BT_DEAD_ILLEGAL_STATE_TRANSITION:
+        return "illegal state transition";
+    case BT_DEAD_UNKNOWN_STATE:
+        return "unknown state";
+    case BT_DEAD_DEVICE_TRAP:
+        return "device trap";
+    case BT_DEAD_QUIESCE_FAILURE:
+        return "quiesce failure";
+    case BT_DEAD_MMIO_WRITE_FAIL:
+        return "MMIO write failure";
+    case BT_DEAD_MMIO_READ_FAIL:
+        return "MMIO read failure";
+    case BT_DEAD_DAR_TRAP:
+        return "DAR trap";
+    default:
+        return "unknown reason";
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -698,17 +865,27 @@ static void bt_hci_flush_events(AppleBCMBTDeviceState *s)
         uint16_t msg_id;
 
         /*
-         * A device-to-host ring is a credit pool: the host advances its head
-         * for every buffer it is willing to receive into. Without a credit
-         * there is nowhere to put the event, so hold it until the host grants
-         * one (it does so from its own interrupt handler after consuming).
+         * A real device-to-host ring is a credit pool: the host advances its
+         * head for every buffer it is willing to receive into, and without a
+         * credit there is nowhere to put the event.
+         *
+         * The HCI device-to-host ring is not one of those. The host creates it
+         * "virtual" (flags bit 7, and the personality's `virtual: 1`), which
+         * means it has no memory at all -- its create message carries a null
+         * address -- and posts no buffers, so its head never moves. Inbound
+         * packets ride entirely in the optional footer of the completion
+         * descriptor, which ACIPCRTIDevice::processCD (@0xfffffff008b7aac4)
+         * takes from `cd + 0x10` when flags bit 1 is set. Waiting for credit on
+         * such a ring waits forever.
          */
-        if (!bt_read_index(s, s->xfer_heads_addr, BT_XFER_RING_HCI_D2H,
-                           &host_head)) {
-            return;
-        }
-        if (host_head == ring->tail) {
-            return;
+        if (!ring->virt) {
+            if (!bt_read_index(s, s->xfer_heads_addr, BT_XFER_RING_HCI_D2H,
+                               &host_head)) {
+                return;
+            }
+            if (host_head == ring->tail) {
+                return;
+            }
         }
 
         msg_id = ((uint16_t)ring->generation << 8) |
@@ -1071,6 +1248,8 @@ static void bt_hci_handle_command(AppleBCMBTDeviceState *s, const uint8_t *cmd,
 /* Control ring                                                       */
 /* ------------------------------------------------------------------ */
 
+static void bt_firmware_trap(AppleBCMBTDeviceState *s, const char *what);
+
 static void bt_ctrl_create_compl_ring(AppleBCMBTDeviceState *s,
                                       const uint8_t *msg)
 {
@@ -1078,9 +1257,8 @@ static void bt_ctrl_create_compl_ring(AppleBCMBTDeviceState *s,
     AppleBCMBTComplRing *ring;
 
     if (id >= BT_MAX_COMPL_RINGS || id >= s->n_compl_rings) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "apple-bcm-bt: create completion ring: bad index %u\n",
-                      id);
+        bt_firmware_trap(s, "create completion ring with an index outside the "
+                            "count the context declared");
         return;
     }
     ring = &s->compl_ring[id];
@@ -1105,8 +1283,8 @@ static void bt_ctrl_create_xfer_ring(AppleBCMBTDeviceState *s,
     AppleBCMBTXferRing *ring;
 
     if (id >= BT_MAX_XFER_RINGS || id >= s->n_xfer_rings) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "apple-bcm-bt: create transfer ring: bad index %u\n", id);
+        bt_firmware_trap(s, "create transfer ring with an index outside the "
+                            "count the context declared");
         return;
     }
     ring = &s->xfer[id];
@@ -1151,8 +1329,7 @@ static void bt_ctrl_handle_message(AppleBCMBTDeviceState *s, const uint8_t *msg,
     }
 
     if (len < 4) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "apple-bcm-bt: runt control message (%u bytes)\n", len);
+        bt_firmware_trap(s, "runt control message");
         return;
     }
 
@@ -1187,13 +1364,12 @@ static void bt_ctrl_handle_message(AppleBCMBTDeviceState *s, const uint8_t *msg,
         qemu_log_mask(LOG_UNIMP,
                       "apple-bcm-bt: unknown control message type %u\n",
                       msg[0]);
+        bt_firmware_trap(s, "control message of a type this model does not "
+                            "implement");
         return;
     }
 
-    qemu_log_mask(LOG_GUEST_ERROR,
-                  "apple-bcm-bt: control message type %u is %u bytes, "
-                  "expected %u\n",
-                  msg[0], len, BT_CONTROL_MSG_SIZE);
+    bt_firmware_trap(s, "control message shorter than the type requires");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1449,10 +1625,63 @@ static void bt_publish_device_info(AppleBCMBTDeviceState *s)
     bt_st32(info + BT_DEVINFO_BOOT_STAGE, s->bootstage);
     bt_st32(info + BT_DEVINFO_STATUS, s->rti_status);
     bt_st32(info + BT_DEVINFO_SLEEP_NOTIFICATION, s->sleep_notification);
-    /* The image size mirror only carries a coredump's size; there is none. */
-    bt_st32(info + BT_DEVINFO_IMAGE_SIZE, 0);
+    /*
+     * The image size mirror carries the size of a coredump image waiting to be
+     * collected. There is no firmware here to dump, so it is zero except while
+     * the modelled firmware is trapped -- see bt_firmware_trap().
+     */
+    bt_st32(info + BT_DEVINFO_IMAGE_SIZE, s->coredump_size);
 
     bt_dma_write(s, s->peripheral_info_addr, info, sizeof(info));
+}
+
+/*
+ * The firmware has hit something it cannot continue from.
+ *
+ * A real part traps, stops servicing its rings and offers a coredump: boot
+ * stage 3, an image size, and an exit code of 1 once the image is ready. The
+ * host notices the stage in the device info mirror, and from then on
+ * msiInterrupt() routes straight to coredumpCompletion() until the part is
+ * reset -- so once this is published nothing else this model does will be
+ * looked at, which is exactly the point. It is what a firmware bug looks like
+ * from the host's side, and it is a far more honest answer than quietly
+ * ignoring a request we cannot honour.
+ *
+ * There is no image: this model has no firmware to dump, so it reports a size
+ * of zero and leaves the exit code at BT_EXIT_CODE_NORMAL rather than
+ * BT_EXIT_CODE_IMAGE_READY. coredumpCompletion() logs that it is ignoring the
+ * response and gives up on the dump, which is the correct outcome.
+ */
+static void bt_firmware_trap(AppleBCMBTDeviceState *s, const char *what)
+{
+    unsigned i;
+
+    if (s->bootstage == BT_BOOTSTAGE_CRASHED) {
+        return;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "apple-bcm-bt: %s; trapping the firmware. The host will see "
+                  "boot stage %u and, if it gives up, report reason 0x%02x "
+                  "(%s)\n",
+                  what, BT_BOOTSTAGE_CRASHED, BT_DEAD_DEVICE_TRAP,
+                  bt_dead_reason_name(BT_DEAD_DEVICE_TRAP));
+
+    /* A trapped firmware services nothing. */
+    for (i = 0; i < BT_MAX_XFER_RINGS; i++) {
+        s->xfer[i].enabled = false;
+    }
+    for (i = 0; i < BT_MAX_COMPL_RINGS; i++) {
+        s->compl_ring[i].enabled = false;
+    }
+    s->evq_head = s->evq_tail = 0;
+
+    s->bootstage = BT_BOOTSTAGE_CRASHED;
+    s->coredump_size = 0;
+    s->exit_code = BT_EXIT_CODE_NORMAL;
+
+    bt_publish_device_info(s);
+    bt_raise_msi(s);
 }
 
 static void bt_boot_timer(void *opaque)
@@ -1497,6 +1726,8 @@ static void bt_firmware_stop(AppleBCMBTDeviceState *s)
     s->ctx_valid = false;
     s->ctx_lo = s->ctx_hi = 0;
     s->fw_lo = s->fw_hi = s->fw_size = 0;
+    s->exit_code = BT_EXIT_CODE_NORMAL;
+    s->coredump_size = 0;
     s->compl_heads_addr = 0;
     s->compl_tails_addr = 0;
     s->xfer_heads_addr = 0;
@@ -1533,6 +1764,18 @@ static uint64_t bt_bar0_read(void *opaque, hwaddr addr, unsigned size)
     case BT_BAR0_SLEEP_CONTROL:
         value = s->sleep_control;
         break;
+    case BT_BAR0_HOST_WINDOW0_LO:
+        value = s->host_window0_lo;
+        break;
+    case BT_BAR0_HOST_WINDOW0_HI:
+        value = s->host_window0_hi;
+        break;
+    case BT_BAR0_HOST_WINDOW0_SIZE:
+        value = s->host_window0_size;
+        break;
+    case BT_BAR0_WINDOW_COMMIT:
+        value = s->window_commit;
+        break;
     case BT_BAR0_HOST_WINDOW_LO:
         value = s->host_window_lo;
         break;
@@ -1544,6 +1787,10 @@ static uint64_t bt_bar0_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case BT_BAR0_SLEEP_STATUS:
         value = s->sleep_status;
+        break;
+    case BT_BAR0_APB_BRIDGE_STATUS:
+        /* Zero means "no bridge error"; see BT_BAR0_APB_BRIDGE_STATUS. */
+        value = 0;
         break;
     case BT_BAR0_CC_CHIPID:
         value = BT_CC_CHIPID_VALUE;
@@ -1643,7 +1890,12 @@ static void bt_bar0_write(void *opaque, hwaddr addr, uint64_t data,
         }
         break;
     case BT_BAR0_SLEEP_CONTROL:
+        /*
+         * The part follows the host here: it is awake unless told to quiesce,
+         * and there is no clock or power domain behind this to take time over.
+         */
         s->sleep_control = data;
+        s->sleep_status = data;
         break;
     case BT_BAR0_DOORBELL:
         if (data & BT_DOORBELL_RING) {
@@ -1660,7 +1912,29 @@ static void bt_bar0_write(void *opaque, hwaddr addr, uint64_t data,
         s->host_window_size = data;
         break;
     case BT_BAR0_SLEEP_STATUS:
-        s->sleep_status = data;
+        /* A wake request; see BT_BAR0_SLEEP_STATUS. */
+        if (data == BT_BAR0_SLEEP_WAKE_REQUEST) {
+            s->sleep_control = BT_SLEEP_CONTROL_AWAKE;
+            s->sleep_status = BT_SLEEP_CONTROL_AWAKE;
+        }
+        break;
+    case BT_BAR0_HOST_WINDOW0_LO:
+        s->host_window0_lo = data;
+        break;
+    case BT_BAR0_HOST_WINDOW0_HI:
+        s->host_window0_hi = data;
+        break;
+    case BT_BAR0_HOST_WINDOW0_SIZE:
+        s->host_window0_size = data;
+        break;
+    case BT_BAR0_WINDOW_COMMIT:
+        s->window_commit = data;
+        BT_DPRINTF("host window %s0 [0x%08x%08x +0x%x] %s1 [0x%08x%08x "
+                   "+0x%x]\n",
+                   (data & BT_WINDOW_COMMIT_WINDOW0) ? "+" : "-",
+                   s->host_window0_hi, s->host_window0_lo, s->host_window0_size,
+                   (data & BT_WINDOW_COMMIT_WINDOW1) ? "+" : "-",
+                   s->host_window_hi, s->host_window_lo, s->host_window_size);
         break;
     default:
         if (addr >= BT_BAR0_DOORBELL_ARRAY &&
@@ -1746,6 +2020,18 @@ static uint64_t bt_bar2_read(void *opaque, hwaddr addr, unsigned size)
     case BT_BAR2_RTI_WINDOW_SIZE:
         value = s->rti_window_size;
         break;
+    case BT_BAR2_EXIT_CODE:
+        value = s->exit_code;
+        break;
+    case BT_BAR2_MSI_ADDR_LO:
+        value = s->msi_addr_lo;
+        break;
+    case BT_BAR2_MSI_ADDR_HI:
+        value = s->msi_addr_hi;
+        break;
+    case BT_BAR2_MSI_DATA:
+        value = s->msi_data;
+        break;
     default:
         qemu_log_mask(LOG_UNIMP,
                       "apple-bcm-bt: unimplemented BAR2 read at 0x%" HWADDR_PRIx
@@ -1795,7 +2081,17 @@ static void bt_bar2_write(void *opaque, hwaddr addr, uint64_t data,
     case BT_BAR2_RTI_WINDOW_SIZE:
         s->rti_window_size = data;
         break;
+    case BT_BAR2_MSI_ADDR_LO:
+        s->msi_addr_lo = data;
+        break;
+    case BT_BAR2_MSI_ADDR_HI:
+        s->msi_addr_hi = data;
+        break;
+    case BT_BAR2_MSI_DATA:
+        s->msi_data = data;
+        break;
     case BT_BAR2_BOOTSTAGE:
+    case BT_BAR2_EXIT_CODE:
     case BT_BAR2_RTI_STATUS:
         qemu_log_mask(LOG_GUEST_ERROR,
                       "apple-bcm-bt: write to read-only BAR2 status register "
@@ -1824,6 +2120,45 @@ static const MemoryRegionOps bt_bar2_ops = {
 /* ------------------------------------------------------------------ */
 /* qdev / PCI                                                         */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Build the OTP image the host would read out of the part. See
+ * BT_OTP_TYPE_SYS_VENDOR for the format.
+ *
+ * The chip parameters string is a fact about the part this model claims to be:
+ * a BCM4378 revision B1, which is what the PCI revision says and what the only
+ * firmware iOS ships for it is named after. The board parameters string is
+ * left empty on purpose -- it carries the module vendor, and what an iPhone 11
+ * module has burned into it is not known here. Every parser of this record
+ * requires that field to identify the module, so leaving it empty makes them
+ * say so ("unexpected module information in OTP, not publishing") instead of
+ * believing an invented vendor and going looking for the wrong firmware.
+ */
+static void bt_build_otp(AppleBCMBTDeviceState *s)
+{
+    static const char chip_params[] = "BCM4378B1";
+    static const char board_params[] = "";
+    uint8_t *p = s->otp;
+    size_t value_len;
+
+    memset(s->otp, 0, sizeof(s->otp));
+
+    value_len = 4 + sizeof(chip_params) + sizeof(board_params);
+    if (value_len > 0xFF || 2 + value_len + 1 > sizeof(s->otp)) {
+        /* Cannot happen with the strings above; do not emit a truncated one. */
+        return;
+    }
+
+    *p++ = BT_OTP_TYPE_SYS_VENDOR;
+    *p++ = value_len;
+    bt_st32(p, BT_OTP_SYS_VENDOR_HDR);
+    p += 4;
+    memcpy(p, chip_params, sizeof(chip_params));
+    p += sizeof(chip_params);
+    memcpy(p, board_params, sizeof(board_params));
+    p += sizeof(board_params);
+    *p = BT_OTP_TYPE_END;
+}
 
 static void apple_bcm_bt_device_pci_realize(PCIDevice *dev, Error **errp)
 {
@@ -1873,6 +2208,8 @@ static void apple_bcm_bt_device_pci_realize(PCIDevice *dev, Error **errp)
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar0);
     pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar2);
 
+    bt_build_otp(s);
+
     s->boot_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, bt_boot_timer, s);
     s->rti_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, bt_rti_timer, s);
 }
@@ -1898,8 +2235,8 @@ static void apple_bcm_bt_device_qdev_reset_hold(Object *obj, ResetType type)
 
     bt_firmware_stop(s);
 
-    s->sleep_control = 0;
-    s->sleep_status = 0;
+    s->sleep_control = BT_SLEEP_CONTROL_AWAKE;
+    s->sleep_status = BT_SLEEP_CONTROL_AWAKE;
     /*
      * The Bluetooth clock is running as soon as the part is powered: the
      * platform turns it on through the combo chip's power control, which is
@@ -1910,6 +2247,13 @@ static void apple_bcm_bt_device_qdev_reset_hold(Object *obj, ResetType type)
     s->host_window_lo = 0;
     s->host_window_hi = 0;
     s->host_window_size = 0;
+    s->host_window0_lo = 0;
+    s->host_window0_hi = 0;
+    s->host_window0_size = 0;
+    s->window_commit = 0;
+    s->msi_addr_lo = 0;
+    s->msi_addr_hi = 0;
+    s->msi_data = 0;
     s->rti_window_lo = 0;
     s->rti_window_hi = 0;
     s->rti_window_size = 0;
