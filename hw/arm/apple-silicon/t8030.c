@@ -671,6 +671,72 @@ static void t8030_pmap_io_range_add(AppleDTNode *defaults, hwaddr base,
                       old_len + sizeof(PmapIORange), ranges);
 }
 
+/*
+ * The GPU DVFS tables, the next thing iOS 26.5 panics on after the handoff:
+ *
+ *   panic(cpu 2 caller 0xfffffff007fe0b00): No set value for `perf-states-sram`
+ *
+ * The shipped `sgx` node is a *template* the boot loader fills in: it carries
+ * `perf-states` as 128 bytes of zeroes, `perf-state-count` = 0 and
+ * `gpu-num-perf-states` = 2, and no `perf-states-sram` at all. On real hardware
+ * iBoot writes the SoC's operating points into it and adds the SRAM rail's
+ * table; Inferno stands in for iBoot, so it has to add the sibling.
+ *
+ * The consumer (@0xfffffff007fddd60 in the 26.5 kernelcache) pins the shape
+ * exactly, and reads `perf-states` and `perf-states-sram` through identical
+ * code -- same divisor, same bound:
+ *
+ *   states = `gpu-num-perf-states` + 1, and it must land in [2, 17]
+ *           (`sub w8, w28, #0x11` / `cmn w8, #0xf` / `b.lo <fail>`)
+ *   tables = `perf-state-table-count`, which must be <= 8
+ *   each table entry is a pair of u32s, so the array must satisfy
+ *           length / (8 * tables) >= states   (`lsl w8, w22, #3` / `udiv`)
+ *
+ * The copy loop then splits every entry: the first u32 goes into a contiguous
+ * per-state array, the second into a 0x20-strided one indexed by table, which
+ * is why the table count is capped at eight.
+ *
+ * Two things make a zero-filled table the correct thing to publish rather than
+ * a convenient one:
+ *
+ *   - `perf-state-table-count` is absent from the shipped tree, and a missing
+ *     one is *not* fatal: the driver takes `mov w22, #1` and carries on with a
+ *     single table (@0xfffffff007fde5bc). Only `perf-states-sram` panics, and
+ *     only when the platform flag at [x21+0x156] bit 0 says this board has an
+ *     SRAM rail.
+ *   - zeroes are explicitly expected. After the copy the driver walks the
+ *     stored states and back-fills every zero slot from the previous non-zero
+ *     one (@0xfffffff007fddfb4..fffff8). It is the same statement the platform
+ *     already makes with its own zeroed `perf-states`.
+ *
+ * So this publishes a table of the same length as the one the tree ships, which
+ * satisfies the bound with room to spare (128 / 8 = 16 entries against the 3
+ * that `gpu-num-perf-states` = 2 asks for).
+ *
+ * NAMED UNKNOWN -- the actual A13 GPU operating points. Nothing in the device
+ * tree, the driver or the firmware states them, and inventing frequency and
+ * voltage pairs would put made-up numbers into a power model that scales real
+ * behaviour. Zero says "the boot loader did not characterise this part", which
+ * is true here, and the driver has a defined response to it.
+ */
+static void t8030_gpu_perf_states_setup(AppleT8030MachineState *t8030)
+{
+    g_autofree uint8_t *sram = NULL;
+    AppleDTNode *sgx;
+    AppleDTProp *perf_states;
+
+    sgx = apple_dt_get_node(t8030->device_tree, "arm-io");
+    assert_nonnull(sgx);
+    sgx = apple_dt_get_node(sgx, "sgx");
+    assert_nonnull(sgx);
+
+    perf_states = apple_dt_get_prop(sgx, "perf-states");
+    assert_nonnull(perf_states);
+
+    sram = g_malloc0(perf_states->len);
+    apple_dt_set_prop(sgx, "perf-states-sram", perf_states->len, sram);
+}
+
 static void t8030_gpu_handoff_setup(AppleT8030MachineState *t8030,
                                     CarveoutAllocator *ca)
 {
@@ -777,6 +843,7 @@ static void t8030_memory_setup(AppleT8030MachineState *t8030)
      */
     if (t8030->gpu) {
         t8030_gpu_handoff_setup(t8030, ca);
+        t8030_gpu_perf_states_setup(t8030);
     }
 
     if (t8030->sep_rom_filename) {
