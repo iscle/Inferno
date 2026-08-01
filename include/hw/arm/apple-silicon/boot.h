@@ -23,15 +23,26 @@
 #define ENABLE_BASEBAND
 #define ENABLE_WLAN
 /*
- * ENABLE_BT is DISABLED by default: the model is incomplete (bluetoothd never
- * stays up -- the driver stops after RTI state 2 and never rings the control
- * doorbell) and it panics all three supported iOS versions on long runs:
- *   iOS 26 -- ACIPCOLYBTControl.cpp:239 assertion failed
- *   iOS 18 -- intermittent DebuggerXCallEnter after apple-bcm-bt RTI churn
- *   iOS 14 -- dart-apcie2 SID 1 (mapper-apcie2-bt) PTE invalid on read
- * It also burns real CPU: 126 RTI respawn cycles in one iOS 26 boot, each
- * re-uploading 373 KB of firmware, competing with whatever is being measured.
- * Re-enable once the RTI stall and the stale-mapping DMA are fixed.
+ * ENABLE_BT is DISABLED by default: the model is incomplete.
+ *
+ * The dart-apcie2 panic it used to cause is fixed -- that was Wi-Fi DMAing
+ * through Bluetooth's DART stream, see apple_pcie_port_dma_as() -- and the
+ * driver now gets through firmware download, RTI bring-up, the "Converged IPC"
+ * context handover and the creation of the control, completion and HCI rings.
+ *
+ * It stops there. Once the two HCI transfer rings exist the driver goes silent
+ * without ringing either of their doorbells, and about a second later it has
+ * the whole BCM4378 externally reset, which takes Wi-Fi down with it ("watchdog
+ * @BCMWLAN Bus external reset request"). That cycle repeats every few seconds:
+ * ~150 Wi-Fi resets in a 4 minute iOS 14 boot against zero with Bluetooth off.
+ * iOS 14 still reaches the home screen through it, but nothing should have to.
+ *
+ * iOS 26 additionally fails earlier and differently: ACIPCOLYBTControl.cpp:239
+ * is `assert(createDevice(create, RTI) != NULL)` in linkUp, i.e. the RTI device
+ * object itself never comes up there.
+ *
+ * Re-enable once the driver gets past ring creation and stops resetting the
+ * part.
  */
 // #define ENABLE_BT
 #define ENABLE_DATA_ENCRYPTION

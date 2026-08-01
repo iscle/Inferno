@@ -192,6 +192,32 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMBTState, APPLE_BCM_BT)
 #define BT_BAR2_RTI_WINDOW_HI 0x200498
 #define BT_BAR2_RTI_WINDOW_SIZE 0x20049C
 
+/*
+ * The "device info" block in host memory, which the context points at.
+ *
+ * This is how a state change actually reaches the driver. ACIPCRTIDevice's MSI
+ * handler (@0xfffffff008b7a1c4 in the iOS 18.6.2 kernelcache) never reads the
+ * boot stage or RTI status registers: it calls processDeviceInfo()
+ * (@0xfffffff008b82d88), which compares these three words against its own idea
+ * of the device's state and drives the state machine off the difference --
+ * `changeState()` is reached no other way during bring-up. Publishing the RTI
+ * status in MMIO alone therefore leaves the driver idle forever, because
+ * nothing it looks at ever changed.
+ *
+ * Getting them wrong is worse than not writing them: a zeroed block tells the
+ * driver the part fell back to boot stage 0 and state 0, and it responds by
+ * destroying the RTI device and starting over.
+ *
+ * The block is exactly 0x10 bytes. setupMemory (@0xfffffff008b76990) places the
+ * transfer ring tail index array at `peripheral_info + 0x10`, so anything
+ * written past that lands on the host's ring indices.
+ */
+#define BT_DEVINFO_SIZE 0x10
+#define BT_DEVINFO_BOOT_STAGE 0x00
+#define BT_DEVINFO_STATUS 0x04
+#define BT_DEVINFO_SLEEP_NOTIFICATION 0x08
+#define BT_DEVINFO_IMAGE_SIZE 0x0C
+
 /* Bootstage / RTI values the host waits for. */
 #define BT_BOOTSTAGE_COLD 0
 #define BT_BOOTSTAGE_READY 2
@@ -348,6 +374,8 @@ struct AppleBCMBTDeviceState {
     /* BAR2 shadow state. */
     uint32_t bootstage;
     uint32_t rti_status;
+    /* Mirrored into the host's device info block; see BT_DEVINFO_SIZE. */
+    uint32_t sleep_notification;
     uint32_t fw_lo, fw_hi, fw_size;
     uint32_t ctx_lo, ctx_hi;
     uint32_t rti_window_lo, rti_window_hi, rti_window_size;
@@ -458,6 +486,7 @@ static bool bt_dma_read(AppleBCMBTDeviceState *s, uint64_t addr, void *buf,
     if (!bt_dma_allowed(s)) {
         return false;
     }
+    BT_TRACE("DMA read  0x%" PRIx64 " +0x%zx\n", addr, len);
     if (dma_memory_read(bt_dma_as(s), addr, buf, len, MEMTXATTRS_UNSPECIFIED) !=
         MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -475,6 +504,7 @@ static bool bt_dma_write(AppleBCMBTDeviceState *s, uint64_t addr,
     if (!bt_dma_allowed(s)) {
         return false;
     }
+    BT_TRACE("DMA write 0x%" PRIx64 " +0x%zx\n", addr, len);
     if (dma_memory_write(bt_dma_as(s), addr, buf, len,
                          MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -1090,6 +1120,16 @@ static void bt_ctrl_handle_message(AppleBCMBTDeviceState *s, const uint8_t *msg,
 {
     unsigned id;
 
+    if (APPLE_BCM_BT_TRACE_MMIO) {
+        unsigned k;
+
+        fprintf(stderr, "apple-bcm-bt: control message (%u bytes):", len);
+        for (k = 0; k < len; k++) {
+            fprintf(stderr, "%s%02x", (k % 16) ? " " : "\n  ", msg[k]);
+        }
+        fprintf(stderr, "\n");
+    }
+
     if (len < 4) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "apple-bcm-bt: runt control message (%u bytes)\n", len);
@@ -1261,6 +1301,8 @@ static void bt_doorbell(AppleBCMBTDeviceState *s, unsigned index)
     unsigned i;
     bool any = false;
 
+    BT_TRACE("doorbell %u\n", index);
+
     if (!s->ctx_valid) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "apple-bcm-bt: doorbell %u before the context was "
@@ -1294,7 +1336,6 @@ static bool bt_load_context(AppleBCMBTDeviceState *s)
     uint64_t addr = ((uint64_t)s->ctx_hi << 32) | s->ctx_lo;
     AppleBCMBTXferRing *ctrl_xfer;
     AppleBCMBTComplRing *ctrl_compl;
-    uint8_t peripheral_info[0x20];
 
     if (addr == 0) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -1364,19 +1405,34 @@ static bool bt_load_context(AppleBCMBTDeviceState *s)
                ctrl_xfer->footer_bytes, ctrl_compl->n_entries,
                ctrl_compl->iova);
 
-    /*
-     * The part writes 0x20 bytes of (undocumented) status here. The host only
-     * needs the buffer to have been written to.
-     */
-    if (s->peripheral_info_addr != 0) {
-        memset(peripheral_info, 0, sizeof(peripheral_info));
-        bt_st32(peripheral_info, s->ctx_version);
-        bt_dma_write(s, s->peripheral_info_addr, peripheral_info,
-                     sizeof(peripheral_info));
-    }
-
     s->ctx_valid = true;
     return true;
+}
+
+/*
+ * Mirror the part's state into the host's device info block. See
+ * BT_DEVINFO_SIZE: this, not the status registers, is what the driver's
+ * interrupt handler compares against to notice anything happened.
+ *
+ * Only meaningful once the context has been handed over; before that the host
+ * is still polling the boot stage register and there is nowhere to write.
+ */
+static void bt_publish_device_info(AppleBCMBTDeviceState *s)
+{
+    uint8_t info[BT_DEVINFO_SIZE];
+
+    if (!s->ctx_valid || s->peripheral_info_addr == 0) {
+        return;
+    }
+
+    memset(info, 0, sizeof(info));
+    bt_st32(info + BT_DEVINFO_BOOT_STAGE, s->bootstage);
+    bt_st32(info + BT_DEVINFO_STATUS, s->rti_status);
+    bt_st32(info + BT_DEVINFO_SLEEP_NOTIFICATION, s->sleep_notification);
+    /* The image size mirror only carries a coredump's size; there is none. */
+    bt_st32(info + BT_DEVINFO_IMAGE_SIZE, 0);
+
+    bt_dma_write(s, s->peripheral_info_addr, info, sizeof(info));
 }
 
 static void bt_boot_timer(void *opaque)
@@ -1385,6 +1441,7 @@ static void bt_boot_timer(void *opaque)
 
     s->bootstage = BT_BOOTSTAGE_READY;
     BT_DPRINTF("firmware booted, bootstage %u\n", s->bootstage);
+    bt_publish_device_info(s);
     bt_raise_msi(s);
 }
 
@@ -1401,6 +1458,8 @@ static void bt_rti_timer(void *opaque)
     }
     s->rti_status = s->rti_target;
     BT_DPRINTF("RTI state %u\n", s->rti_status);
+
+    bt_publish_device_info(s);
     bt_raise_msi(s);
 }
 
@@ -1413,6 +1472,7 @@ static void bt_firmware_stop(AppleBCMBTDeviceState *s)
 
     s->bootstage = BT_BOOTSTAGE_COLD;
     s->rti_status = BT_RTI_STATE_OFF;
+    s->sleep_notification = 0;
     s->rti_target = BT_RTI_STATE_OFF;
     s->ctx_valid = false;
     s->ctx_lo = s->ctx_hi = 0;
