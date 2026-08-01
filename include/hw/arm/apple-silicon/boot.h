@@ -30,12 +30,13 @@
  * driver now gets through firmware download, RTI bring-up, the "Converged IPC"
  * context handover and the creation of the control, completion and HCI rings.
  *
- * It stops there. Once the two HCI transfer rings exist the driver goes silent
- * without ringing either of their doorbells, and about a second later it has
- * the whole BCM4378 externally reset, which takes Wi-Fi down with it ("watchdog
- * @BCMWLAN Bus external reset request"). That cycle repeats every few seconds:
- * ~150 Wi-Fi resets in a 4 minute iOS 14 boot against zero with Bluetooth off.
- * iOS 14 still reaches the home screen through it, but nothing should have to.
+ * It stops there. Both HCI pipes open and are acknowledged, and then nothing
+ * ever uses them: neither of their doorbells is rung, so no HCI command is ever
+ * sent, and about two seconds later the whole BCM4378 is externally reset,
+ * which takes Wi-Fi down with it ("watchdog@BCMWLAN Bus external reset
+ * request"). That cycle repeats every few seconds -- ~50 Wi-Fi resets in a
+ * 3 minute iOS 14 boot against zero with Bluetooth off. iOS 14 still reaches
+ * the home screen through it, but nothing should have to.
  *
  * iOS 26 additionally fails earlier and differently: ACIPCOLYBTControl.cpp:239
  * is `assert(createDevice(create, RTI) != NULL)` in linkUp, i.e. the RTI device

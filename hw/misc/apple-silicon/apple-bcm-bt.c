@@ -244,6 +244,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(AppleBCMBTState, APPLE_BCM_BT)
  * footer is the ACL one at 4 KiB. */
 #define BT_MAX_PAYLOAD 4096
 
+/*
+ * Completion ring entry layout, and in particular the status field in bits 1..3
+ * of byte 1. See bt_compl_post(): only the value 2 means success.
+ */
+#define BT_COMPL_STATUS_SUCCESS 2
+
 /* Transfer ring entry flags. */
 #define BT_XFER_FLAG_PAYLOAD_MAPPED BIT(0)
 #define BT_XFER_FLAG_PAYLOAD_IN_FOOTER BIT(1)
@@ -617,9 +623,23 @@ static bool bt_compl_post(AppleBCMBTDeviceState *s, unsigned compl_index,
 
     memset(entry, 0, sizeof(entry));
     entry[0] = flags;
+    /*
+     * The status field, and the whole reason ring creation used to go nowhere.
+     * Zero is not "no error" here: ACIPCRTIDevice::messageCompletion
+     * (@0xfffffff008b7b660 in the iOS 18.6.2 kernelcache) maps it through a
+     * table at 0xfffffff007300e70 where 0 is kIOReturnNoCompletion and only 2
+     * is success. A create-transfer-ring acknowledgement carrying 0 makes
+     * ACIPCRTIPipe::openPipeComplete report kACIPCPipeOpenFailed and leave the
+     * pipe shut, so checkPendingIO() -- the thing that rings the pipe's
+     * doorbell -- is never reached and the transport never opens.
+     */
+    entry[1] = (BT_COMPL_STATUS_SUCCESS & 7) << 1;
     bt_st16(entry + 2, xfer_ring);
     bt_st16(entry + 4, msg_id);
-    bt_st32(entry + 6, payload_len);
+    /* 24 bits, at a byte offset the following field shares a word with. */
+    entry[6] = payload_len & 0xFF;
+    entry[7] = (payload_len >> 8) & 0xFF;
+    entry[8] = (payload_len >> 16) & 0xFF;
 
     if (!bt_dma_write(s, addr, entry, sizeof(entry))) {
         return false;
