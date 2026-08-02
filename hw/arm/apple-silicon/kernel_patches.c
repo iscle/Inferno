@@ -800,6 +800,105 @@ static void ck_kp_cs_patches(CKPatcherRange *range)
     }
 }
 
+/*
+ * Don't kill a process for an invalid page.
+ *
+ * The `bypass code signature checks` patch defeats the vm_fault_enter gate that
+ * *rejects* a tainted page, but there are two further, independent decisions
+ * that *kill the process* once a page has been marked tainted. On iOS 26 that is
+ * what actually terminates every process which faults in a page of the
+ * InfernoFSPatcher-modified dyld shared cache -- the patcher rewrites the cache
+ * without rehashing, so those pages fail validation:
+ *
+ *   launchd: (com.apple.backboardd [N]) exited with exit reason
+ *            (namespace: 3 code: 0x2) - OS_REASON_CODESIGNING
+ *
+ * 153 kills in one boot, every respawning daemon, and namespace 3 / code 2 is
+ * exactly `OS_REASON_CODESIGNING` / `CODESIGNING_EXIT_REASON_INVALID_PAGE`.
+ * backboardd survives until it first touches the patched CoreImage/QuartzCore
+ * pages, i.e. right when the UI would come up, which is the whole reason the
+ * boot stalls with every process alive but nothing on screen. Restoring with an
+ * unmodified cache produces zero such kills.
+ *
+ * The two sites live in different images (one in the kernel's vm_fault_enter,
+ * one in a kext), so this runs over the whole `__TEXT_EXEC` segment rather than
+ * a single image's __text.
+ */
+static void ck_kp_nokill_invalid_page_patches(CKPatcherRange *range)
+{
+    /*
+     * Site 1 -- vm_fault_enter. It loads the per-fault "tainted" flag and
+     * branches over the kill when it is zero:
+     *
+     *   ldur w8, [x29, #-0x5c]   ; the tainted result
+     *   cbz  w8, <no kill>
+     *   mov  w0, #3              ; OS_REASON_CODESIGNING
+     *   mov  w1, #2              ; CODESIGNING_EXIT_REASON_INVALID_PAGE
+     *   bl   <os_reason_create>
+     *
+     * `mov w0,#3; mov w1,#2` right before the reason call is the reliable
+     * anchor. Rewrite the load to `mov w8, #0` so the flag reads zero and the
+     * cbz always takes the no-kill path; the page is still mapped, the process
+     * simply is not terminated for it.
+     */
+    static const uint8_t nokill_pattern[] = {
+        0xA8, 0x43, 0x5A, 0xB8, // ldur w8, [x29, #-0x5c]
+        0x08, 0x00, 0x00, 0x34, // cbz w8, #?
+        0x60, 0x00, 0x80, 0x52, // mov w0, #3  (OS_REASON_CODESIGNING)
+        0x41, 0x00, 0x80, 0x52, // mov w1, #2  (INVALID_PAGE)
+        0x00, 0x00, 0x00, 0x94, // bl <os_reason_create>
+    };
+    static const uint8_t nokill_mask[] = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0x1F, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xFC,
+    };
+    QEMU_BUILD_BUG_ON(sizeof(nokill_pattern) != sizeof(nokill_mask));
+    /* mov w8, #0 -- the flag's destination register is w8, not w0. */
+    static const uint8_t mov_w8_0[] = { 0x08, 0x00, 0x80, 0x52 };
+    ck_patcher_find_replace(range, "don't kill a process for an invalid page",
+                            nokill_pattern, nokill_mask, sizeof(nokill_pattern),
+                            sizeof(uint32_t), mov_w8_0, NULL, 0,
+                            sizeof(mov_w8_0));
+
+    /*
+     * Site 2 -- the kext path. Neutering only site 1 took the count from 153
+     * kills per boot to 22, and backboardd was still among the survivors'
+     * killers. This one has the shape
+     *
+     *   mov w0, #3               ; OS_REASON_CODESIGNING
+     *   mov w1, #2               ; INVALID_PAGE
+     *   bl  <os_reason_create>
+     *   cbnz w0, <terminate>     ; if a reason object was allocated, kill
+     *   ...return without killing...
+     *   <terminate>: orr w0, w19, #2 ; bl <exit_with_reason>
+     *
+     * i.e. it only proceeds to the terminate when os_reason_create succeeds.
+     * Rewrite the `cbnz w0` to a NOP so it always falls through to the no-kill
+     * return; the reason object is still built and leaked (once, at the point a
+     * signature would have failed) but the process is not terminated. (There is
+     * a third os_reason_create(3,2) in the fileset, but it only populates a
+     * table -- `str x0, [x19, #0xe8]` -- and never terminates, so it is left
+     * alone.)
+     */
+    static const uint8_t nokill2_pattern[] = {
+        0x60, 0x00, 0x80, 0x52, // mov w0, #3  (OS_REASON_CODESIGNING)
+        0x41, 0x00, 0x80, 0x52, // mov w1, #2  (INVALID_PAGE)
+        0x00, 0x00, 0x00, 0x94, // bl <os_reason_create>
+        0x00, 0x00, 0x00, 0x35, // cbnz w0, <terminate>
+    };
+    static const uint8_t nokill2_mask[] = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x00, 0x00, 0x00, 0xFC, 0x1F, 0x00, 0x00, 0xFF,
+    };
+    QEMU_BUILD_BUG_ON(sizeof(nokill2_pattern) != sizeof(nokill2_mask));
+    static const uint8_t nop[] = { NOP_BYTES };
+    ck_patcher_find_replace(range,
+                            "don't kill a process for an invalid page (2)",
+                            nokill2_pattern, nokill2_mask,
+                            sizeof(nokill2_pattern), sizeof(uint32_t), nop, NULL,
+                            0xC, sizeof(nop));
+}
+
 static void ck_kp_pmap_cs_enforce_patch(CKPatcherRange *range)
 {
     // in pmap_enter_options_internal
@@ -865,6 +964,37 @@ void ck_patch_kernel(MachoHeader64 *hdr, const char *root_snapshot_name)
     ck_kp_kprintf_patch(kernel_text);
     ck_kp_amx_patch(kernel_text);
     ck_kp_cs_patches(kernel_text);
+
+    /*
+     * The two invalid-page kill sites live in different fileset images (the
+     * kernel and a kext), so run over the whole __TEXT_EXEC segment. The
+     * fileset's *own* __TEXT_EXEC spans every image, but apple_boot_get_segment
+     * redirects a fileset to the `com.apple.kernel` entry, giving only the
+     * kernel's text -- so walk the fileset header's load commands directly.
+     */
+    {
+        MachoSegmentCommand64 *whole_text_exec = NULL;
+        MachoSegmentCommand64 *sgp = (MachoSegmentCommand64 *)(hdr + 1);
+        uint32_t i;
+
+        for (i = 0; i < hdr->n_cmds;
+             i++, sgp = (MachoSegmentCommand64 *)((char *)sgp + sgp->cmd_size)) {
+            if (sgp->cmd == LC_SEGMENT_64 &&
+                strncmp(sgp->segname, "__TEXT_EXEC",
+                        sizeof(sgp->segname) - 1) == 0) {
+                whole_text_exec = sgp;
+                break;
+            }
+        }
+        if (whole_text_exec != NULL) {
+            g_autofree CKPatcherRange *text_exec_range =
+                ck_kp_range_from_va("__TEXT_EXEC", whole_text_exec->vmaddr,
+                                    whole_text_exec->vmsize);
+            ck_kp_nokill_invalid_page_patches(text_exec_range);
+        } else {
+            warn_report("Failed to find the fileset `__TEXT_EXEC` segment.");
+        }
+    }
     kernel_const = ck_kp_get_kernel_section(hdr, "__TEXT", "__const");
     ck_kp_hactivation_patch(kernel_const);
 
