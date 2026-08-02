@@ -152,6 +152,38 @@ Two halves, two different answers:
 - **The launch service cache** is on the sealed volume, so it has to be patched
   before `seal_system_volume` runs.
 
+### iOS 26: the patched cache must be re-hashed
+
+On iOS 26 patching the dyld shared cache is not enough on its own. Each
+shared-cache page is validated against a SHA-256 in the subcache's own embedded
+code signature, and from iOS 26 the kernel *terminates* any process that faults
+in a page whose bytes no longer match its stored hash:
+
+```
+launchd: (com.apple.backboardd [N]) exited with exit reason
+    (namespace: 3 code: 0x2) - OS_REASON_CODESIGNING
+```
+
+InfernoFSPatcher rewrites the cache without re-signing it, so every daemon that
+maps a patched page dies and respawns forever; backboardd survives only until it
+first touches the patched CoreImage/QuartzCore pages — exactly when the UI would
+come up — so the device sits with every process alive and a black screen. (A
+non-patched cache produces zero such kills; the patched-but-not-re-hashed cache
+produces ~150 per boot.)
+
+The fix is to make the pages valid rather than fight the kernel: after running
+InfernoFSPatcher, run
+
+```
+inferno-cache-rehash.py <cryptex>/System/Library/Caches/com.apple.dyld
+```
+
+which recomputes the CodeDirectory page hash for each page InfernoFSPatcher
+touched (it reads the `.InfernoOriginalBytes` files the patcher leaves behind).
+The kernel's AMFI/trust-cache bypass already accepts the resulting cdhash, so no
+re-signing is needed. With this, iOS 26.5 boots to the lock screen. It is
+idempotent and safe to re-run.
+
 ### The hook
 
 `patches/idevicerestore-fs-patch-hook.patch` adds `INFERNO_FS_PATCH_CMD`, which
